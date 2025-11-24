@@ -2,12 +2,20 @@ import 'dotenv/config';
 import { App, LogLevel } from '@slack/bolt';
 import { registerListeners } from './listeners/index.js';
 
+// Determine log level based on NODE_ENV
+const env = process.env.NODE_ENV?.toLowerCase();
+const resolvedLogLevel = env === 'production'
+  ? LogLevel.INFO // suppress DEBUG in production
+  : env === 'test'
+  ? LogLevel.WARN
+  : LogLevel.DEBUG; // default for dev/undefined
+
 // Initialize the Bolt app
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
-  logLevel: LogLevel.DEBUG,
+  logLevel: resolvedLogLevel,
   clientOptions: {
     slackApiUrl: process.env.SLACK_API_URL || 'https://slack.com/api',
   },
