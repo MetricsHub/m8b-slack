@@ -605,7 +605,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       },
         ...(includeMcp ? [{
           type: 'mcp',
-          server_label: 'm8b-agent-01',
+          server_label: 'MetricsHub',
           server_url: MCP_AGENT_URL,
           require_approval: 'never',
           headers: mcpHeaders
