@@ -348,7 +348,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
       const stream = await openai.responses.create({
         model: 'gpt-5.1',
-        reasoning: { effort: 'low', summary: 'auto' },
+        reasoning: { effort: 'medium', summary: 'auto' },
         previous_response_id,
         max_output_tokens: 4000,
         tool_choice: tool_choice ?? 'auto',
