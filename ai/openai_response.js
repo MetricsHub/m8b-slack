@@ -347,8 +347,8 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       // streamer will be created lazily on first output_text.delta so Slack shows "thinking..."
 
       const stream = await openai.responses.create({
-        model: 'gpt-5.1-1m',
-        reasoning: { effort: 'medium', summary: 'auto' },
+        model: 'gpt-5.1',
+        reasoning: { effort: 'low', summary: 'auto' },
         previous_response_id,
         max_output_tokens: 4000,
         tool_choice: tool_choice ?? 'auto',
