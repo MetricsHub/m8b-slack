@@ -1,78 +1,235 @@
-# AI Agent App Template (Bolt for JavaScript)
+# M8B Slack Bot (MetricsHub)
 
-This Bolt for JavaScript template demonstrates how to build [AI Apps](https://docs.slack.dev/ai/) in Slack.
+M8B is a grumpy but competent Slack bot that helps solve IT issues. It uses OpenAI for reasoning and can query one or more MetricsHub MCP servers for real metrics. Built with Slack Bolt (Node.js).
 
-Models from [OpenAI](https://openai.com) are used and can be customized for prompts of all kinds.
+This README covers production deployment on Linux using systemd, plus developer setup.
 
-## Setup
+## Prerequisites
 
-Before getting started, make sure you have a development workspace where you have permissions to install apps. If you don’t have one setup, go ahead and [create one](https://slack.com/create).
+- Linux host with systemd (Ubuntu/Debian/CentOS etc.)
+- Node.js 20+ and npm installed (check with `node -v`)
+- A Slack workspace where you can install apps
+- OpenAI API key
+- Optional: MetricsHub MCP servers (URLs + API tokens)
 
-### Developer Program
+## Create and Install the Slack App
 
-Join the [Slack Developer Program](https://api.slack.com/developer-program) for exclusive access to sandbox environments for building and testing your apps, tooling, and resources created to help you build and grow.
+1. Go to <https://api.slack.com/apps/new> and choose "From an app manifest".
+1. Pick your workspace.
+1. Paste the contents of `manifest.json` (JSON tab) and click Next.
+1. Review and Create the app.
+1. On the app page, go to Install App and install to your workspace.
 
-## Installation
+You will need two tokens from Slack:
 
-### Create a Slack App
+- SLACK_BOT_TOKEN (Bot User OAuth Token)
+- SLACK_APP_TOKEN (App-level token with `connections:write`)
 
-1. Open [https://api.slack.com/apps/new](https://api.slack.com/apps/new) and
-   choose "From an app manifest"
-2. Choose the workspace you want to install the application to
-3. Copy the contents of [manifest.json](./manifest.json) into the text box that
-   says `*Paste your manifest code here*` (within the JSON tab) and click _Next_
-4. Review the configuration and click _Create_
-5. You'll then be redirected to App Settings. Visit the **Install App** page and install your app.
+## Production Installation on Linux
 
-### Environment Variables
+The following example installs into `/opt/m8b-slack` and manages the bot via systemd. Adjust paths/usernames to your needs.
 
-Before you can run the app, you'll need to store some environment variables.
+1. Clone the repository
 
-
-1. Rename `.env.sample` to `.env`.
-2. Open your apps setting page from [this list](https://api.slack.com/apps), click _OAuth & Permissions_ in the left hand menu, then copy the _Bot User OAuth Token_ into your `.env` file under `SLACK_BOT_TOKEN`.
-```zsh
-SLACK_BOT_TOKEN=YOUR_SLACK_BOT_TOKEN
-```
-3. Click _Basic Information_ from the left hand menu and follow the steps in the _App-Level Tokens_ section to create an app-level token with the `connections:write` scope. Copy that token into your `.env` as `SLACK_APP_TOKEN`.
-```zsh
-SLACK_APP_TOKEN=YOUR_SLACK_APP_TOKEN
-```
-4. Save your OpenAI key into `.env` under `OPENAI_API_KEY`.
-```zsh
-OPENAI_API_KEY=YOUR_OPEN_API_KEY
+```bash
+sudo mkdir -p /opt/m8b-slack
+sudo chown "$USER":"$USER" /opt/m8b-slack
+cd /opt/m8b-slack
+git clone https://github.com/metricshub/m8b-slack .
 ```
 
+1. Install dependencies
 
-### Local Project
-
-```zsh
-# Clone this project onto your machine
-git clone https://github.com/slack-samples/bolt-js-assistant-template.git
-
-# Change into this project directory
-cd bolt-js-assistant-template
-
-# Install dependencies
-npm install
-
-# Run Bolt server
-npm start
+```bash
+cd /opt/m8b-slack
+npm ci
 ```
+
+1. Configure environment variables in `/etc/m8b-slack.env`
+
+Create the file and secure it:
+
+```bash
+sudo bash -c 'cat >/etc/m8b-slack.env' <<'EOF'
+# Required
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+OPENAI_API_KEY=sk-...
+
+# Optional
+NODE_ENV=production
+# SLACK_API_URL=https://slack.com/api
+
+# Back-compat single MetricsHub server (optional, use local config file for multiple)
+# MCP_AGENT_URL=https://metricshub.example.com/sse
+# MCP_AGENT_TOKEN=...
+
+# Optional: OpenAI Vector Store / Code Interpreter settings
+# OPENAI_VECTOR_STORE_ID=vs_...
+# OPENAI_CODE_CONTAINER_ID=cc_...
+EOF
+sudo chmod 600 /etc/m8b-slack.env
+```
+
+1. Configure one or more MetricsHub MCP servers (optional)
+
+- Copy the sample and create a local file that is NOT tracked by git:
+
+```bash
+cp ai/mcp.config.sample.js ai/mcp.config.local.js
+```
+
+- Edit `ai/mcp.config.local.js` and list your servers. You can reference env vars from `/etc/m8b-slack.env`:
+
+```js
+export default [
+  { server_label: 'metricshub-paris', server_url: process.env.MCP_PARIS_URL, token: process.env.MCP_PARIS_TOKEN },
+  { server_label: 'metricshub-nyc',   server_url: process.env.MCP_NYC_URL,   token: process.env.MCP_NYC_TOKEN   },
+];
+```
+
+1. Create a systemd unit file
+
+```bash
+sudo bash -c 'cat >/etc/systemd/system/m8b-slack.service' <<'EOF'
+[Unit]
+Description=M8B Slack Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/m8b-slack.env
+WorkingDirectory=/opt/m8b-slack
+ExecStart=/usr/bin/env node app.js
+Restart=always
+RestartSec=3
+# Hardening (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+1. Start the service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now m8b-slack
+sudo systemctl status m8b-slack --no-pager
+```
+
+1. View logs
+
+```bash
+journalctl -u m8b-slack -f
+```
+
+## Updating to the latest version
+
+```bash
+cd /opt/m8b-slack
+git fetch && git pull
+npm ci
+sudo systemctl restart m8b-slack
+```
+
+## Developer Setup (Slack CLI preferred)
+
+Using the Slack CLI is the smoothest way to develop and run this app locally. It injects the required Slack tokens at runtime and helps you create/install the app from the included manifest.
+
+### Slack CLI prerequisites
+
+1. Install the Slack CLI for your platform (macOS/Linux/Windows):
+
+  - <https://api.slack.com/automation/cli/install>
+
+1. Verify installation and login:
+
+  ```bash
+  slack version
+  slack login
+  ```
+
+1. Clone the repository and install dependencies:
+
+  ```bash
+  git clone https://github.com/metricshub/m8b-slack
+  cd m8b-slack
+  npm install
+  ```
+
+### Run the app with Slack CLI
+
+1. Start the app with the CLI (it will use the included `manifest.json`). Choose "Create a new app" when prompted and select your workspace:
+
+  ```bash
+  slack run
+  # ...
+  # [INFO]  bolt-app ⚡️ Bolt app is running!
+  ```
+
+1. In Slack, open a DM with the app (or invite it to a channel) and interact.
+
+1. To customize settings (icon, scopes, features), open app settings:
+
+  ```bash
+  slack app settings
+  ```
+
+### Making code changes
+
+1. Edit files (for example `app.js` or `ai/openai_response.js`).
+
+1. Restart or re-run the app to pick up changes:
+
+  ```bash
+  slack run
+  ```
+
+### Optional: Configure MetricsHub servers for dev
+
+If you want multiple MetricsHub servers in dev, create `ai/mcp.config.local.js` (copied from `ai/mcp.config.sample.js`) and reference environment variables or inline values. This file is ignored by git.
 
 ### Linting
 
-```zsh
-# Run lint for code formatting and linting
+```bash
 npm run lint
 ```
 
-## Project Structure
+## Alternative Developer Setup (without Slack CLI)
 
-### `manifest.json`
+You can also run the app directly with Node.js and a local `.env` file (useful in CI or if you prefer manual token management).
 
-`manifest.json` is a configuration for Slack apps. With a manifest, you can create an app with a pre-defined configuration, or adjust the configuration of an existing app.
+1. Clone and install:
 
-### `app.js`
+  ```bash
+  git clone https://github.com/metricshub/m8b-slack
+  cd m8b-slack
+  npm install
+  ```
 
-`app.js` is the entry point for the application and is the file you'll run to start the server. This project aims to keep this file as thin as possible, primarily using it as a way to route inbound requests.
+1. Create a `.env` file in the repo root with at least:
+
+  ```env
+  SLACK_BOT_TOKEN=xoxb-...
+  SLACK_APP_TOKEN=xapp-...
+  OPENAI_API_KEY=sk-...
+  NODE_ENV=development
+  ```
+
+1. Run locally:
+
+  ```bash
+  npm start
+  ```
+
+## Notes
+
+- The bot’s logging level adapts to `NODE_ENV` (production hides DEBUG).
+- MetricsHub MCP config is loaded from `ai/mcp.config.local.js` if present; otherwise a single server can be set via `MCP_AGENT_URL` + `MCP_AGENT_TOKEN`.
+- Never commit real secrets. `/etc/m8b-slack.env` and `ai/mcp.config.local.js` are excluded via `.gitignore`.
