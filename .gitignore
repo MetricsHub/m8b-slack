@@ -143,3 +143,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Local MCP configuration (do not commit)
+ai/mcp.config.local.js

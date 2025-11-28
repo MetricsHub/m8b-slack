@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 export const respond = async ({ client, context, logger, message, getThreadContext, say, setTitle, setStatus, setSuggestedPrompts }) => {
 
@@ -593,23 +594,59 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     // Build tools array (include your other tools too)
     const codeContainerId = process.env.OPENAI_CODE_CONTAINER_ID || process.env.CODE_CONTAINER_ID;
     const baseVectorStoreIds = ['vs_6901f2d030b48191ba844f57b7b703ff'];
-      const MCP_AGENT_TOKEN = process.env.MCP_AGENT_TOKEN;
-      const MCP_AGENT_URL = process.env.MCP_AGENT_URL;
-      const includeMcp = !!(MCP_AGENT_TOKEN && MCP_AGENT_URL);
-      const mcpHeaders = includeMcp ? { Authorization: `Bearer ${MCP_AGENT_TOKEN}` } : undefined;
+
+    // Load MCP server configs from a local, untracked file if present
+    let mcpServers = [];
+    try {
+      const localCfgPath = path.resolve(process.cwd(), 'ai', 'mcp.config.local.js');
+      if (fs.existsSync(localCfgPath)) {
+        const mod = await import(pathToFileURL(localCfgPath).href);
+        const arr = (mod && (mod.default || mod.servers)) || [];
+        if (Array.isArray(arr)) mcpServers = arr;
+        else logger.warn?.('mcp.config.local.js did not export an array; ignoring.');
+      }
+    } catch (e) {
+      logger.warn?.('Failed to load ai/mcp.config.local.js', { e: String(e) });
+    }
+    // Backward-compat: if no local config, allow single server via env
+    if (!mcpServers.length) {
+      const url = process.env.MCP_AGENT_URL;
+      const token = process.env.MCP_AGENT_TOKEN;
+      if (url && token) mcpServers.push({ server_label: 'm8b-agent-01', server_url: url, token });
+    }
+
+    // Build MCP tools for each configured server
+    const mcpTools = [];
+    for (let i = 0; i < mcpServers.length; i++) {
+      const s = mcpServers[i] || {};
+      const server_url = s.server_url || s.url;
+      const server_label = s.server_label || s.label || `mcp-${i + 1}`;
+      const token = s.token || s.apiKey || s.key;
+      if (!server_url) {
+        logger.warn?.('Skipping MCP server missing URL', { index: i, server_label });
+        continue;
+      }
+      if (!token) {
+        logger.warn?.('Skipping MCP server missing API token', { index: i, server_label, server_url });
+        continue;
+      }
+      const headers = { Authorization: `Bearer ${token}` };
+      mcpTools.push({
+        type: 'mcp',
+        server_label,
+        server_url,
+        require_approval: 'never',
+        headers,
+      });
+    }
+
     const tools = [
       {
         type: 'file_search',
         vector_store_ids: baseVectorStoreIds,
         max_num_results: 10
       },
-        ...(includeMcp ? [{
-          type: 'mcp',
-          server_label: 'MetricsHub',
-          server_url: MCP_AGENT_URL,
-          require_approval: 'never',
-          headers: mcpHeaders
-        }] : []),
+      ...mcpTools,
       {
         type: "code_interpreter",
         container: { type: "auto", file_ids: Array.from(codeFileIds) },
@@ -643,15 +680,12 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       }
     ];
 
-      // If MetricsHub MCP is not configured, notify in logs and warn in Slack
-      if (!includeMcp) {
-        logger.warn?.('MetricsHub MCP is not configured. Running without MetricsHub capabilities.', {
-          haveToken: !!MCP_AGENT_TOKEN,
-          haveUrl: !!MCP_AGENT_URL
-        });
+      // If no MCP servers configured/valid, notify in logs and warn in Slack
+      if (mcpTools.length === 0) {
+        logger.warn?.('No MetricsHub MCP servers configured. Running without MetricsHub capabilities.');
         try {
           await say({
-            text: ':warning: MetricsHub MCP is not configured (set MCP_AGENT_URL and MCP_AGENT_TOKEN). Running without MetricsHub capabilities.'
+            text: ':warning: No MetricsHub MCP servers configured. Create ai/mcp.config.local.js or set MCP_AGENT_URL and MCP_AGENT_TOKEN. Running without MetricsHub capabilities.'
           });
         } catch (e) {
           logger.warn?.('Failed to post Slack warning about missing MetricsHub MCP config', { e: String(e) });
