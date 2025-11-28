@@ -670,28 +670,56 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     ];
 
     // Include any messages that happened after our last OpenAI-context bot message, with attachments
+    // Roles policy for prior turns:
+    // - assistant for previous bot messages (text only)
+    // - user for previous human messages (current user or others)
+    //   * if authored by current user => text = rawText
+    //   * if authored by someone else => text = `<@authorId> said: ${rawText}`
+    // Files (images, PDFs) are always sent under 'user' role (the Responses API does not allow images under 'system').
     {
       for (let i = (lastBotIndex + 1) || 0; i < msgs.length; i++) {
         const m = msgs[i];
         if (!m || m.ts === message.ts) continue; // skip the current incoming message
         const rawText = (m.text || '').trim();
         const authorId = m.user || m.bot_id || m.app_id;
-        let role = 'system';
-        let text = rawText;
-        if (authorId && context.userId && authorId === context.userId) {
-          role = 'user';
-        } else if (authorId && rawText) {
-          text = `<@${authorId}> says: ${rawText}`;
+
+        // Determine if this message was authored by our bot
+        const authoredByBot = (
+          (m.bot_id && context.BOT_ID && m.bot_id === context.BOT_ID) ||
+          (m.user && context.BOT_USER_ID && m.user === context.BOT_USER_ID) ||
+          (m.app_id && context.BOT_ID && m.app_id === context.BOT_ID)
+        );
+
+        // 1) Text: assistant for bot, user for humans
+        if (rawText) {
+          if (authoredByBot) {
+            input.push({ role: 'assistant', content: [{ type: 'input_text', text: rawText }] });
+          } else {
+            const textForUser = (authorId && context.userId && authorId === context.userId)
+              ? rawText
+              : `<@${authorId}> said: ${rawText}`;
+            input.push({ role: 'user', content: [{ type: 'input_text', text: textForUser }] });
+          }
         }
 
-        const contentItems = [];
-        if (text) contentItems.push({ type: 'input_text', text });
+        // 2) Files (if any) ALWAYS under 'user' role to allow input_image/input_file
         const files = Array.isArray(m.files) ? m.files : [];
+        const fileItems = [];
         for (const f of files) {
           const res = await uploadOnce(f);
-          if (res?.contentItem) contentItems.push(res.contentItem);
+          if (res?.contentItem) fileItems.push(res.contentItem);
         }
-        if (contentItems.length) input.push({ role, content: contentItems });
+        if (fileItems.length) {
+          if (authoredByBot) {
+            // Do not include bot attachments as 'assistant' (non-text content is not supported there).
+            // Also avoid echoing bot files back as 'user' content.
+          } else {
+          const preface = (authorId && (!context.userId || authorId !== context.userId))
+            ? [{ type: 'input_text', text: `Files from <@${authorId}>:` }]
+            : [];
+          input.push({ role: 'user', content: [...preface, ...fileItems] });
+          }
+        }
       }
     }
 
