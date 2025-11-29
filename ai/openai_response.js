@@ -740,7 +740,8 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         // 1) Text: assistant for bot, user for humans
         if (rawText) {
           if (authoredByBot) {
-            input.push({ role: 'assistant', content: [{ type: 'input_text', text: rawText }] });
+            // Assistant role requires output item types (output_text or refusal), not input_text
+            input.push({ role: 'assistant', content: [{ type: 'output_text', text: rawText }] });
           } else {
             const textForUser = (authorId && context.userId && authorId === context.userId)
               ? rawText
