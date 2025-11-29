@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { App, LogLevel } from '@slack/bolt';
 import { registerListeners } from './listeners/index.js';
+import { initializeMcpRegistry } from './ai/mcp_registry.js';
 
 // Determine log level based on NODE_ENV
 const env = process.env.NODE_ENV?.toLowerCase();
@@ -41,6 +42,14 @@ const app = new App({
       context.BOT_ID = BOT_ID;
       await next();
     });
+
+    // Initialize MetricsHub MCP registry (discover tools/hosts)
+    try {
+      await initializeMcpRegistry(app.logger);
+      app.logger.info('MCP registry initialized');
+    } catch (e) {
+      app.logger.warn('Failed to initialize MCP registry', e);
+    }
 
     // Register the action and event listeners
     registerListeners(app);

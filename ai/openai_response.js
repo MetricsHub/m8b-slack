@@ -1,5 +1,6 @@
 import { feedbackBlock } from "../listeners/views/feedback_block.js";
 import { openai, DEFAULT_SYSTEM_CONTENT } from "./index.js";
+import { getOpenAiFunctionTools, executeMcpFunctionCall, getMcpServerCount } from './mcp_registry.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -576,7 +577,13 @@ export const respond = async ({ client, context, logger, message, getThreadConte
           }
 
         } else {
-          output = { ok: false, error: `Unhandled tool: ${name}` };
+          // Delegate to MCP registry for dynamically discovered tools
+          try {
+            const res = await executeMcpFunctionCall(name, args, logger);
+            output = res && typeof res === 'object' ? res : { ok: true, result: res };
+          } catch (e) {
+            output = { ok: false, error: String(e) };
+          }
         }
       } catch (err) {
         output = { ok: false, error: String(err) };
@@ -623,38 +630,13 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       if (url && token) mcpServers.push({ server_label: 'm8b-agent-01', server_url: url, token });
     }
 
-    // Build MCP tools for each configured server
-    const mcpTools = [];
-    for (let i = 0; i < mcpServers.length; i++) {
-      const s = mcpServers[i] || {};
-      const server_url = s.server_url || s.url;
-      const server_label = s.server_label || s.label || `mcp-${i + 1}`;
-      const token = s.token || s.apiKey || s.key;
-      if (!server_url) {
-        logger.warn?.('Skipping MCP server missing URL', { index: i, server_label });
-        continue;
-      }
-      if (!token) {
-        logger.warn?.('Skipping MCP server missing API token', { index: i, server_label, server_url });
-        continue;
-      }
-      const headers = { Authorization: `Bearer ${token}` };
-      mcpTools.push({
-        type: 'mcp',
-        server_label,
-        server_url,
-        require_approval: 'never',
-        headers,
-      });
-    }
-
     const tools = [
       ...(baseVectorStoreIds.length ? [{
         type: 'file_search',
         vector_store_ids: baseVectorStoreIds,
         max_num_results: 10
       }] : []),
-      ...mcpTools,
+      ...getOpenAiFunctionTools(),
       {
         type: "code_interpreter",
         container: { type: "auto", file_ids: Array.from(codeFileIds) },
@@ -689,7 +671,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     ];
 
       // If no MCP servers configured/valid, notify in logs and warn in Slack
-      if (mcpTools.length === 0) {
+      if (getMcpServerCount() === 0) {
         logger.warn?.('No MetricsHub MCP servers configured. Running without MetricsHub capabilities.');
         try {
           await say({
