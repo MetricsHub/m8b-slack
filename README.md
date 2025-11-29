@@ -65,7 +65,9 @@ NODE_ENV=production
 # MCP_AGENT_TOKEN=...
 
 # Optional: OpenAI Vector Store / Code Interpreter settings
-# OPENAI_VECTOR_STORE_ID=vs_...
+# Multiple vector stores (comma-separated) or single ID
+# OPENAI_VECTOR_STORE_IDS=vs_123,vs_456
+# OPENAI_VECTOR_STORE_ID=vs_123
 # OPENAI_CODE_CONTAINER_ID=cc_...
 EOF
 sudo chmod 600 /etc/m8b-slack.env

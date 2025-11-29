@@ -593,7 +593,15 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
     // Build tools array (include your other tools too)
     const codeContainerId = process.env.OPENAI_CODE_CONTAINER_ID || process.env.CODE_CONTAINER_ID;
-    const baseVectorStoreIds = ['vs_6901f2d030b48191ba844f57b7b703ff'];
+    // Support multiple vector stores via env OPENAI_VECTOR_STORE_IDS (comma-separated)
+    // Fallback to OPENAI_VECTOR_STORE_ID for single-id setups.
+    const vsFromEnv = (process.env.OPENAI_VECTOR_STORE_IDS || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const baseVectorStoreIds = vsFromEnv.length
+      ? vsFromEnv
+      : (process.env.OPENAI_VECTOR_STORE_ID ? [process.env.OPENAI_VECTOR_STORE_ID] : []);
 
     // Load MCP server configs from a local, untracked file if present
     let mcpServers = [];
@@ -641,11 +649,11 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     }
 
     const tools = [
-      {
+      ...(baseVectorStoreIds.length ? [{
         type: 'file_search',
         vector_store_ids: baseVectorStoreIds,
         max_num_results: 10
-      },
+      }] : []),
       ...mcpTools,
       {
         type: "code_interpreter",
@@ -690,6 +698,11 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         } catch (e) {
           logger.warn?.('Failed to post Slack warning about missing MetricsHub MCP config', { e: String(e) });
         }
+      }
+
+      // Warn if no vector stores configured (File Search disabled)
+      if (baseVectorStoreIds.length === 0) {
+        logger.warn?.('No OpenAI vector stores configured. File Search tool disabled. Set OPENAI_VECTOR_STORE_IDS or OPENAI_VECTOR_STORE_ID.');
       }
 
     // Initial input (system + user)
@@ -987,16 +1000,22 @@ export const respond = async ({ client, context, logger, message, getThreadConte
           const uploadedSlackFiles = [];
           const upTo = 3;
           let count = 0;
-          const vectorStoreId = (Array.isArray(baseVectorStoreIds) && baseVectorStoreIds[0]) || process.env.OPENAI_VECTOR_STORE_ID;
-          if (!vectorStoreId) {
-            logger.debug?.('No vector store ID available; skipping attachment fetches for citations');
+          const vectorStoreIds = Array.isArray(baseVectorStoreIds) ? baseVectorStoreIds : [];
+          if (!vectorStoreIds.length) {
+            logger.debug?.('No vector store IDs configured; skipping attachment fetches for citations');
           } else {
             for (const [fileId, filename] of citationMap.entries()) {
               if (count >= upTo) break;
               try {
-                const url = `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files/${fileId}/content`;
-                const res = await fetch(url, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, Accept: '*/*' } });
-                if (res.ok) {
+                // Try each configured vector store until one returns content
+                let res = null;
+                let usedVs = null;
+                for (const vsId of vectorStoreIds) {
+                  const url = `https://api.openai.com/v1/vector_stores/${vsId}/files/${fileId}/content`;
+                  const attempt = await fetch(url, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, Accept: '*/*' } });
+                  if (attempt.ok) { res = attempt; usedVs = vsId; break; }
+                }
+                if (res && res.ok) {
                   const contentType = res.headers.get('content-type') || '';
                   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'm8b-src-'));
                   const baseSafeName = filename || `${fileId}.bin`;
@@ -1034,10 +1053,10 @@ export const respond = async ({ client, context, logger, message, getThreadConte
                   const up = await client.files.uploadV2({ channel_id: channel, thread_ts: thread_ts, file: fs.createReadStream(tmpPath), filename: finalName, title: finalName });
                   if (up?.ok) { uploadedSlackFiles.push(finalName); count += 1; }
                 } else {
-                  logger.debug?.('Vector store file content fetch failed', { fileId, vectorStoreId, status: res.status });
+                  logger.debug?.('Vector store file content fetch failed for all stores', { fileId, vectorStoreIds });
                 }
               } catch (e) {
-                logger.debug?.('Failed to fetch/upload cited file (vector store content)', { fileId, vectorStoreId, e: String(e) });
+                logger.debug?.('Failed to fetch/upload cited file (vector store content)', { fileId, vectorStoreIds, e: String(e) });
               }
             }
           }
