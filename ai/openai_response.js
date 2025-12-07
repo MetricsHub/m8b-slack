@@ -557,6 +557,9 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       const { name, call_id, arguments: argsStr } = functionCall;
       let output = { ok: true };
 
+      console.log(`[FUNCTION_CALL] Processing: ${name} (call_id: ${call_id})`);
+      console.log(`[FUNCTION_CALL] Arguments: ${argsStr}`);
+
       try {
         // Arguments are a JSON string
         const args = argsStr ? JSON.parse(argsStr) : {};
@@ -578,16 +581,22 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
         } else {
           // Delegate to MCP registry for dynamically discovered tools
+          console.log(`[FUNCTION_CALL] Delegating to MCP registry: ${name}`);
           try {
             const res = await executeMcpFunctionCall(name, args, logger);
+            console.log(`[FUNCTION_CALL] MCP result for ${name}:`, JSON.stringify(res).slice(0, 500));
             output = res && typeof res === 'object' ? res : { ok: true, result: res };
           } catch (e) {
+            console.error(`[FUNCTION_CALL] MCP error for ${name}:`, e);
             output = { ok: false, error: String(e) };
           }
         }
       } catch (err) {
+        console.error(`[FUNCTION_CALL] Error processing ${name}:`, err);
         output = { ok: false, error: String(err) };
       }
+
+      console.log(`[FUNCTION_CALL] Output for ${name}:`, JSON.stringify(output).slice(0, 500));
 
       // This is the Responses API way to return tool output without submitToolOutputs:
       // feed a new input with type 'function_call_output'
