@@ -20,6 +20,20 @@ export const respond = async ({ client, context, logger, message, getThreadConte
   logger.debug(`Processing message in thread ${thread_ts} from ${userDisplayName}: ${message.text}`);
   logger.debug('Context:', { context });
 
+  // Fetch user profile for real name and timezone
+  let userRealName = null;
+  let userTimezone = null;
+  try {
+    const userInfo = await client.users.info({ user: userId });
+    if (userInfo?.ok && userInfo?.user) {
+      userRealName = userInfo.user.real_name || userInfo.user.profile?.real_name || userInfo.user.name;
+      userTimezone = userInfo.user.tz || userInfo.user.tz_label;
+      logger.debug(`User profile fetched: ${userRealName}, timezone: ${userTimezone}`);
+    }
+  } catch (e) {
+    logger.debug?.('Failed to fetch user profile', { userId, e: String(e) });
+  }
+
   try {
     // Track the last seen response id across turns for recovery in catch
     let lastSeenResponseId = null;
@@ -1085,7 +1099,16 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         const res = await uploadOnce(f);
         if (res?.contentItem) contentItems.push(res.contentItem);
       }
-			input.push({ role: 'system', content: [{ type: 'input_text', text: `User name: ${userDisplayName}` }] });
+      // Build user context message with real name, Slack ID, and timezone
+      const userContextParts = [];
+      if (userRealName) {
+        userContextParts.push(`User's real name: ${userRealName}`);
+      }
+      userContextParts.push(`User's Slack ID: ${userDisplayName} (always use this format to mention the user)`);
+      if (userTimezone) {
+        userContextParts.push(`User's timezone: ${userTimezone}`);
+      }
+      input.push({ role: 'system', content: [{ type: 'input_text', text: userContextParts.join('\n') }] });
       input.push({ role: 'user', content: contentItems });
     }
 
