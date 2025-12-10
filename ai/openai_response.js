@@ -1,6 +1,7 @@
 import { feedbackBlock } from "../listeners/views/feedback_block.js";
 import { openai, DEFAULT_SYSTEM_CONTENT } from "./index.js";
 import { getOpenAiFunctionTools, executeMcpFunctionCall, getMcpServerCount } from './mcp_registry.js';
+import { getPromQLTool, executePromQLQuery } from './prometheus.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -105,6 +106,114 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         logger.warn?.('recoverFromTerminated failed', { err: String(err) });
         return null;
       }
+    }
+
+    // Estimate rough token count for input (4 chars ~= 1 token as a rough heuristic)
+    function estimateTokenCount(inputItems) {
+      let chars = 0;
+      for (const item of inputItems || []) {
+        const content = item?.content || [];
+        for (const c of content) {
+          if (c?.text) chars += String(c.text).length;
+          // Files/images count as ~1000 tokens each roughly
+          if (c?.type === 'input_image' || c?.type === 'input_file') chars += 4000;
+        }
+      }
+      return Math.ceil(chars / 4);
+    }
+
+    // Summarize older conversation history to reduce context size
+    async function summarizeConversationHistory(inputItems, keepRecentCount = 4) {
+      // Split input into system prompts, older messages, and recent messages
+      const systemItems = [];
+      const conversationItems = [];
+
+      for (const item of inputItems || []) {
+        if (item?.role === 'system' && conversationItems.length === 0) {
+          // System prompts at the beginning
+          systemItems.push(item);
+        } else {
+          conversationItems.push(item);
+        }
+      }
+
+      // Keep recent messages as-is, summarize older ones
+      const recentItems = conversationItems.slice(-keepRecentCount);
+      const olderItems = conversationItems.slice(0, -keepRecentCount);
+
+      if (olderItems.length === 0) {
+        // Nothing to summarize
+        return inputItems;
+      }
+
+      // Build text representation of older messages for summarization
+      const olderTexts = [];
+      for (const item of olderItems) {
+        const role = item?.role || 'unknown';
+        const content = item?.content || [];
+        for (const c of content) {
+          if (c?.text) {
+            olderTexts.push(`[${role}]: ${c.text}`);
+          } else if (c?.type === 'input_image') {
+            olderTexts.push(`[${role}]: [attached image]`);
+          } else if (c?.type === 'input_file') {
+            olderTexts.push(`[${role}]: [attached file: ${c.filename || 'unknown'}]`);
+          }
+        }
+      }
+
+      if (olderTexts.length === 0) {
+        return [...systemItems, ...recentItems];
+      }
+
+      console.log(`[Context] Summarizing ${olderItems.length} older messages to reduce context size...`);
+
+      try {
+        // Use a quick summarization call
+        const summaryResponse = await openai.responses.create({
+          model: 'gpt-4o-mini',
+          input: [
+            {
+              role: 'system',
+              content: [{ type: 'input_text', text: 'Summarize the following conversation history concisely, preserving key facts, decisions, technical details, and any unresolved issues. Keep it under 500 words. Output only the summary, no preamble.' }]
+            },
+            {
+              role: 'user',
+              content: [{ type: 'input_text', text: olderTexts.join('\n\n') }]
+            }
+          ],
+          max_output_tokens: 1000,
+        });
+
+        const summaryText = getTextFromResponse(summaryResponse) || 'Previous conversation occurred but could not be summarized.';
+        console.log(`[Context] Conversation summarized to ${summaryText.length} chars`);
+
+        // Build new input with summary
+        return [
+          ...systemItems,
+          {
+            role: 'system',
+            content: [{ type: 'input_text', text: `**Summary of earlier conversation:**\n${summaryText}` }]
+          },
+          ...recentItems
+        ];
+      } catch (e) {
+        console.error('[Context] Failed to summarize conversation:', e);
+        // Fallback: just use system + recent items
+        return [...systemItems, ...recentItems];
+      }
+    }
+
+    // Check if an error is a context window overflow error
+    function isContextWindowError(e) {
+      const msg = String(e?.message || '').toLowerCase();
+      const type = String(e?.type || '').toLowerCase();
+      return (
+        msg.includes('context window') ||
+        msg.includes('exceeds') ||
+        msg.includes('too many tokens') ||
+        (type === 'invalid_request_error' && e?.param === 'input')
+      );
     }
 
     await setTitle(message.text);
@@ -552,6 +661,148 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       return { functionCalls: functionCalls.filter(Boolean), responseId: newResponseId, streamer: streamer, hadText, incompleteReason, sawCompleted, fullResponseText, debug: { startedWriting, fullResponseTextLen: fullResponseText.length, evtCounters, unknownEventTypes: unknownTypesSummary, incompleteReason, sawCompleted, ...debugMeta } };
     }
 
+    // Handle large tool outputs by uploading them as JSON files for code_interpreter
+    // Returns { output } where output may be the original or a summary with file reference
+    const MAX_INLINE_OUTPUT_CHARS = 30000; // ~7500 tokens - outputs smaller than this go inline
+
+    async function handleLargeToolOutput(output, toolName) {
+      const outputStr = JSON.stringify(output, null, 2);
+      const outputLen = outputStr.length;
+
+      if (outputLen <= MAX_INLINE_OUTPUT_CHARS) {
+        // Output is small enough, return inline
+        return { output };
+      }
+
+      console.log(`[FUNCTION_CALL] Output for ${toolName} is large (${outputLen} chars), uploading as JSON file...`);
+
+      try {
+        // Create a temporary JSON file
+        const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'm8b-tool-'));
+        const timestamp = Date.now();
+        const safeToolName = toolName.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const fileName = `${safeToolName}_${timestamp}.json`;
+        const tmpPath = path.join(tmpDir, fileName);
+
+        // Write the full output as formatted JSON
+        await fsp.writeFile(tmpPath, outputStr, 'utf8');
+
+        // Upload to OpenAI
+        const uploaded = await openai.files.create({
+          file: fs.createReadStream(tmpPath),
+          purpose: 'user_data'
+        });
+
+        console.log(`[FUNCTION_CALL] Uploaded ${toolName} output as file ${uploaded.id} (${outputLen} chars)`);
+
+        // Track the uploaded file for this turn
+        uploadedFilesThisTurn.push({
+          tool_output: toolName,
+          openai_file_id: uploaded.id,
+          size: outputLen
+        });
+
+        // Add to codeFileIds so code_interpreter can access it
+        codeFileIds.add(uploaded.id);
+        codeContainerFiles.set(uploaded.id, fileName);
+
+        // Return a small summary inline with the file reference
+        const summaryOutput = {
+          ok: output?.ok ?? true,
+          dataInFile: true,
+          fileId: uploaded.id,
+          fileName: fileName,
+          originalSize: outputLen,
+          hint: `Full ${toolName} output (${outputLen} chars) uploaded as file "${fileName}". Use code_interpreter to read and analyze this JSON file.`,
+          // Include a small preview of the data structure
+          preview: createOutputPreview(output)
+        };
+
+        // Cleanup temp file (async, don't wait)
+        fsp.rm(tmpDir, { recursive: true }).catch(() => {});
+
+        return { output: summaryOutput };
+      } catch (e) {
+        console.error(`[FUNCTION_CALL] Failed to upload ${toolName} output as file:`, e);
+        // Fallback: truncate the output
+        return { output: truncateOutput(output, MAX_INLINE_OUTPUT_CHARS) };
+      }
+    }
+
+    // Create a small preview of the output structure for the inline summary
+    function createOutputPreview(output) {
+      if (!output || typeof output !== 'object') return output;
+
+      const preview = {};
+
+      // Copy simple fields
+      for (const [key, value] of Object.entries(output)) {
+        if (value === null || typeof value !== 'object') {
+          preview[key] = value;
+        } else if (Array.isArray(value)) {
+          preview[key] = `[Array with ${value.length} items]`;
+          // Include first item as sample if it exists
+          if (value.length > 0 && typeof value[0] === 'object') {
+            preview[`${key}_sample`] = value[0];
+          }
+        } else {
+          const keys = Object.keys(value);
+          preview[key] = `{Object with ${keys.length} keys: ${keys.slice(0, 5).join(', ')}${keys.length > 5 ? '...' : ''}}`;
+        }
+      }
+
+      return preview;
+    }
+
+    // Simple truncation fallback
+    function truncateOutput(output, maxChars) {
+      const str = JSON.stringify(output);
+      if (str.length <= maxChars) return output;
+
+      return {
+        ok: output?.ok ?? true,
+        truncated: true,
+        originalSize: str.length,
+        message: 'Output was too large and has been truncated',
+        preview: createOutputPreview(output)
+      };
+    }
+
+    // Try to parse a value that might be a JSON string (some MCP tools return JSON as string)
+    // Recursively handles nested stringified JSON
+    function tryParseJsonString(value) {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        // Check if it looks like JSON (starts with { or [)
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            // Recursively try to parse in case of nested stringified JSON
+            return tryParseJsonString(parsed);
+          } catch {
+            // Not valid JSON, return as-is
+            return value;
+          }
+        }
+        return value;
+      }
+
+      if (Array.isArray(value)) {
+        return value.map(tryParseJsonString);
+      }
+
+      if (value && typeof value === 'object') {
+        const result = {};
+        for (const [k, v] of Object.entries(value)) {
+          result[k] = tryParseJsonString(v);
+        }
+        return result;
+      }
+
+      return value;
+    }
+
     // Run one function call locally and return the next input items to send back.
     async function processFunctionCall(functionCall) {
       const { name, call_id, arguments: argsStr } = functionCall;
@@ -579,11 +830,25 @@ export const respond = async ({ client, context, logger, message, getThreadConte
             logger.debug('slack_add_reply called without text argument');
           }
 
+        } else if (name === 'PromQLQuery') {
+          // Prometheus PromQL query
+          console.log(`[FUNCTION_CALL] Executing PromQL query`);
+          try {
+            const res = await executePromQLQuery(args, logger);
+            console.log(`[FUNCTION_CALL] PromQL result:`, JSON.stringify(res).slice(0, 500));
+            output = res;
+          } catch (e) {
+            console.error(`[FUNCTION_CALL] PromQL error:`, e);
+            output = { ok: false, error: String(e) };
+          }
+
         } else {
           // Delegate to MCP registry for dynamically discovered tools
           console.log(`[FUNCTION_CALL] Delegating to MCP registry: ${name}`);
           try {
-            const res = await executeMcpFunctionCall(name, args, logger);
+            let res = await executeMcpFunctionCall(name, args, logger);
+            // Some MCP tools return JSON as a string - try to parse it
+            res = tryParseJsonString(res);
             console.log(`[FUNCTION_CALL] MCP result for ${name}:`, JSON.stringify(res).slice(0, 500));
             output = res && typeof res === 'object' ? res : { ok: true, result: res };
           } catch (e) {
@@ -598,12 +863,14 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
       console.log(`[FUNCTION_CALL] Output for ${name}:`, JSON.stringify(output).slice(0, 500));
 
-      // This is the Responses API way to return tool output without submitToolOutputs:
-      // feed a new input with type 'function_call_output'
+      // Handle large outputs by uploading them as JSON files for code_interpreter
+      const { output: processedOutput } = await handleLargeToolOutput(output, name);
+
+      // Return the function call output
       return [{
         type: 'function_call_output',
         call_id: call_id,            // CRITICAL: use model-supplied call_id
-        output: JSON.stringify(output)
+        output: JSON.stringify(processedOutput)
       }];
     }
 
@@ -646,6 +913,8 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         max_num_results: 10
       }] : []),
       ...getOpenAiFunctionTools(),
+      // Add Prometheus PromQL tool if configured
+      ...(getPromQLTool() ? [getPromQLTool()] : []),
       {
         type: "code_interpreter",
         container: { type: "auto", file_ids: Array.from(codeFileIds) },
@@ -782,6 +1051,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
   let forceToolChoiceNext = undefined; // can set to 'none' to force text-only
   let sawAnyIncomplete = false;
   let lastFullText = '';
+  let contextSummarized = false; // track if we've already summarized to avoid infinite retry
 
     function summarizeInputItems(items) {
       try {
@@ -796,6 +1066,18 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       }
     }
 
+    // Pre-flight check: if input is likely too large, proactively summarize
+    // GPT-4o has ~128k context, but we want to leave room for output and tools
+    const estimatedTokens = estimateTokenCount(input);
+    const TOKEN_THRESHOLD = 80000; // Leave room for output, tools, etc.
+    if (estimatedTokens > TOKEN_THRESHOLD && !contextSummarized) {
+      console.log(`[Context] Pre-flight: estimated ${estimatedTokens} tokens exceeds threshold, summarizing...`);
+      await setStatus({ status: 'summarizing conversation...' });
+      input = await summarizeConversationHistory(input, 6);
+      contextSummarized = true;
+      console.log(`[Context] After summarization: estimated ${estimateTokenCount(input)} tokens`);
+    }
+
     do {
       loopIteration += 1;
       logger.debug?.('Loop iteration: calling streamOnce', {
@@ -805,12 +1087,41 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         inputSummary: summarizeInputItems(input)
       });
 
-      const { functionCalls, responseId, streamer, hadText, incompleteReason, sawCompleted, fullResponseText, debug: streamDebug } = await streamOnce({
-        input,
-        tools,
-        previous_response_id,
-        tool_choice: forceToolChoiceNext
-      });
+      let streamResult;
+      try {
+        streamResult = await streamOnce({
+          input,
+          tools,
+          previous_response_id,
+          tool_choice: forceToolChoiceNext
+        });
+      } catch (streamError) {
+        // Check if this is a context window error and we haven't already tried summarizing
+        if (isContextWindowError(streamError) && !contextSummarized) {
+          console.log('[Context] Context window exceeded, attempting to summarize and retry...');
+          await setStatus({ status: 'conversation too long, summarizing...' });
+          input = await summarizeConversationHistory(input, 4);
+          contextSummarized = true;
+          console.log(`[Context] After summarization: estimated ${estimateTokenCount(input)} tokens`);
+          // Retry the streamOnce call with summarized input
+          try {
+            streamResult = await streamOnce({
+              input,
+              tools,
+              previous_response_id,
+              tool_choice: forceToolChoiceNext
+            });
+          } catch (retryError) {
+            // If it still fails, re-throw the error
+            throw retryError;
+          }
+        } else {
+          // Not a context window error or already tried summarizing, re-throw
+          throw streamError;
+        }
+      }
+
+      const { functionCalls, responseId, streamer, hadText, incompleteReason, sawCompleted, fullResponseText, debug: streamDebug } = streamResult;
 
       logger.debug?.('streamOnce returned', {
         iteration: loopIteration,
