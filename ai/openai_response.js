@@ -1067,9 +1067,9 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     }
 
     // Pre-flight check: if input is likely too large, proactively summarize
-    // GPT-4o has ~128k context, but we want to leave room for output and tools
+    // GPT-5.1 has ~196k context, but we want to leave room for output and tools
     const estimatedTokens = estimateTokenCount(input);
-    const TOKEN_THRESHOLD = 80000; // Leave room for output, tools, etc.
+    const TOKEN_THRESHOLD = 140000; // Leave room for output, tools, etc.
     if (estimatedTokens > TOKEN_THRESHOLD && !contextSummarized) {
       console.log(`[Context] Pre-flight: estimated ${estimatedTokens} tokens exceeds threshold, summarizing...`);
       await setStatus({ status: 'summarizing conversation...' });
