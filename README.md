@@ -64,6 +64,9 @@ NODE_ENV=production
 # MCP_AGENT_URL=https://metricshub.example.com/sse
 # MCP_AGENT_TOKEN=...
 
+# Optional: Prometheus server for PromQL queries
+# M8B_PROMETHEUS_URL=http://prometheus.example.com:9090
+
 # Optional: OpenAI Vector Store / Code Interpreter settings
 # Multiple vector stores (comma-separated) or single ID
 # OPENAI_VECTOR_STORE_IDS=vs_123,vs_456
@@ -89,6 +92,33 @@ export default [
   { server_label: 'metricshub-nyc',   server_url: process.env.MCP_NYC_URL,   token: process.env.MCP_NYC_TOKEN   },
 ];
 ```
+
+1. Configure Prometheus for PromQL queries (optional)
+
+If you have a Prometheus server, M8B can execute PromQL queries to retrieve metrics, alerts, and time-series data. Set the `M8B_PROMETHEUS_URL` environment variable to enable this feature:
+
+```bash
+# In /etc/m8b-slack.env
+M8B_PROMETHEUS_URL=http://prometheus.example.com:9090
+```
+
+Once configured, the bot can:
+
+- Execute **instant queries** to get current metric values
+- Execute **range queries** to get values over a time period
+- Query **Prometheus AlertManager alerts** using `ALERTS_FOR_STATE`
+
+Example prompts the bot can handle:
+
+- "What alerts are currently firing?"
+- "Show me the CPU usage for server1 over the last hour"
+- "Are there any alerts for host.example.com?"
+
+The bot will use PromQL queries like:
+
+- `ALERTS_FOR_STATE` - List all active alerts
+- `ALERTS_FOR_STATE{host_name="some.host.name"}` - Alerts for a specific host
+- `rate(system_cpu_usage_seconds_total{mode="user"}[5m])` - CPU usage rate
 
 1. Create a systemd unit file
 
@@ -232,6 +262,7 @@ You can also run the app directly with Node.js and a local `.env` file (useful i
 
 ## Notes
 
-- The bot’s logging level adapts to `NODE_ENV` (production hides DEBUG).
+- The bot's logging level adapts to `NODE_ENV` (production hides DEBUG).
 - MetricsHub MCP config is loaded from `ai/mcp.config.local.js` if present; otherwise a single server can be set via `MCP_AGENT_URL` + `MCP_AGENT_TOKEN`.
+- Prometheus PromQL queries are enabled when `M8B_PROMETHEUS_URL` is set.
 - Never commit real secrets. `/etc/m8b-slack.env` and `ai/mcp.config.local.js` are excluded via `.gitignore`.
