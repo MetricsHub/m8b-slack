@@ -730,6 +730,9 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     }
 
     // Create a small preview of the output structure for the inline summary
+    // Ensures the preview itself doesn't get too large
+    const MAX_PREVIEW_CHARS = 5000;
+
     function createOutputPreview(output) {
       if (!output || typeof output !== 'object') return output;
 
@@ -741,9 +744,14 @@ export const respond = async ({ client, context, logger, message, getThreadConte
           preview[key] = value;
         } else if (Array.isArray(value)) {
           preview[key] = `[Array with ${value.length} items]`;
-          // Include first item as sample if it exists
-          if (value.length > 0 && typeof value[0] === 'object') {
-            preview[`${key}_sample`] = value[0];
+          // Include first item as sample only if it's small
+          if (value.length > 0) {
+            const sampleStr = JSON.stringify(value[0]);
+            if (sampleStr.length < 500) {
+              preview[`${key}_sample`] = value[0];
+            } else {
+              preview[`${key}_sample`] = '[Sample too large - use code_interpreter to read the file]';
+            }
           }
         } else {
           const keys = Object.keys(value);
@@ -751,21 +759,47 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         }
       }
 
+      // Final safety check - ensure preview isn't too large
+      const previewStr = JSON.stringify(preview);
+      if (previewStr.length > MAX_PREVIEW_CHARS) {
+        return {
+          note: 'Preview too large',
+          keys: Object.keys(output).slice(0, 20),
+          totalKeys: Object.keys(output).length
+        };
+      }
+
       return preview;
     }
 
-    // Simple truncation fallback
+    // Simple truncation fallback - ensures output never exceeds limit
+    const HARD_MAX_OUTPUT_CHARS = 1000000; // 1MB hard limit (well under OpenAI's 10MB)
+
     function truncateOutput(output, maxChars) {
       const str = JSON.stringify(output);
       if (str.length <= maxChars) return output;
 
-      return {
+      const truncated = {
         ok: output?.ok ?? true,
         truncated: true,
         originalSize: str.length,
-        message: 'Output was too large and has been truncated',
+        message: 'Output was too large and has been truncated. The data could not be uploaded as a file.',
         preview: createOutputPreview(output)
       };
+
+      // Safety check - if even the truncated version is too big, strip the preview
+      const truncatedStr = JSON.stringify(truncated);
+      if (truncatedStr.length > HARD_MAX_OUTPUT_CHARS) {
+        return {
+          ok: output?.ok ?? true,
+          truncated: true,
+          originalSize: str.length,
+          message: 'Output was too large and has been truncated. The data could not be uploaded as a file.',
+          hint: 'Request more specific data to reduce response size.'
+        };
+      }
+
+      return truncated;
     }
 
     // Try to parse a value that might be a JSON string (some MCP tools return JSON as string)
@@ -866,11 +900,23 @@ export const respond = async ({ client, context, logger, message, getThreadConte
       // Handle large outputs by uploading them as JSON files for code_interpreter
       const { output: processedOutput } = await handleLargeToolOutput(output, name);
 
+      // Final safety check - ensure we never exceed OpenAI's 10MB limit
+      let finalOutputStr = JSON.stringify(processedOutput);
+      if (finalOutputStr.length > HARD_MAX_OUTPUT_CHARS) {
+        console.warn(`[FUNCTION_CALL] Output still too large after processing (${finalOutputStr.length} chars), applying hard truncation`);
+        finalOutputStr = JSON.stringify({
+          ok: processedOutput?.ok ?? true,
+          error: 'Output exceeded maximum size limit',
+          originalSize: finalOutputStr.length,
+          hint: 'Request more specific data to reduce response size.'
+        });
+      }
+
       // Return the function call output
       return [{
         type: 'function_call_output',
         call_id: call_id,            // CRITICAL: use model-supplied call_id
-        output: JSON.stringify(processedOutput)
+        output: finalOutputStr
       }];
     }
 
