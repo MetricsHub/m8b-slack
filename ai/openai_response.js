@@ -678,6 +678,22 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     // Handle large tool outputs by uploading them as JSON files for code_interpreter
     // Returns { output } where output may be the original or a summary with file reference
     const MAX_INLINE_OUTPUT_CHARS = 30000; // ~7500 tokens - outputs smaller than this go inline
+    const HARD_MAX_OUTPUT_CHARS = 1000000; // 1MB hard limit (well under OpenAI's 10MB)
+
+    // Guaranteed safe output - always returns something under HARD_MAX_OUTPUT_CHARS
+    function ensureSafeOutput(output, toolName, originalSize) {
+      const outputStr = JSON.stringify(output);
+      if (outputStr.length <= HARD_MAX_OUTPUT_CHARS) {
+        return output;
+      }
+      // Nuclear option - return minimal error message
+      console.warn(`[FUNCTION_CALL] Output for ${toolName} still too large (${outputStr.length} chars), using nuclear truncation`);
+      return {
+        ok: false,
+        error: `Output too large (${originalSize || outputStr.length} chars). Data could not be processed.`,
+        hint: 'Use more specific query parameters to reduce the result size.'
+      };
+    }
 
     async function handleLargeToolOutput(output, toolName) {
       const outputStr = JSON.stringify(output, null, 2);
@@ -685,7 +701,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
       if (outputLen <= MAX_INLINE_OUTPUT_CHARS) {
         // Output is small enough, return inline
-        return { output };
+        return { output: ensureSafeOutput(output, toolName, outputLen) };
       }
 
       console.log(`[FUNCTION_CALL] Output for ${toolName} is large (${outputLen} chars), uploading as JSON file...`);
@@ -735,11 +751,13 @@ export const respond = async ({ client, context, logger, message, getThreadConte
         // Cleanup temp file (async, don't wait)
         fsp.rm(tmpDir, { recursive: true }).catch(() => {});
 
-        return { output: summaryOutput };
+        return { output: ensureSafeOutput(summaryOutput, toolName, outputLen) };
       } catch (e) {
         console.error(`[FUNCTION_CALL] Failed to upload ${toolName} output as file:`, e);
-        // Fallback: truncate the output
-        return { output: truncateOutput(output, MAX_INLINE_OUTPUT_CHARS) };
+        // Fallback: hard truncate the output to ensure it fits
+        console.log(`[FUNCTION_CALL] Falling back to hard truncation for ${toolName}`);
+        const truncated = truncateOutput(output, MAX_INLINE_OUTPUT_CHARS);
+        return { output: ensureSafeOutput(truncated, toolName, outputLen) };
       }
     }
 
@@ -787,8 +805,6 @@ export const respond = async ({ client, context, logger, message, getThreadConte
     }
 
     // Simple truncation fallback - ensures output never exceeds limit
-    const HARD_MAX_OUTPUT_CHARS = 1000000; // 1MB hard limit (well under OpenAI's 10MB)
-
     function truncateOutput(output, maxChars) {
       const str = JSON.stringify(output);
       if (str.length <= maxChars) return output;
