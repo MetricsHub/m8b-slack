@@ -35,6 +35,17 @@ export const respond = async ({ client, context, logger, message, getThreadConte
   }
 
   try {
+    // Support multiple vector stores via env OPENAI_VECTOR_STORE_IDS (comma-separated)
+    // Fallback to OPENAI_VECTOR_STORE_ID for single-id setups.
+    // Defined early so it's available in processFunctionCall for update_knowledge
+    const vsFromEnv = (process.env.OPENAI_VECTOR_STORE_IDS || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const baseVectorStoreIds = vsFromEnv.length
+      ? vsFromEnv
+      : (process.env.OPENAI_VECTOR_STORE_ID ? [process.env.OPENAI_VECTOR_STORE_ID] : []);
+
     // Track the last seen response id across turns for recovery in catch
     let lastSeenResponseId = null;
     // Collect citations seen during streaming (if any) for later Slack post-processing
@@ -905,6 +916,14 @@ export const respond = async ({ client, context, logger, message, getThreadConte
           } else if (baseVectorStoreIds.length === 0) {
             output = { ok: false, error: 'No Vector Store configured. Cannot update knowledge.' };
           } else {
+            // Filter out any undefined/empty vector store IDs
+            const validVectorStoreIds = baseVectorStoreIds.filter(id => id && typeof id === 'string');
+            console.log(`[update_knowledge] Vector store IDs: ${JSON.stringify(validVectorStoreIds)}`);
+            console.log(`[update_knowledge] openai.vectorStores exists: ${!!openai.vectorStores}, openai.vectorStores?.files exists: ${!!openai.vectorStores?.files}`);
+
+            if (validVectorStoreIds.length === 0) {
+              output = { ok: false, error: 'No valid Vector Store IDs configured.' };
+            } else {
             try {
               // Create a temporary file with the content
               const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'm8b-knowledge-'));
@@ -921,9 +940,9 @@ export const respond = async ({ client, context, logger, message, getThreadConte
               // Note: We only detach (not delete) to avoid issues if the file is referenced elsewhere
               // Detaching stops it from being used for retrieval; deletion is optional cleanup
               if (existingFileId) {
-                for (const vsId of baseVectorStoreIds) {
+                for (const vsId of validVectorStoreIds) {
                   try {
-                    await openai.vectorStores.files.del(vsId, existingFileId);
+                    await openai.vectorStores.files.del(existingFileId, { vector_store_id: vsId });
                     console.log(`[update_knowledge] Detached old file ${existingFileId} from vector store ${vsId}`);
                   } catch (e) {
                     // File might not be in this vector store, or already removed - that's fine
@@ -932,7 +951,7 @@ export const respond = async ({ client, context, logger, message, getThreadConte
                 }
                 // Optionally delete the underlying file for cleanup (comment out if you want to keep history)
                 try {
-                  await openai.files.del(existingFileId);
+                  await openai.files.delete(existingFileId);
                   console.log(`[update_knowledge] Deleted old file object ${existingFileId}`);
                 } catch (e) {
                   // Non-fatal - file might already be deleted or in use
@@ -947,66 +966,32 @@ export const respond = async ({ client, context, logger, message, getThreadConte
               });
               console.log(`[update_knowledge] Uploaded file ${uploaded.id}: ${fileName}`);
 
-              // Helper to poll vector store file status until indexed or failed
-              async function waitForIndexing(vsId, fileId, maxWaitMs = 30000) {
-                const startTime = Date.now();
-                const pollIntervalMs = 1000;
-                while (Date.now() - startTime < maxWaitMs) {
-                  try {
-                    const vsFile = await openai.vectorStores.files.retrieve(vsId, fileId);
-                    const status = vsFile?.status;
-                    console.log(`[update_knowledge] File ${fileId} in VS ${vsId} status: ${status}`);
-                    if (status === 'completed') {
-                      return { ok: true, status: 'completed' };
-                    } else if (status === 'failed' || status === 'cancelled') {
-                      return { ok: false, status, error: vsFile?.last_error?.message || 'Indexing failed' };
-                    }
-                    // status is 'in_progress' or 'queued' - keep polling
-                    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
-                  } catch (e) {
-                    console.warn(`[update_knowledge] Error polling file status: ${e.message}`);
-                    return { ok: false, status: 'error', error: e.message };
-                  }
-                }
-                return { ok: false, status: 'timeout', error: `Indexing did not complete within ${maxWaitMs}ms` };
-              }
-
-              // Add to all configured vector stores and wait for indexing
-              const indexingResults = [];
-              for (const vsId of baseVectorStoreIds) {
+              // Add to all configured vector stores (indexing happens in the background)
+              const attachResults = [];
+              for (const vsId of validVectorStoreIds) {
                 try {
                   await openai.vectorStores.files.create(vsId, { file_id: uploaded.id });
-                  console.log(`[update_knowledge] Attached file ${uploaded.id} to vector store ${vsId}, waiting for indexing...`);
-
-                  // Poll until indexing completes (or timeout)
-                  const indexResult = await waitForIndexing(vsId, uploaded.id);
-                  indexingResults.push({ vsId, ...indexResult });
-
-                  if (indexResult.ok) {
-                    console.log(`[update_knowledge] File ${uploaded.id} successfully indexed in ${vsId}`);
-                  } else {
-                    console.warn(`[update_knowledge] File ${uploaded.id} indexing issue in ${vsId}: ${indexResult.status} - ${indexResult.error}`);
-                  }
+                  console.log(`[update_knowledge] Attached file ${uploaded.id} to vector store ${vsId} (indexing in background)`);
+                  attachResults.push({ vsId, ok: true });
                 } catch (e) {
-                  console.error(`[update_knowledge] Failed to add file to vector store ${vsId}:`, e);
-                  indexingResults.push({ vsId, ok: false, status: 'attach_failed', error: e.message });
+                  console.error(`[update_knowledge] Failed to attach file to vector store ${vsId}:`, e);
+                  attachResults.push({ vsId, ok: false, error: e.message });
                 }
               }
 
               // Cleanup temp file
               fsp.rm(tmpDir, { recursive: true }).catch(() => {});
 
-              const successfulStores = indexingResults.filter(r => r.ok).map(r => r.vsId);
-              const failedStores = indexingResults.filter(r => !r.ok);
+              const successfulStores = attachResults.filter(r => r.ok).map(r => r.vsId);
+              const failedStores = attachResults.filter(r => !r.ok);
 
               if (successfulStores.length > 0) {
                 output = {
                   ok: true,
-                  message: `Knowledge entry "${title}" has been saved and indexed in the Vector Store.`,
+                  message: `Knowledge entry "${title}" has been saved. Indexing will complete in the background.`,
                   fileId: uploaded.id,
                   fileName: fileName,
                   vectorStores: successfulStores,
-                  indexingResults: indexingResults,
                   replacedFileId: existingFileId || null
                 };
                 // Notify the user that knowledge was updated
@@ -1014,20 +999,21 @@ export const respond = async ({ client, context, logger, message, getThreadConte
               } else {
                 output = {
                   ok: false,
-                  error: 'File was uploaded but indexing failed in all Vector Stores',
+                  error: 'File was uploaded but could not be attached to any Vector Store',
                   fileId: uploaded.id,
-                  indexingResults: indexingResults
+                  attachResults: attachResults
                 };
               }
 
               // Log any partial failures
               if (failedStores.length > 0 && successfulStores.length > 0) {
-                console.warn(`[update_knowledge] Partial success: indexed in ${successfulStores.length} stores, failed in ${failedStores.length}`);
+                console.warn(`[update_knowledge] Partial success: attached to ${successfulStores.length} stores, failed in ${failedStores.length}`);
               }
             } catch (e) {
               console.error('[update_knowledge] Error:', e);
               output = { ok: false, error: String(e) };
             }
+            } // end validVectorStoreIds.length check
           }
 
         } else if (name === 'PromQLQuery') {
@@ -1088,15 +1074,6 @@ export const respond = async ({ client, context, logger, message, getThreadConte
 
     // Build tools array (include your other tools too)
     const codeContainerId = process.env.OPENAI_CODE_CONTAINER_ID || process.env.CODE_CONTAINER_ID;
-    // Support multiple vector stores via env OPENAI_VECTOR_STORE_IDS (comma-separated)
-    // Fallback to OPENAI_VECTOR_STORE_ID for single-id setups.
-    const vsFromEnv = (process.env.OPENAI_VECTOR_STORE_IDS || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
-    const baseVectorStoreIds = vsFromEnv.length
-      ? vsFromEnv
-      : (process.env.OPENAI_VECTOR_STORE_ID ? [process.env.OPENAI_VECTOR_STORE_ID] : []);
 
     // Load MCP server configs from a local, untracked file if present
     let mcpServers = [];
