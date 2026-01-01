@@ -1,3 +1,3 @@
-import { respond } from '../../ai/openai_response.js';
+import { respond } from "../../ai/respond.js";
 
 export const message = respond;

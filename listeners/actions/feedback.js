@@ -10,34 +10,34 @@
  * @param {import("@slack/logger").Logger} params.logger - Logger instance.
  */
 export const feedbackActionCallback = async ({ ack, body, client, logger }) => {
-  try {
-    await ack();
+	try {
+		await ack();
 
-    if (body.type !== 'block_actions' || body.actions[0].type !== 'feedback_buttons') {
-      return;
-    }
+		if (body.type !== "block_actions" || body.actions[0].type !== "feedback_buttons") {
+			return;
+		}
 
-    const message_ts = body.message.ts;
-    const channel_id = body.channel.id;
-    const user_id = body.user.id;
-    const value = body.actions[0].value;
+		const message_ts = body.message.ts;
+		const channel_id = body.channel.id;
+		const user_id = body.user.id;
+		const value = body.actions[0].value;
 
-    if (value === 'good-feedback') {
-      await client.chat.postEphemeral({
-        channel: channel_id,
-        user: user_id,
-        thread_ts: message_ts,
-        text: "We're glad you found this useful.",
-      });
-    } else {
-      await client.chat.postEphemeral({
-        channel: channel_id,
-        user: user_id,
-        thread_ts: message_ts,
-        text: "Sorry to hear that response wasn't up to par :slightly_frowning_face: Starting a new chat may help with AI mistakes and hallucinations.",
-      });
-    }
-  } catch (error) {
-    logger.error(`:warning: Something went wrong! ${error}`);
-  }
+		if (value === "good-feedback") {
+			await client.chat.postEphemeral({
+				channel: channel_id,
+				user: user_id,
+				thread_ts: message_ts,
+				text: "We're glad you found this useful.",
+			});
+		} else {
+			await client.chat.postEphemeral({
+				channel: channel_id,
+				user: user_id,
+				thread_ts: message_ts,
+				text: "Sorry to hear that response wasn't up to par :slightly_frowning_face: Starting a new chat may help with AI mistakes and hallucinations.",
+			});
+		}
+	} catch (error) {
+		logger.error(`:warning: Something went wrong! ${error}`);
+	}
 };

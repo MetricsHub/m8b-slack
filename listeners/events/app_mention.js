@@ -1,4 +1,4 @@
-import { respond } from '../../ai/openai_response.js';
+import { respond } from "../../ai/respond.js";
 
 /**
  * The `appMentionCallback` event handler allows your app to receive message
@@ -15,49 +15,49 @@ import { respond } from '../../ai/openai_response.js';
  * @see {@link https://docs.slack.dev/reference/events/app_mention/}
  */
 export const appMentionCallback = async ({ event, client, logger, say }) => {
-  try {
-    const { channel, text, team, user } = event;
-    const thread_ts = event.thread_ts || event.ts;
+	try {
+		const { channel, text, team, user } = event;
+		const thread_ts = event.thread_ts || event.ts;
 
-    // Build minimal message object
-    const messageObj = {
-      channel,
-      thread_ts,
-      ts: event.ts,
-      text: text.replace(/<@[^>]+>\s*/, ''), // Remove the bot mention
-      user,
-      files: Array.isArray(event.files) ? event.files : undefined,
-    };
+		// Build minimal message object
+		const messageObj = {
+			channel,
+			thread_ts,
+			ts: event.ts,
+			text: text.replace(/<@[^>]+>\s*/, ""), // Remove the bot mention
+			user,
+			files: Array.isArray(event.files) ? event.files : undefined,
+		};
 
-    // Create wrappers that match the function signatures expected by handleAssistantMessage
-    const setTitle = (title) => void 0;
+		// Create wrappers that match the function signatures expected by handleAssistantMessage
+		const setTitle = (_title) => void 0;
 
-    const setStatus = (statusObj) => client.assistant.threads.setStatus({
-      channel_id: channel,
-      thread_ts,
-      ...statusObj // spread the status and loading_messages
-    });
+		const setStatus = (statusObj) =>
+			client.assistant.threads.setStatus({
+				channel_id: channel,
+				thread_ts,
+				...statusObj, // spread the status and loading_messages
+			});
 
-    return await respond({
-      client,
-      context: {
-        userId: user,
-        teamId: team,
-      },
-      logger,
-      message: messageObj,
-      say: (msg) => say({ ...(typeof msg === 'string' ? { text: msg } : msg), thread_ts }),
-      getThreadContext: () => void 0,
-      setTitle,
-      setStatus
-    });
-
-  } catch (e) {
-    logger.error(e);
-    await say({
-      text: `You needed me here? Well... 😬 ${e}`,
-      channel: event.channel,
-      thread_ts: event.thread_ts || event.ts
-    });
-  }
+		return await respond({
+			client,
+			context: {
+				userId: user,
+				teamId: team,
+			},
+			logger,
+			message: messageObj,
+			say: (msg) => say({ ...(typeof msg === "string" ? { text: msg } : msg), thread_ts }),
+			getThreadContext: () => void 0,
+			setTitle,
+			setStatus,
+		});
+	} catch (e) {
+		logger.error(e);
+		await say({
+			text: `You needed me here? Well... 😬 ${e}`,
+			channel: event.channel,
+			thread_ts: event.thread_ts || event.ts,
+		});
+	}
 };
