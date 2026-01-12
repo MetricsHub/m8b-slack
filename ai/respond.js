@@ -24,10 +24,26 @@ import {
 	pollUntilTerminal,
 	recoverFromTerminated,
 } from "./services/openai.js";
-import { createFileUploadManager, extractPreviousUploads } from "./services/slack-files.js";
+import {
+	createFileUploadManager,
+	extractPreviousUploads,
+	uploadOutputFilesToSlack,
+} from "./services/slack-files.js";
 import { streamOnce } from "./services/streaming.js";
 import { buildToolsArray, logToolWarnings } from "./tools/index.js";
 import { estimateTokenCount, isContextWindowError, summarizeInputItems } from "./utils/tokens.js";
+
+/**
+ * In-memory cache: threadTs -> last OpenAI response_id
+ * Used to maintain conversation continuity across messages.
+ * Cleared on bot restart.
+ */
+const threadResponseCache = new Map();
+
+/**
+ * Slack message length limits
+ */
+const SLACK_SAFE_LENGTH = 35000; // Leave buffer for markdown formatting overhead (Slack limit is ~40k)
 
 /**
  * Main response handler for Slack messages.
@@ -53,9 +69,7 @@ export async function respond({
 	const { userId, teamId } = context;
 	const userDisplayName = `<@${userId}>`;
 
-	logger.debug(
-		`Processing message in thread ${thread_ts} from ${userDisplayName}: ${message.text}`
-	);
+	logger.info(`Processing message in thread ${thread_ts} from ${userDisplayName}: ${message.text}`);
 
 	// Fetch user profile
 	const userProfile = await fetchUserProfile(client, userId, logger);
@@ -111,11 +125,13 @@ export async function respond({
 		}
 
 		// Find previous bot response for continuity
-		const lastBot = findLastBotMessage(messages, context);
-		logger.debug(`Previous response ID: ${lastBot.responseId}`);
+		const lastBot = findLastBotMessage(messages, context, logger);
 
-		// Build tools array
-		const tools = buildToolsArray({
+		// Try cache first, fall back to message metadata
+		const cachedResponseId = threadResponseCache.get(thread_ts);
+
+		// Build tools array (will be rebuilt after function calls add files)
+		let tools = buildToolsArray({
 			vectorStoreIds,
 			codeFileIds: fileManager.codeFileIds,
 		});
@@ -123,27 +139,41 @@ export async function respond({
 		// Log any configuration warnings
 		await logToolWarnings({ vectorStoreIds, say, logger });
 
+		// Determine if we have a previous response ID (for conversation continuity)
+		// Use cached response ID (for cross-message continuity) or fall back to metadata
+		const previousResponseId = cachedResponseId || lastBot.responseId;
+
 		// Build initial input
+		// Skip base system prompt when previous_response_id exists (OpenAI maintains context)
 		let input = buildInitialInput({
 			codeContainerFiles: fileManager.codeContainerFiles,
+			includeBasePrompt: !previousResponseId,
 		});
 
-		// Add conversation history
-		const historyInput = await buildConversationInput(
-			messages,
-			lastBot.index,
-			message.ts,
-			context,
-			fileManager.uploadOnce
-		);
-		input.push(...historyInput);
+		// Add conversation history ONLY if no previous_response_id
+		// When previous_response_id exists, OpenAI maintains context internally
+		if (!previousResponseId) {
+			const historyInput = await buildConversationInput(
+				messages,
+				lastBot.index,
+				message.ts,
+				context,
+				fileManager.uploadOnce
+			);
+			input.push(...historyInput);
+			logger.info(`Included conversation history: ${historyInput.length} items`);
+		} else {
+			logger.info(
+				`Skipping conversation history (using previous_response_id: ${previousResponseId})`
+			);
+		}
 
-		// Add current message with user context
+		// ALWAYS add current message (regardless of previous_response_id)
 		await appendCurrentMessage({
 			input,
 			message,
 			userProfile,
-			userDisplayName,
+			userDisplayName: `<@${userId}>`,
 			uploadOnce: fileManager.uploadOnce,
 		});
 
@@ -152,17 +182,17 @@ export async function respond({
 		const estimatedTokens = estimateTokenCount(input);
 
 		if (estimatedTokens > TOKEN_LIMITS.contextThreshold) {
-			console.log(
+			logger.info(
 				`[Context] Pre-flight: estimated ${estimatedTokens} tokens exceeds threshold, summarizing...`
 			);
 			await setStatus({ status: "summarizing conversation..." });
-			input = await summarizeConversationHistory(input, 6);
+			input = await summarizeConversationHistory(input, 6, logger);
 			contextSummarized = true;
-			console.log(`[Context] After summarization: estimated ${estimateTokenCount(input)} tokens`);
+			logger.info(`[Context] After summarization: estimated ${estimateTokenCount(input)} tokens`);
 		}
 
 		// State for the conversation loop
-		let previousResponseId = lastBot.responseId;
+		let _previousResponseId = previousResponseId;
 		let responseIdFromFinalTurn = null;
 		let _lastSeenResponseId = null;
 		let anyTextStreamed = false;
@@ -171,12 +201,16 @@ export async function respond({
 		let forceToolChoiceNext;
 		let loopIteration = 0;
 
+		logger.info(
+			`Previous response ID: ${_previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
+		);
+
 		// Main conversation loop
 		do {
 			loopIteration += 1;
-			logger.debug?.("Loop iteration: calling streamOnce", {
+			logger.info?.("Loop iteration: calling streamOnce", {
 				iteration: loopIteration,
-				previous_response_id: previousResponseId,
+				previous_response_id: _previousResponseId,
 				inputCount: input.length,
 				inputSummary: summarizeInputItems(input),
 			});
@@ -186,7 +220,7 @@ export async function respond({
 				streamResult = await executeStreamWithRetry({
 					input,
 					tools,
-					previousResponseId,
+					previousResponseId: _previousResponseId,
 					forceToolChoiceNext,
 					contextSummarized,
 					setStatus,
@@ -203,15 +237,15 @@ export async function respond({
 			} catch (streamError) {
 				// Check if this is a context window error
 				if (isContextWindowError(streamError) && !contextSummarized) {
-					console.log("[Context] Context window exceeded, attempting to summarize and retry...");
+					logger.info("[Context] Context window exceeded, attempting to summarize and retry...");
 					await setStatus({ status: "conversation too long, summarizing..." });
-					input = await summarizeConversationHistory(input, 4);
+					input = await summarizeConversationHistory(input, 4, logger);
 					contextSummarized = true;
 
 					streamResult = await executeStreamWithRetry({
 						input,
 						tools,
-						previousResponseId,
+						previousResponseId: _previousResponseId,
 						forceToolChoiceNext,
 						contextSummarized,
 						setStatus,
@@ -229,26 +263,42 @@ export async function respond({
 				}
 			}
 
-			const { functionCalls, responseId, hadText, incompleteReason, fullResponseText } =
-				streamResult;
+			const {
+				functionCalls,
+				outputFiles,
+				responseId,
+				hadText,
+				incompleteReason,
+				fullResponseText,
+			} = streamResult;
+
+			// Upload any generated files to Slack
+			if (outputFiles && outputFiles.length > 0) {
+				logger.info?.("Processing output files from code_interpreter", {
+					count: outputFiles.length,
+				});
+				await uploadOutputFilesToSlack(outputFiles, client, channel, thread_ts, logger);
+			}
 
 			// Update state
 			if (responseId) {
 				responseIdFromFinalTurn = responseId;
 				_lastSeenResponseId = responseId;
+				_previousResponseId = responseId;
+				// Cache the response ID for this thread
+				threadResponseCache.set(thread_ts, responseId);
 			}
 			if (hadText) anyTextStreamed = true;
 			if (incompleteReason) sawAnyIncomplete = true;
 			if (fullResponseText) lastFullText = fullResponseText;
 
 			// Prepare next turn
-			previousResponseId = responseId || previousResponseId;
 			input = [];
 			forceToolChoiceNext = undefined;
 
 			// Handle incomplete response with no output
 			if (!hadText && (!functionCalls || functionCalls.length === 0) && incompleteReason) {
-				logger.debug?.("Response was incomplete; continuing with forced text-only turn", {
+				logger.info?.("Response was incomplete; continuing with forced text-only turn", {
 					iteration: loopIteration,
 					incompleteReason,
 				});
@@ -282,7 +332,7 @@ export async function respond({
 					logger,
 				});
 
-				logger.debug?.("Executed function call", {
+				logger.info?.("Executed function call", {
 					iteration: loopIteration,
 					name: fc?.name,
 					call_id: fc?.call_id,
@@ -290,6 +340,18 @@ export async function respond({
 				});
 
 				input.push(...outItems);
+			}
+
+			// Rebuild tools array to include any newly uploaded code_interpreter files
+			if (fileManager.codeFileIds.size > 0) {
+				tools = buildToolsArray({
+					vectorStoreIds,
+					codeFileIds: fileManager.codeFileIds,
+				});
+				logger.debug?.("Rebuilt tools array with updated code_interpreter files", {
+					codeFileCount: fileManager.codeFileIds.size,
+					files: Array.from(fileManager.codeContainerFiles.values()),
+				});
 			}
 		} while (input.length > 0);
 
@@ -326,7 +388,7 @@ export async function respond({
 			logger.warn("No response ID was received from OpenAI");
 		}
 	} catch (e) {
-		console.error("OpenAI/stream error", {
+		logger.error("OpenAI/stream error", {
 			message: e?.message,
 			status: e?.status,
 			request_id: e?.request_id,
@@ -392,9 +454,18 @@ async function fetchUserProfile(client, userId, logger) {
 
 /**
  * Build initial input with system prompts.
+ * @param {Object} options
+ * @param {Map} options.codeContainerFiles - Files uploaded to code_interpreter
+ * @param {boolean} options.includeBasePrompt - Whether to include base system prompt (false for subsequent messages)
  */
-function buildInitialInput({ codeContainerFiles }) {
-	const input = [{ role: "system", content: [{ type: "input_text", text: SYSTEM_PROMPT }] }];
+function buildInitialInput({ codeContainerFiles, includeBasePrompt = true }) {
+	const input = [];
+
+	// Include base system prompt only on first message
+	// When previous_response_id exists, OpenAI maintains this context
+	if (includeBasePrompt) {
+		input.push({ role: "system", content: [{ type: "input_text", text: SYSTEM_PROMPT }] });
+	}
 
 	// Add attachment guidance if files are present
 	const codeFileNames = Array.from(codeContainerFiles.values());
@@ -461,6 +532,8 @@ async function executeStreamWithRetry({
 }) {
 	let streamer = null;
 	let postedFirstLine = false;
+	let totalCharsStreamed = 0; // Track message length
+	let truncated = false;
 
 	const result = await streamOnce(
 		{
@@ -472,7 +545,7 @@ async function executeStreamWithRetry({
 		{
 			setStatus,
 			logger,
-			onStreamStart: async () => {
+			onStreamStart: async (responseId) => {
 				// Create Slack streamer on first text output
 				try {
 					streamer = client.chatStream({
@@ -480,14 +553,53 @@ async function executeStreamWithRetry({
 						recipient_team_id: teamId,
 						recipient_user_id: userId,
 						thread_ts,
+						metadata: responseId
+							? {
+									event_type: "openai_context",
+									event_payload: {
+										response_id: responseId,
+										uploaded_files: fileManager.uploadedFilesThisTurn,
+									},
+								}
+							: undefined,
 					});
 					return streamer;
 				} catch (err) {
-					logger?.debug?.("Failed to create chatStream streamer", { err: String(err) });
+					logger?.info?.("Failed to create chatStream streamer", { err: String(err) });
 					return null;
 				}
 			},
 			onTextChunk: async (cleaned, streamController) => {
+				// Check if we're approaching Slack's message length limit
+				if (totalCharsStreamed + cleaned.length > SLACK_SAFE_LENGTH) {
+					if (!truncated) {
+						truncated = true;
+						const remaining = Math.max(0, SLACK_SAFE_LENGTH - totalCharsStreamed);
+						const truncatedChunk = cleaned.slice(0, remaining);
+						const warning = "\n\n... _(output truncated - message too long)_";
+
+						if (streamController) {
+							if (truncatedChunk.length > 0) {
+								await streamController.append({ markdown_text: truncatedChunk });
+							}
+							await streamController.append({ markdown_text: warning });
+						} else {
+							const text = truncatedChunk + warning;
+							await say({ text });
+						}
+
+						totalCharsStreamed += truncatedChunk.length + warning.length;
+						logger?.warn?.("Truncated streaming output - exceeded Slack message limit", {
+							totalChars: totalCharsStreamed,
+							limit: SLACK_SAFE_LENGTH,
+						});
+					}
+					// Drop remaining chunks
+					return;
+				}
+
+				totalCharsStreamed += cleaned.length;
+
 				if (streamController) {
 					await streamController.append({ markdown_text: cleaned });
 				} else {
@@ -509,26 +621,13 @@ async function executeStreamWithRetry({
 		}
 	);
 
-	// Attach metadata to streamed message
-	if (streamer && result.responseId) {
+	// Stop the streamer
+	if (streamer) {
 		try {
-			const stopResult = await streamer.stop();
-			const msgTs = stopResult?.message?.ts;
-			if (msgTs) {
-				await client.chat.update({
-					channel,
-					ts: msgTs,
-					metadata: {
-						event_type: "openai_context",
-						event_payload: {
-							response_id: result.responseId,
-							uploaded_files: fileManager.uploadedFilesThisTurn,
-						},
-					},
-				});
-			}
+			await streamer.stop();
+			logger?.info?.("Stopped stream", { response_id: result.responseId });
 		} catch (e) {
-			logger?.debug?.("Failed to attach metadata to streamed message", { e: String(e) });
+			logger?.warn?.("Failed to stop stream", { error: String(e) });
 		}
 	}
 

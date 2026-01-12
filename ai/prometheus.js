@@ -68,7 +68,7 @@ Supports two query modes:
  * @param {Object} [logger] - Optional logger
  * @returns {Promise<Object>} Query result
  */
-export async function executePromQLQuery(args, _logger) {
+export async function executePromQLQuery(args, logger) {
 	const prometheusUrl = process.env.M8B_PROMETHEUS_URL;
 	if (!prometheusUrl) {
 		return {
@@ -105,7 +105,7 @@ export async function executePromQLQuery(args, _logger) {
 			url.searchParams.set("query", query);
 		}
 
-		console.log(`[Prometheus] Executing ${isRangeQuery ? "range" : "instant"} query: ${query}`);
+		logger?.info?.(`[Prometheus] Executing ${isRangeQuery ? "range" : "instant"} query: ${query}`);
 		const startTime = Date.now();
 
 		const response = await fetch(url.toString(), {
@@ -117,7 +117,7 @@ export async function executePromQLQuery(args, _logger) {
 
 		if (!response.ok) {
 			const errorText = await response.text();
-			console.error(`[Prometheus] Query failed with status ${response.status}: ${errorText}`);
+			logger?.error?.(`[Prometheus] Query failed with status ${response.status}: ${errorText}`);
 			return {
 				ok: false,
 				error: `Prometheus query failed: ${response.status} ${response.statusText}`,
@@ -126,7 +126,7 @@ export async function executePromQLQuery(args, _logger) {
 		}
 
 		const data = await response.json();
-		console.log(`[Prometheus] Query completed in ${Date.now() - startTime}ms`);
+		logger?.info?.(`[Prometheus] Query completed in ${Date.now() - startTime}ms`);
 
 		if (data.status !== "success") {
 			return {
@@ -143,7 +143,7 @@ export async function executePromQLQuery(args, _logger) {
 			result: data.data?.result,
 		};
 	} catch (e) {
-		console.error(`[Prometheus] Query failed:`, e);
+		logger?.error?.(`[Prometheus] Query failed:`, { error: e });
 		return { ok: false, error: `Failed to execute Prometheus query: ${String(e)}` };
 	}
 }

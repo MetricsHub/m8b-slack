@@ -34,7 +34,7 @@
 				"useTemplate": "warn"
 			},
 			"suspicious": {
-				"noConsole": "off",
+				"noConsole": "error",
 				"noExplicitAny": "off"
 			}
 		}

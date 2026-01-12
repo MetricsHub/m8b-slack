@@ -87,16 +87,16 @@ describe("summarizeInputItems", () => {
 
 		expect(summary).toHaveLength(2);
 		expect(summary[0]).toEqual({
-			idx: 0,
 			role: "system",
-			types: ["input_text"],
-			totalText: 5,
+			types: "input_text",
+			chars: 5,
+			preview: "Hello",
 		});
 		expect(summary[1]).toEqual({
-			idx: 1,
 			role: "user",
-			types: ["input_text", "input_image"],
-			totalText: 5,
+			types: "input_text,input_image",
+			chars: 5,
+			preview: "World",
 		});
 	});
 });

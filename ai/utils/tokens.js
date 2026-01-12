@@ -50,22 +50,38 @@ export function isContextWindowError(error) {
  * Create a summary of input items for debugging.
  *
  * @param {Array} items - Input items to summarize
- * @returns {Array} Summary objects with role, types, and text length
+ * @returns {Array} Summary objects with role, types, and text preview
  */
 export function summarizeInputItems(items) {
 	try {
-		return (items || []).map((item, idx) => {
-			const types = Array.isArray(item?.content)
-				? item.content.map((c) => c?.type).filter(Boolean)
-				: [];
+		return (items || []).map((item) => {
+			const content = Array.isArray(item?.content) ? item.content : [];
+			const types = content.map((c) => c?.type).filter(Boolean);
 
-			const textLens = Array.isArray(item?.content)
-				? item.content.filter((c) => c?.type === "input_text").map((c) => (c.text || "").length)
-				: [];
+			// Get text preview from first text content
+			const firstText = content.find((c) => c?.type === "input_text");
+			const textPreview = firstText?.text
+				? firstText.text.slice(0, 80).replace(/\n/g, " ") +
+					(firstText.text.length > 80 ? "..." : "")
+				: null;
 
-			const totalText = textLens.reduce((a, b) => a + b, 0);
+			const totalText = content
+				.filter((c) => c?.type === "input_text")
+				.reduce((sum, c) => sum + (c.text || "").length, 0);
 
-			return { idx, role: item?.role, types, totalText };
+			// Build compact summary string
+			const typeSummary = types.join(",") || "empty";
+			const summary = {
+				role: item?.role || "?",
+				types: typeSummary,
+				chars: totalText,
+			};
+
+			if (textPreview) {
+				summary.preview = textPreview;
+			}
+
+			return summary;
 		});
 	} catch {
 		return [];

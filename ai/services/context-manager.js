@@ -14,7 +14,8 @@ import { getTextFromResponse, openai } from "./openai.js";
  */
 export async function summarizeConversationHistory(
 	inputItems,
-	keepRecentCount = TOKEN_LIMITS.keepRecentMessages
+	keepRecentCount = TOKEN_LIMITS.keepRecentMessages,
+	logger = null
 ) {
 	// Split input into system prompts, older messages, and recent messages
 	const systemItems = [];
@@ -60,7 +61,7 @@ export async function summarizeConversationHistory(
 		return [...systemItems, ...recentItems];
 	}
 
-	console.log(
+	logger?.info?.(
 		`[Context] Summarizing ${olderItems.length} older messages to reduce context size...`
 	);
 
@@ -90,7 +91,7 @@ export async function summarizeConversationHistory(
 			getTextFromResponse(summaryResponse) ||
 			"Previous conversation occurred but could not be summarized.";
 
-		console.log(`[Context] Conversation summarized to ${summaryText.length} chars`);
+		logger?.info?.(`[Context] Conversation summarized to ${summaryText.length} chars`);
 
 		// Build new input with summary
 		return [
@@ -107,7 +108,7 @@ export async function summarizeConversationHistory(
 			...recentItems,
 		];
 	} catch (e) {
-		console.error("[Context] Failed to summarize conversation:", e);
+		logger?.error?.("[Context] Failed to summarize conversation:", { error: e });
 		// Fallback: just use system + recent items
 		return [...systemItems, ...recentItems];
 	}
@@ -120,11 +121,15 @@ export async function summarizeConversationHistory(
  * @param {Object} context - Slack context with BOT_ID and BOT_USER_ID
  * @returns {{index: number, message: Object|null, responseId: string|null}}
  */
-export function findLastBotMessage(messages, context) {
+export function findLastBotMessage(messages, context, logger = null) {
+	const msgCount = messages?.length || 0;
+	logger?.info?.(`[CONTEXT] Searching ${msgCount} messages for previous bot response`);
+
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
-		const hasOpenAiMeta =
-			msg.metadata?.event_type === "openai_context" && msg.metadata?.event_payload?.response_id;
+		// Check for openai_context metadata with response_id
+		const responseId = msg.metadata?.event_payload?.response_id;
+		const hasOpenAiMeta = msg.metadata?.event_type === "openai_context" && responseId;
 
 		const authoredByThisBot =
 			(msg.bot_id && context.BOT_ID && msg.bot_id === context.BOT_ID) ||
@@ -132,14 +137,16 @@ export function findLastBotMessage(messages, context) {
 			(msg.app_id && context.BOT_ID && msg.app_id === context.BOT_ID);
 
 		if (hasOpenAiMeta && (authoredByThisBot || msg.bot_id || msg.app_id)) {
+			logger?.info?.(`[CONTEXT] Found previous response at msg ${i}: ${responseId.slice(-12)}`);
 			return {
 				index: i,
 				message: msg,
-				responseId: msg.metadata.event_payload.response_id,
+				responseId,
 			};
 		}
 	}
 
+	logger?.info?.(`[CONTEXT] No previous bot response found (will send full context)`);
 	return { index: -1, message: null, responseId: null };
 }
 

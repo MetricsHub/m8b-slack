@@ -6,11 +6,7 @@ import { registerListeners } from "./listeners/index.js";
 // Determine log level based on NODE_ENV
 const env = process.env.NODE_ENV?.toLowerCase();
 const resolvedLogLevel =
-	env === "production"
-		? LogLevel.INFO // suppress DEBUG in production
-		: env === "test"
-			? LogLevel.WARN
-			: LogLevel.DEBUG; // default for dev/undefined
+	env === "production" ? LogLevel.WARN : env === "test" ? LogLevel.INFO : LogLevel.DEBUG; // debug/development default
 
 // Initialize the Bolt app
 const app = new App({

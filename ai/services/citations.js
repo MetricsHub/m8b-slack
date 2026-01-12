@@ -116,7 +116,7 @@ export async function processCitations({
 		let uploadCount = 0;
 
 		if (!vectorStoreIds?.length) {
-			logger?.debug?.("No vector store IDs configured; skipping attachment fetches for citations");
+			logger?.info?.("No vector store IDs configured; skipping attachment fetches for citations");
 		} else {
 			for (const [fileId, filename] of citationMap.entries()) {
 				if (uploadCount >= maxUploads) break;
@@ -196,13 +196,13 @@ export async function processCitations({
 						// Cleanup
 						fsp.rm(tmpDir, { recursive: true }).catch(() => {});
 					} else {
-						logger?.debug?.("Vector store file content fetch failed", {
+						logger?.info?.("Vector store file content fetch failed", {
 							fileId,
 							vectorStoreIds,
 						});
 					}
 				} catch (e) {
-					logger?.debug?.("Failed to fetch/upload cited file", {
+					logger?.info?.("Failed to fetch/upload cited file", {
 						fileId,
 						e: String(e),
 					});
@@ -215,6 +215,6 @@ export async function processCitations({
 			await say?.({ text: `Sources: ${filenames.join(", ")}` });
 		}
 	} catch (e) {
-		logger?.debug?.("Citation post-processing skipped/failed", { e: String(e) });
+		logger?.info?.("Citation post-processing skipped/failed", { e: String(e) });
 	}
 }

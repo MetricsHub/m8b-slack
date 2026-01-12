@@ -163,7 +163,7 @@ export function createFileUploadManager(previousUploads, logger) {
 			cache.set(key, result);
 			return result;
 		} catch (err) {
-			logger?.debug?.("Upload failed for Slack file", {
+			logger?.info?.("Upload failed for Slack file", {
 				name: file?.name,
 				err: String(err),
 			});
@@ -204,4 +204,223 @@ export function extractPreviousUploads(messages) {
 	}
 
 	return uploads;
+}
+
+/**
+ * Download a file from OpenAI (either regular or container file).
+ *
+ * @param {Object} outputFile - OpenAI output file object with file_id
+ * @param {Object} logger - Logger instance
+ * @returns {Promise<Object|null>} Object with buffer, filename, type or null on failure
+ */
+async function downloadOpenAIFile(outputFile, logger) {
+	const { file_id, filename, type, sandbox_path, container_id } = outputFile;
+
+	// Handle sandbox:/ file paths (code_interpreter output)
+	if (type === "sandbox_file" && sandbox_path) {
+		logger?.warn?.("Sandbox file detected - cannot download sandbox:/ paths", {
+			sandbox_path,
+			filename,
+			note: "Files must be explicitly written and saved to generate downloadable file_ids",
+		});
+		return null;
+	}
+
+	if (!file_id) {
+		logger?.warn?.("No file_id in output file", { outputFile });
+		return null;
+	}
+
+	try {
+		logger?.info?.("Downloading OpenAI file", { file_id, filename, type, container_id });
+
+		let fileContent;
+
+		// Container files (cfile_*) need to be downloaded using container API
+		if (file_id.startsWith("cfile_") && container_id) {
+			logger?.info?.("Downloading container file content", { container_id, file_id });
+			// Use the container-specific content endpoint: /v1/containers/{container_id}/files/{file_id}/content
+			const response = await fetch(
+				`https://api.openai.com/v1/containers/${container_id}/files/${file_id}/content`,
+				{
+					headers: {
+						Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+						"OpenAI-Beta": "responses=v1",
+					},
+				}
+			);
+
+			if (!response.ok) {
+				throw new Error(
+					`Container file content download failed: ${response.status} ${response.statusText}`
+				);
+			}
+
+			fileContent = response;
+		} else {
+			// Regular file download using OpenAI SDK
+			fileContent = await openai.files.content(file_id);
+		}
+
+		// Convert to buffer
+		const arrayBuffer = await fileContent.arrayBuffer();
+		const buffer = Buffer.from(arrayBuffer);
+
+		// Determine filename
+		const finalFilename =
+			filename || `${type === "image" ? "generated_image" : "generated_file"}_${file_id.slice(-8)}`;
+
+		logger?.info?.("Downloaded OpenAI file", {
+			file_id,
+			filename: finalFilename,
+			size: buffer.length,
+		});
+
+		return { buffer, filename: finalFilename, type, file_id };
+	} catch (e) {
+		logger?.error?.("Failed to download OpenAI file", {
+			file_id,
+			filename,
+			error: String(e),
+		});
+		return null;
+	}
+}
+
+/**
+ * Download a file from OpenAI and upload it to Slack (single file).
+ *
+ * @param {Object} outputFile - OpenAI output file object with file_id
+ * @param {Object} client - Slack client
+ * @param {string} channel - Slack channel ID
+ * @param {string} thread_ts - Thread timestamp
+ * @param {Object} logger - Logger instance
+ * @returns {Promise<Object|null>} Slack file upload result or null on failure
+ */
+export async function uploadOpenAIFileToSlack(outputFile, client, channel, thread_ts, logger) {
+	const downloaded = await downloadOpenAIFile(outputFile, logger);
+	if (!downloaded) {
+		return null;
+	}
+
+	const { buffer, filename, type } = downloaded;
+
+	try {
+		logger?.info?.("Uploading to Slack", {
+			filename,
+			size: buffer.length,
+			channel,
+			thread_ts,
+		});
+
+		// Upload to Slack
+		const result = await client.filesUploadV2({
+			channel_id: channel,
+			thread_ts,
+			filename,
+			file: buffer,
+			initial_comment:
+				type === "image" ? "Here's the generated image:" : `Here's the generated file:`,
+		});
+
+		logger?.info?.("Slack file upload successful", {
+			file_id: outputFile.file_id,
+			slack_file: result?.files?.[0]?.id,
+		});
+
+		return result;
+	} catch (e) {
+		logger?.error?.("Failed to upload OpenAI file to Slack", {
+			file_id: outputFile.file_id,
+			filename,
+			error: String(e),
+		});
+		return null;
+	}
+}
+
+/**
+ * Process and upload all output files from a response to Slack.
+ * Uploads all files in a single message instead of separate messages.
+ *
+ * @param {Array} outputFiles - Array of output file objects from streaming
+ * @param {Object} client - Slack client
+ * @param {string} channel - Slack channel ID
+ * @param {string} thread_ts - Thread timestamp
+ * @param {Object} logger - Logger instance
+ * @returns {Promise<Array>} Array of successfully uploaded file results
+ */
+export async function uploadOutputFilesToSlack(outputFiles, client, channel, thread_ts, logger) {
+	if (!outputFiles || outputFiles.length === 0) {
+		return [];
+	}
+
+	logger?.info?.("Processing output files for Slack upload", {
+		count: outputFiles.length,
+		files: outputFiles.map((f) => ({ file_id: f.file_id, filename: f.filename, type: f.type })),
+	});
+
+	// Download all files first
+	const downloadedFiles = [];
+	for (const file of outputFiles) {
+		try {
+			const downloaded = await downloadOpenAIFile(file, logger);
+			if (downloaded) {
+				downloadedFiles.push(downloaded);
+			}
+		} catch (e) {
+			logger?.error?.("Failed to download file", {
+				file_id: file.file_id,
+				error: String(e),
+			});
+		}
+	}
+
+	if (downloadedFiles.length === 0) {
+		return [];
+	}
+
+	// Upload all files in a single Slack message
+	try {
+		const fileUploads = downloadedFiles.map((f) => ({
+			file: f.buffer,
+			filename: f.filename,
+		}));
+
+		const hasImages = downloadedFiles.some((f) => f.type === "image");
+		const fileCount = downloadedFiles.length;
+		const comment =
+			fileCount === 1
+				? hasImages
+					? "Here's the generated image:"
+					: "Here's the generated file:"
+				: `Here are ${fileCount} generated files:`;
+
+		logger?.info?.("Uploading files to Slack", {
+			fileCount,
+			filenames: downloadedFiles.map((f) => f.filename),
+			channel,
+			thread_ts,
+		});
+
+		const result = await client.filesUploadV2({
+			channel_id: channel,
+			thread_ts,
+			file_uploads: fileUploads,
+			initial_comment: comment,
+		});
+
+		logger?.info?.("Slack file upload successful", {
+			fileCount,
+			slack_files: result?.files?.map((f) => f?.id),
+		});
+
+		return [result];
+	} catch (e) {
+		logger?.error?.("Failed to upload files to Slack", {
+			fileCount: downloadedFiles.length,
+			error: String(e),
+		});
+		return [];
+	}
 }
