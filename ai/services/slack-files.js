@@ -323,9 +323,11 @@ export async function uploadOpenAIFileToSlack(outputFile, client, channel, threa
 				type === "image" ? "Here's the generated image:" : `Here's the generated file:`,
 		});
 
+		// filesUploadV2 returns { files: [{ ok, files: [...] }] } structure
+		const slackFileId = result?.files?.[0]?.files?.[0]?.id || result?.files?.[0]?.id;
 		logger?.info?.("Slack file upload successful", {
 			file_id: outputFile.file_id,
-			slack_file: result?.files?.[0]?.id,
+			slack_file_id: slackFileId,
 		});
 
 		return result;
@@ -410,9 +412,11 @@ export async function uploadOutputFilesToSlack(outputFiles, client, channel, thr
 			initial_comment: comment,
 		});
 
+		// filesUploadV2 returns { files: [{ ok, files: [...] }] } structure
+		const uploadedIds = result?.files?.flatMap((f) => f?.files?.map((sf) => sf?.id) || []) || [];
 		logger?.info?.("Slack file upload successful", {
 			fileCount,
-			slack_files: result?.files?.map((f) => f?.id),
+			slack_file_ids: uploadedIds,
 		});
 
 		return [result];

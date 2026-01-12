@@ -9,8 +9,9 @@ import path from "node:path";
 import { executeMcpFunctionCall } from "../mcp_registry.js";
 import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
-import { HARD_MAX_OUTPUT_CHARS, handleLargeToolOutput } from "../utils/output-handler.js";
+import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
 import { openai } from "./openai.js";
+import { executeWithMiddleware } from "./tool-middleware.js";
 
 /**
  * Process a single function call from OpenAI.
@@ -29,15 +30,23 @@ export async function processFunctionCall(functionCall, context) {
 	const { name, call_id, arguments: argsStr } = functionCall;
 	const { client, message, say, vectorStoreIds, fileTracking, logger } = context;
 
-	let output = { ok: true };
+	logger?.info?.(`[FUNCTION] ${name}`, { call_id: call_id?.slice(-12) });
 
-	console.log(`[FUNCTION_CALL] Processing: ${name} (call_id: ${call_id})`);
-	console.log(`[FUNCTION_CALL] Arguments: ${argsStr}`);
+	let output;
+
+	// Middleware options for caching/pagination/file uploads
+	const middlewareOptions = {
+		logger,
+		openaiClient: openai,
+		fileTracking,
+	};
 
 	try {
 		const args = argsStr ? JSON.parse(argsStr) : {};
 
+		// Route to appropriate handler with middleware for pagination/caching
 		switch (name) {
+			// Internal Slack functions - no caching needed
 			case "slack_add_reaction":
 				output = await handleSlackReaction(args, client, message);
 				break;
@@ -50,40 +59,42 @@ export async function processFunctionCall(functionCall, context) {
 				output = await handleUpdateKnowledge(args, vectorStoreIds, say);
 				break;
 
+			// Prometheus - use middleware for potential large results
 			case "PromQLQuery":
-				output = await handlePromQLQuery(args, logger);
+				output = await executeWithMiddleware(
+					name,
+					args,
+					async (_name, cleanArgs) => executePromQLQuery(cleanArgs, logger),
+					middlewareOptions
+				);
 				break;
 
+			// MCP functions - use middleware for caching and pagination
 			default:
-				output = await handleMcpFunctionCall(name, args, logger);
+				output = await executeWithMiddleware(
+					name,
+					args,
+					async (_name, cleanArgs) => handleMcpFunctionCall(_name, cleanArgs, logger),
+					middlewareOptions
+				);
 				break;
 		}
 	} catch (err) {
-		console.error(`[FUNCTION_CALL] Error processing ${name}:`, err);
+		logger?.error?.(`[FUNCTION] Error: ${name}`, { error: err });
 		output = { ok: false, error: String(err) };
 	}
 
-	console.log(`[FUNCTION_CALL] Output for ${name}:`, JSON.stringify(output).slice(0, 500));
-
-	// Handle large outputs
-	const { output: processedOutput } = await handleLargeToolOutput(
-		output,
-		name,
-		openai,
-		fileTracking
-	);
+	// Log summary
+	logger?.info?.(`[FUNCTION] ${name} → ${formatOutputSummary(output)}`);
 
 	// Final safety check
-	let finalOutputStr = JSON.stringify(processedOutput);
+	let finalOutputStr = JSON.stringify(output);
 	if (finalOutputStr.length > HARD_MAX_OUTPUT_CHARS) {
-		console.warn(
-			`[FUNCTION_CALL] Output still too large after processing (${finalOutputStr.length} chars)`
-		);
+		logger?.warn?.(`[FUNCTION] Output too large (${finalOutputStr.length} chars)`);
 		finalOutputStr = JSON.stringify({
-			ok: processedOutput?.ok ?? true,
+			ok: false,
 			error: "Output exceeded maximum size limit",
-			originalSize: finalOutputStr.length,
-			hint: "Request more specific data to reduce response size.",
+			hint: "Use smaller maxResults or more specific query parameters.",
 		});
 	}
 
@@ -94,6 +105,31 @@ export async function processFunctionCall(functionCall, context) {
 			output: finalOutputStr,
 		},
 	];
+}
+
+/**
+ * Format output for logging.
+ */
+function formatOutputSummary(output) {
+	if (!output || typeof output !== "object") {
+		return String(output).slice(0, 80);
+	}
+
+	const parts = [];
+	if (output.ok === true) parts.push("✓");
+	else if (output.ok === false) parts.push("✗");
+
+	if (output.error) return `✗ ${String(output.error).slice(0, 80)}`;
+
+	if (output.hosts) {
+		const count = typeof output.hosts === "object" ? Object.keys(output.hosts).length : 0;
+		parts.push(`${count} hosts`);
+	}
+	if (output._pagination?.total) {
+		parts.push(`(${output._pagination.returned}/${output._pagination.total})`);
+	}
+
+	return parts.length > 0 ? parts.join(" ") : "ok";
 }
 
 /**
@@ -231,43 +267,20 @@ async function handleUpdateKnowledge(args, vectorStoreIds, say) {
 			attachResults: attachResults,
 		};
 	} catch (e) {
-		console.error("[update_knowledge] Error:", e);
 		return { ok: false, error: String(e) };
 	}
 }
 
 /**
- * Handle PromQL query function call.
- */
-async function handlePromQLQuery(args, logger) {
-	console.log(`[FUNCTION_CALL] Executing PromQL query`);
-
-	try {
-		const result = await executePromQLQuery(args, logger);
-		console.log(`[FUNCTION_CALL] PromQL result:`, JSON.stringify(result).slice(0, 500));
-		return result;
-	} catch (e) {
-		console.error(`[FUNCTION_CALL] PromQL error:`, e);
-		return { ok: false, error: String(e) };
-	}
-}
-
-/**
- * Handle MCP function calls.
+ * Handle MCP function calls (raw execution, middleware handles caching/pagination).
  */
 async function handleMcpFunctionCall(name, args, logger) {
-	console.log(`[FUNCTION_CALL] Delegating to MCP registry: ${name}`);
-
 	try {
 		let result = await executeMcpFunctionCall(name, args, logger);
-		// Some MCP tools return JSON as a string
 		result = tryParseJsonString(result);
-
-		console.log(`[FUNCTION_CALL] MCP result for ${name}:`, JSON.stringify(result).slice(0, 500));
-
 		return result && typeof result === "object" ? result : { ok: true, result: result };
 	} catch (e) {
-		console.error(`[FUNCTION_CALL] MCP error for ${name}:`, e);
+		logger?.error?.(`[MCP] Error for ${name}:`, { error: e });
 		return { ok: false, error: String(e) };
 	}
 }

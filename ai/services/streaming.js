@@ -211,6 +211,7 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 
 	// Reasoning buffer for status updates
 	let reasoningBuf = "";
+	let reasoningLogged = false; // Track if we've already logged the reasoning
 	let lastStatusAt = 0;
 	let lastSentJson = "";
 
@@ -281,6 +282,20 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 				if (item?.type === "function_call") {
 					evtCounters.output_item_added_function_call++;
 					functionCalls[evt.output_index] = { ...item, arguments: item.arguments || "" };
+
+					// Log reasoning BEFORE logging the function call (explains WHY the function is being called)
+					if (reasoningBuf.length > 0 && !reasoningLogged) {
+						reasoningLogged = true;
+						const reasoningPreview =
+							reasoningBuf.length > 2000
+								? `${reasoningBuf.slice(0, 2000)}... [${reasoningBuf.length - 2000} more chars]`
+								: reasoningBuf;
+						logger?.info?.(
+							`[REASONING] LLM reasoning (${reasoningBuf.length} chars):\n${reasoningPreview}`
+						);
+					}
+
+					// Note: arguments are streamed incrementally, so we log them when complete
 					logger?.info?.("[ACTION] LLM initiated function call", {
 						name: item.name,
 						call_id: item.call_id,
@@ -312,11 +327,12 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 					const idx = evt.output_index;
 					const prior = functionCalls[idx] || { arguments: "" };
 					functionCalls[idx] = { ...evt.item, arguments: prior.arguments };
-					logger?.info?.("[ACTION] Function call completed", {
-						name: evt.item.name,
-						call_id: evt.item.call_id,
-						argumentsLength: prior.arguments.length,
-					});
+					// Log full arguments when function call is complete
+					const argsPreview =
+						prior.arguments.length > 500 ? prior.arguments.slice(0, 500) + "..." : prior.arguments;
+					logger?.info?.(
+						`[ACTION] Function call ready: ${evt.item.name}\n  Arguments: ${argsPreview}`
+					);
 				} else if (evt.item?.type === "message") {
 					// Extract container_file_citation annotations from message content
 					for (const contentItem of evt.item.content || []) {
@@ -344,11 +360,11 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 					const containerId = evt.item?.container_id;
 					const results = evt.item?.results || [];
 
-					logger?.info?.("[CODE_INTERPRETER] LLM executed Python code", {
-						codeLength: code.length,
-						codePreview: code.slice(0, 200) + (code.length > 200 ? "..." : ""),
-						containerId,
-					});
+					// Log code in a readable format (as a code block)
+					const codePreview = code.length > 300 ? code.slice(0, 300) + "..." : code;
+					logger?.info?.(
+						`[CODE_INTERPRETER] LLM executed Python code (${code.length} chars):\n\`\`\`python\n${codePreview}\n\`\`\``
+					);
 
 					// Track container ID - we'll query for files once at the END of streaming
 					if (containerId) {
@@ -403,15 +419,16 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 
 				if (!startedWriting) {
 					startedWriting = true;
-					// Log reasoning summary before starting text output
-					if (reasoningBuf.length > 0) {
-						// Show more of the reasoning (up to 1500 chars) for better debugging
+					// Log reasoning summary before starting text output (if not already logged)
+					if (reasoningBuf.length > 0 && !reasoningLogged) {
+						reasoningLogged = true;
+						// Show more of the reasoning (up to 2000 chars) for better debugging
 						const reasoningPreview =
-							reasoningBuf.length > 1500
-								? `${reasoningBuf.slice(0, 1500)}... [${reasoningBuf.length - 1500} more chars]`
+							reasoningBuf.length > 2000
+								? `${reasoningBuf.slice(0, 2000)}... [${reasoningBuf.length - 2000} more chars]`
 								: reasoningBuf;
 						logger?.info?.(
-							`[REASONING] LLM reasoning complete (${reasoningBuf.length} chars):\n${reasoningPreview}`
+							`[REASONING] LLM reasoning (${reasoningBuf.length} chars):\n${reasoningPreview}`
 						);
 					}
 
