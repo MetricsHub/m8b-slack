@@ -236,6 +236,35 @@ export function getAggregatedHosts() {
 export function getOpenAiFunctionTools() {
 	const tools = [];
 
+	// ListAgents - list all registered MCP agents
+	tools.push({
+		type: "function",
+		name: "ListAgents",
+		description:
+			"List all registered MetricsHub agents. Returns the label and URL of each agent that has been configured and connected.",
+		parameters: { type: "object", properties: {}, additionalProperties: false },
+	});
+
+	// TestAgents - test connectivity and health of agents
+	tools.push({
+		type: "function",
+		name: "TestAgents",
+		description:
+			"Test the health and connectivity of one or more MetricsHub agents. Makes a connection to each MCP server and retrieves the list of tools to verify the agent is responding. Returns the response time and status for each agent.",
+		parameters: {
+			type: "object",
+			properties: {
+				agents: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Optional list of agent labels to test. If not provided, all registered agents will be tested.",
+				},
+			},
+			additionalProperties: false,
+		},
+	});
+
 	// Consolidated ListHosts
 	tools.push({
 		type: "function",
@@ -321,6 +350,73 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 	console.log(`[MCP] executeMcpFunctionCall called: ${name}`, JSON.stringify(args));
 
 	// Special local functions
+	if (name === "ListAgents") {
+		const agents = state.servers.map((s) => ({
+			label: s.server_label,
+			url: s.server_url,
+			connected: s.client !== null,
+			toolCount: s.tools.size,
+		}));
+		return { ok: true, agentCount: agents.length, agents };
+	}
+
+	if (name === "TestAgents") {
+		const requestedAgents = Array.isArray(args?.agents) ? args.agents : [];
+		const serversToTest =
+			requestedAgents.length > 0
+				? state.servers.filter((s) => requestedAgents.includes(s.server_label))
+				: state.servers;
+
+		const results = [];
+		for (const server of serversToTest) {
+			const startTime = Date.now();
+			try {
+				// Try to connect/reconnect and list tools
+				const connected = await _ensureConnected(server);
+				if (!connected) {
+					results.push({
+						label: server.server_label,
+						url: server.server_url,
+						ok: false,
+						error: "Failed to connect",
+						responseTimeMs: Date.now() - startTime,
+					});
+					continue;
+				}
+
+				// Get list of tools to verify the connection is working
+				const toolsResult = await server.client.listTools();
+				const toolCount = toolsResult.tools?.length || 0;
+				const responseTimeMs = Date.now() - startTime;
+
+				results.push({
+					label: server.server_label,
+					url: server.server_url,
+					ok: true,
+					responseTimeMs,
+					toolCount,
+				});
+			} catch (e) {
+				results.push({
+					label: server.server_label,
+					url: server.server_url,
+					ok: false,
+					error: String(e.message || e),
+					responseTimeMs: Date.now() - startTime,
+				});
+			}
+		}
+
+		const healthyCount = results.filter((r) => r.ok).length;
+		return {
+			ok: true,
+			testedCount: results.length,
+			healthyCount,
+			unhealthyCount: results.length - healthyCount,
+			results,
+		};
+	}
+
 	if (name === "ListHosts") {
 		return { ok: true, hosts: getAggregatedHosts() };
 	}
