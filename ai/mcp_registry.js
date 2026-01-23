@@ -279,13 +279,14 @@ export function getOpenAiFunctionTools() {
 		type: "function",
 		name: "SearchHost",
 		description:
-			"Search hosts by regex (case-insensitive) across consolidated host keys and attributes.host.name.",
+			"Search hosts by pattern across consolidated host keys and attributes.host.name. The search is always case-insensitive. Returns matching hosts with their attributes and protocols.",
 		parameters: {
 			type: "object",
 			properties: {
 				pattern: {
 					type: "string",
-					description: "Regular expression to match host keys or host names (case-insensitive).",
+					description:
+						"JavaScript regex pattern to match host keys or host names. Case-insensitive by default. Use simple patterns like 'nvidia', 'nvidia|gpu', or 'dev-.*-01'. Do NOT use (?i) or other inline flags — they are not supported in JavaScript regex.",
 				},
 			},
 			required: ["pattern"],

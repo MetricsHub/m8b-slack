@@ -18,8 +18,8 @@ import path from "node:path";
 /** Default maximum items to return per page */
 export const DEFAULT_MAX_RESULTS = 100;
 
-/** Maximum characters for inline output (~7500 tokens) - above this, upload as file */
-export const MAX_INLINE_OUTPUT_CHARS = 30000;
+/** Maximum characters for inline output (~125K tokens) - above this, upload as file */
+export const MAX_INLINE_OUTPUT_CHARS = 500000;
 
 /** Hard limit (1MB, well under OpenAI's 10MB limit) */
 export const HARD_MAX_OUTPUT_CHARS = 1000000;
@@ -392,6 +392,9 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 		return { ok: false, error: String(e) };
 	}
 
+	// Compress MCP output to reduce payload size (removes verbose/redundant fields)
+	result = compressMcpOutput(result, name, logger);
+
 	// Always upload the full result as a file (if we have the client)
 	let uploadedFile = null;
 	if (openaiClient && fileTracking) {
@@ -460,4 +463,242 @@ export function getCacheStats() {
 		size: resultCache.size,
 		keys: [...resultCache.keys()],
 	};
+}
+
+// ============================================================================
+// MCP Output Compression
+// ============================================================================
+
+/**
+ * Fields to remove from MCP metric objects (reduce payload size).
+ */
+const METRIC_FIELDS_TO_REMOVE = [
+	"resetMetricsTime",
+	"name",
+	"updated",
+	"type",
+	"collectTime",
+	"previousCollectTime",
+	"previousValue",
+];
+
+/**
+ * Fields to remove from MCP monitor objects.
+ */
+const MONITOR_FIELDS_TO_REMOVE = ["discoveryTime", "identifyingAttributeKeys"];
+
+/**
+ * Boolean flags to remove when false (they add no information).
+ */
+const FALSE_FLAGS_TO_REMOVE = ["connector", "endpoint", "endpointHost", "is_endpoint"];
+
+/**
+ * Recursively remove empty objects and arrays from an object.
+ * @param {*} obj - The object to clean
+ * @returns {*} Cleaned object or undefined if empty
+ */
+function removeEmptyObjects(obj) {
+	if (obj === null || typeof obj !== "object") {
+		return obj;
+	}
+
+	if (Array.isArray(obj)) {
+		const cleaned = obj.map(removeEmptyObjects).filter((item) => item !== undefined);
+		return cleaned.length > 0 ? cleaned : undefined;
+	}
+
+	const cleaned = {};
+	for (const [key, value] of Object.entries(obj)) {
+		const cleanedValue = removeEmptyObjects(value);
+		if (cleanedValue !== undefined) {
+			cleaned[key] = cleanedValue;
+		}
+	}
+
+	return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+}
+
+/**
+ * Remove duplicate content from legacyTextParameters.StatusInformation.
+ * The field often contains the same output twice (once as "Result:" and again as "Result:" under "Message:").
+ * @param {string} statusInfo - The StatusInformation string
+ * @returns {string} Deduplicated string
+ */
+function deduplicateStatusInformation(statusInfo) {
+	if (!statusInfo || typeof statusInfo !== "string") {
+		return statusInfo;
+	}
+
+	// Pattern: content appears after "Result:" and then again after "Message:...Result:"
+	// We keep only the first occurrence and the conclusion
+	const messageMarker = "\n\nMessage:\n====================================\n";
+	const conclusionMarker = "\n====================================\n\nConclusion:";
+
+	const messageIdx = statusInfo.indexOf(messageMarker);
+	const conclusionIdx = statusInfo.indexOf(conclusionMarker);
+
+	if (messageIdx === -1 || conclusionIdx === -1) {
+		return statusInfo;
+	}
+
+	// Keep everything before Message and the Conclusion
+	const beforeMessage = statusInfo.substring(0, messageIdx);
+	const conclusionPart = statusInfo.substring(
+		conclusionIdx + "\n====================================\n\n".length
+	);
+
+	return beforeMessage + "\n\n" + conclusionPart;
+}
+
+/**
+ * Compress a single metric object by removing verbose fields.
+ * @param {Object} metric - A metric object with name, value, attributes, etc.
+ * @returns {Object} Compressed metric
+ */
+function compressMetric(metric) {
+	if (!metric || typeof metric !== "object") {
+		return metric;
+	}
+
+	const compressed = {};
+	for (const [key, value] of Object.entries(metric)) {
+		if (METRIC_FIELDS_TO_REMOVE.includes(key)) {
+			continue;
+		}
+		compressed[key] = value;
+	}
+
+	return compressed;
+}
+
+/**
+ * Compress metrics object (keyed by metric name).
+ * @param {Object} metrics - Object with metric names as keys
+ * @returns {Object} Compressed metrics object
+ */
+function compressMetrics(metrics) {
+	if (!metrics || typeof metrics !== "object") {
+		return metrics;
+	}
+
+	const compressed = {};
+	for (const [metricName, metricData] of Object.entries(metrics)) {
+		compressed[metricName] = compressMetric(metricData);
+	}
+
+	return compressed;
+}
+
+/**
+ * Compress a monitor object by removing verbose fields and compressing nested metrics.
+ * @param {Object} monitor - A monitor object from MetricsHub
+ * @returns {Object} Compressed monitor
+ */
+function compressMonitor(monitor) {
+	if (!monitor || typeof monitor !== "object") {
+		return monitor;
+	}
+
+	const compressed = {};
+
+	for (const [key, value] of Object.entries(monitor)) {
+		// Skip fields we want to remove
+		if (MONITOR_FIELDS_TO_REMOVE.includes(key)) {
+			continue;
+		}
+
+		// Remove false boolean flags
+		if (FALSE_FLAGS_TO_REMOVE.includes(key) && value === false) {
+			continue;
+		}
+
+		// Compress nested metrics
+		if (key === "metrics" && value && typeof value === "object") {
+			const compressedMetrics = compressMetrics(value);
+			if (compressedMetrics && Object.keys(compressedMetrics).length > 0) {
+				compressed[key] = compressedMetrics;
+			}
+			continue;
+		}
+
+		// Deduplicate StatusInformation
+		if (key === "legacyTextParameters" && value?.StatusInformation) {
+			const deduped = deduplicateStatusInformation(value.StatusInformation);
+			if (deduped && deduped.trim()) {
+				compressed[key] = { ...value, StatusInformation: deduped };
+			}
+			continue;
+		}
+
+		compressed[key] = value;
+	}
+
+	return compressed;
+}
+
+/**
+ * Compress MCP telemetry output by removing redundant fields.
+ * Traverses the structure looking for monitors arrays and compresses each monitor.
+ * @param {*} data - The data to compress (recursively searches for monitors)
+ * @returns {*} Compressed data
+ */
+function compressMcpTelemetry(data) {
+	if (data === null || typeof data !== "object") {
+		return data;
+	}
+
+	if (Array.isArray(data)) {
+		return data.map(compressMcpTelemetry);
+	}
+
+	const result = {};
+
+	for (const [key, value] of Object.entries(data)) {
+		if (key === "monitors" && Array.isArray(value)) {
+			// Compress each monitor in the array
+			result[key] = value.map(compressMonitor);
+		} else if (typeof value === "object" && value !== null) {
+			// Recurse into nested objects
+			result[key] = compressMcpTelemetry(value);
+		} else {
+			result[key] = value;
+		}
+	}
+
+	return result;
+}
+
+/**
+ * Compress MCP tool output to reduce payload size.
+ * Applies telemetry compression and removes empty objects.
+ *
+ * @param {*} output - The raw MCP tool output
+ * @param {string} toolName - Name of the tool (for conditional logic)
+ * @param {Object} logger - Logger instance
+ * @returns {*} Compressed output
+ */
+export function compressMcpOutput(output, toolName, logger) {
+	if (!output || typeof output !== "object") {
+		return output;
+	}
+
+	const originalSize = JSON.stringify(output).length;
+
+	// Apply telemetry compression (handles monitors arrays)
+	let compressed = compressMcpTelemetry(output);
+
+	// Remove empty objects throughout
+	compressed = removeEmptyObjects(compressed) || {};
+
+	const compressedSize = JSON.stringify(compressed).length;
+	const savings = originalSize - compressedSize;
+	const savingsPercent = ((savings / originalSize) * 100).toFixed(1);
+
+	if (savings > 1000) {
+		logger?.info?.(
+			`[MIDDLEWARE] Compressed ${toolName} output: ${originalSize} → ${compressedSize} chars (${savingsPercent}% reduction)`
+		);
+	}
+
+	return compressed;
 }
