@@ -20,4 +20,11 @@ export default [
 	//   server_url: process.env.MCP_NYC_URL,
 	//   token: process.env.MCP_NYC_TOKEN,
 	// },
+	// Example with self-signed certificate (for HTTPS with custom CA)
+	// {
+	//   server_label: 'metricshub-dev',
+	//   server_url: 'https://dev-server.local:8443/sse',
+	//   token: process.env.MCP_DEV_TOKEN,
+	//   allowSelfSignedCert: true, // Allow self-signed/untrusted certificates
+	// },
 ];

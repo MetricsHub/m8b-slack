@@ -16,25 +16,69 @@ function _log(logger, level, msg, meta) {
 	} catch {}
 }
 
+// Create a custom fetch function that handles self-signed certificates and logs errors
+function _createCustomFetch(server) {
+	return async (url, init) => {
+		const fetchOptions = {
+			...init,
+			headers: {
+				...init?.headers,
+				Authorization: `Bearer ${server.token}`,
+			},
+		};
+
+		// Add custom HTTPS agent for self-signed certificates if configured
+		if (server.allowSelfSignedCert && url.toString().startsWith("https:")) {
+			fetchOptions.dispatcher = new (await import("undici")).Agent({
+				connect: { rejectUnauthorized: false },
+			});
+		}
+
+		try {
+			const response = await fetch(url, fetchOptions);
+
+			// Log response body for non-200 status codes to help debugging
+			if (!response.ok) {
+				try {
+					// Clone response to read body without consuming it
+					const clonedResponse = response.clone();
+					const errorBody = await clonedResponse.text();
+					console.error(
+						`[MCP] HTTP ${response.status} from ${server.server_label}: ${errorBody.slice(0, 1000)}`
+					);
+				} catch (bodyErr) {
+					console.error(
+						`[MCP] HTTP ${response.status} from ${server.server_label} (could not read body: ${bodyErr.message})`
+					);
+				}
+			}
+
+			return response;
+		} catch (err) {
+			// Enhanced error logging for fetch failures
+			console.error(`[MCP] Fetch error for ${server.server_label}:`, err.message);
+			if (err.cause) {
+				console.error(`[MCP] Cause:`, err.cause.message || err.cause);
+			}
+			throw err;
+		}
+	};
+}
+
 // Create a new SSE transport for a server
 function _createTransport(server) {
+	const customFetch = _createCustomFetch(server);
+
 	return new SSEClientTransport(new URL(server.server_url), {
 		eventSourceInit: {
-			fetch: (url, init) => {
-				return fetch(url, {
-					...init,
-					headers: {
-						...init?.headers,
-						Authorization: `Bearer ${server.token}`,
-					},
-				});
-			},
+			fetch: customFetch,
 		},
 		requestInit: {
 			headers: {
 				Authorization: `Bearer ${server.token}`,
 			},
 		},
+		fetch: customFetch,
 	});
 }
 
@@ -138,8 +182,16 @@ export async function initializeMcpRegistry(logger) {
 					const server_url = s.server_url || s.url;
 					const server_label = s.server_label || s.label;
 					const token = s.token || s.apiKey || s.key;
+					const allowSelfSignedCert = s.allowSelfSignedCert ?? s.insecure ?? false;
 					if (server_url && server_label && token) {
-						state.servers.push({ server_url, server_label, token, tools: new Map(), client: null });
+						state.servers.push({
+							server_url,
+							server_label,
+							token,
+							allowSelfSignedCert,
+							tools: new Map(),
+							client: null,
+						});
 					}
 				}
 			}
@@ -152,12 +204,16 @@ export async function initializeMcpRegistry(logger) {
 	if (state.servers.length === 0) {
 		const url = process.env.MCP_AGENT_URL;
 		const token = process.env.MCP_AGENT_TOKEN;
+		const allowSelfSignedCert =
+			process.env.MCP_ALLOW_SELF_SIGNED_CERT === "true" ||
+			process.env.MCP_ALLOW_SELF_SIGNED_CERT === "1";
 		if (url && token) {
 			_log(logger, "info", "Using env MCP config", { url });
 			state.servers.push({
 				server_url: url,
 				server_label: "m8b-agent-01",
 				token,
+				allowSelfSignedCert,
 				tools: new Map(),
 				client: null,
 			});
