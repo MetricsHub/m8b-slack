@@ -14,9 +14,10 @@ import { respond } from "../../ai/respond.js";
  *
  * @see {@link https://docs.slack.dev/reference/events/app_mention/}
  */
-export const appMentionCallback = async ({ event, client, logger, say }) => {
+export const appMentionCallback = async ({ event, context, body, client, logger, say }) => {
 	try {
-		const { channel, text, team, user } = event;
+		const { channel, text, user } = event;
+		const teamId = event.team || context.teamId || body.team_id;
 		const thread_ts = event.thread_ts || event.ts;
 
 		// Build minimal message object
@@ -43,7 +44,7 @@ export const appMentionCallback = async ({ event, client, logger, say }) => {
 			client,
 			context: {
 				userId: user,
-				teamId: team,
+				teamId: teamId,
 			},
 			logger,
 			message: messageObj,

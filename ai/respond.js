@@ -55,6 +55,8 @@ export async function respond({
 	context,
 	logger,
 	message,
+	body,
+	payload,
 	say,
 	setTitle,
 	setStatus,
@@ -66,7 +68,23 @@ export async function respond({
 	}
 
 	const { channel, thread_ts } = message;
-	const { userId, teamId } = context;
+
+	// Safely extract userId and teamId from either context, message, event, or body
+	// App_mention wrapper passes them in context, but standard Bolt passes them differently
+	const userId =
+		context?.userId || message?.user || message?.author_id || payload?.user || body?.event?.user;
+
+	// Bolt's core context usually has teamId; fallback to message.team or body.team_id
+	const teamId =
+		context?.teamId ||
+		message?.team ||
+		message?.team_id ||
+		payload?.team ||
+		body?.team_id ||
+		body?.event?.team ||
+		body?.team?.id ||
+		(context && context.enterpriseId ? context.teamId : undefined);
+
 	const userDisplayName = `<@${userId}>`;
 
 	logger.info(`Processing message in thread ${thread_ts} from ${userDisplayName}: ${message.text}`);
