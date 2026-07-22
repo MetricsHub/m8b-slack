@@ -181,11 +181,15 @@ files so Code Interpreter can analyze the complete result instead of a truncated
 4. Review and Create the app
 5. On the app page, go to Install App and install to your workspace
 
-> **Slack compatibility:** `manifest.json` currently uses Slack's legacy `assistant_view` and
-> `assistant_thread_*` events. Existing Assistant-view installations can continue to use it, but
-> Slack requires the newer `agent_view` for newly created agent apps. Migrating the manifest and
-> event flow to Agent View is separate work; see Slack's
-> [Agent messaging migration guidance](https://docs.slack.dev/ai/developing-agents/).
+The manifest uses Slack's Agent messaging experience (`agent_view`). Conversations appear in the
+app's standard Messages tab, with each user message starting or continuing a thread. The bot listens
+for `app_home_opened`, `app_context_changed`, and `message.im` events as described in Slack's
+[Agent messaging guidance](https://docs.slack.dev/ai/developing-agents/).
+
+> Switching an existing Slack app from `assistant_view` to `agent_view` is irreversible. Update and
+> test the application code before applying `manifest.json` to an existing installation. Users need
+> to hard-refresh Slack after the manifest update. Updating an existing app does not require
+> registering a new bot. Slack CLI 4.4.0 or newer is required to apply an Agent View manifest.
 
 You will need two tokens from Slack:
 

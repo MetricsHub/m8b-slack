@@ -8,6 +8,8 @@ import { respond } from "../../ai/respond.js";
  *
  * @param {Object} params
  * @param {import("@slack/types").AppMentionEvent} params.event - The app mention event.
+ * @param {import("@slack/bolt").Context} params.context - Bolt listener context.
+ * @param {Object} params.body - Events API request body.
  * @param {import("@slack/web-api").WebClient} params.client - Slack web client.
  * @param {import("@slack/logger").Logger} params.logger - Logger instance.
  * @param {import("@slack/bolt").SayFn} params.say - Function to send messages.

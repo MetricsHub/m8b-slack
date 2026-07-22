@@ -1,6 +1,8 @@
 {
 	"display_information": {
-		"name": "M8B"
+		"name": "M8B",
+		"description": "M8B system monitoring assistant",
+		"background_color": "#c55100"
 	},
 	"features": {
 		"app_home": {
@@ -12,9 +14,22 @@
 			"display_name": "M8B",
 			"always_online": false
 		},
-		"assistant_view": {
-			"assistant_description": "A system admin assistant, with actual access to monitored systems with MetricsHub.",
-			"suggested_prompts": []
+		"agent_view": {
+			"agent_description": "A system admin agent with access to monitored systems through MetricsHub.",
+			"suggested_prompts": [
+				{
+					"title": "List the monitored systems",
+					"message": "M8B, please list all the systems you are currently monitoring."
+				},
+				{
+					"title": "How are we doing?",
+					"message": "M8B, give me a quick summary of the current status of our IT systems."
+				},
+				{
+					"title": "System admin challenge",
+					"message": "M8B, find one issue in any monitored system and report it back to me."
+				}
+			]
 		}
 	},
 	"oauth_config": {
@@ -29,22 +44,20 @@
 				"files:write",
 				"im:history",
 				"groups:history",
+				"metadata.message:read",
+				"reactions:write",
 				"users:read"
 			]
 		}
 	},
 	"settings": {
 		"event_subscriptions": {
-			"bot_events": [
-				"app_mention",
-				"assistant_thread_context_changed",
-				"assistant_thread_started",
-				"message.im"
-			]
+			"bot_events": ["app_mention", "app_context_changed", "app_home_opened", "message.im"]
 		},
 		"interactivity": {
-			"is_enabled": false
+			"is_enabled": true
 		},
+		"is_mcp_enabled": false,
 		"org_deploy_enabled": true,
 		"socket_mode_enabled": true,
 		"token_rotation_enabled": false

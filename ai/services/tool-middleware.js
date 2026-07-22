@@ -335,8 +335,8 @@ async function uploadOutputAsFile(output, toolName, openaiClient, fileTracking, 
  * @param {string} name - Tool name
  * @param {Object} args - Tool arguments (may include offset, maxResults, _cacheId)
  * @param {Function} executor - Function that executes the actual tool call: (name, args) => result
- * @param {Object} options - Options object
- * @param {Object} options.logger - Logger instance
+ * @param {Object} [options] - Options object
+ * @param {Object} [options.logger] - Logger instance
  * @param {Object} [options.openaiClient] - OpenAI client for file uploads
  * @param {Object} [options.fileTracking] - File tracking state for uploaded files
  * @returns {Promise<Object>} Processed output with pagination and file reference
@@ -547,7 +547,7 @@ function deduplicateStatusInformation(statusInfo) {
 		conclusionIdx + "\n====================================\n\n".length
 	);
 
-	return beforeMessage + "\n\n" + conclusionPart;
+	return `${beforeMessage}\n\n${conclusionPart}`;
 }
 
 /**
@@ -624,7 +624,7 @@ function compressMonitor(monitor) {
 		// Deduplicate StatusInformation
 		if (key === "legacyTextParameters" && value?.StatusInformation) {
 			const deduped = deduplicateStatusInformation(value.StatusInformation);
-			if (deduped && deduped.trim()) {
+			if (deduped?.trim()) {
 				compressed[key] = { ...value, StatusInformation: deduped };
 			}
 			continue;

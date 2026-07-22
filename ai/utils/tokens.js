@@ -31,7 +31,7 @@ export function estimateTokenCount(inputItems) {
 /**
  * Check if an error is a context window overflow error.
  *
- * @param {Error} error - The error to check
+ * @param {Error & {type?: string, param?: string}} error - The error to check
  * @returns {boolean} True if this is a context window error
  */
 export function isContextWindowError(error) {

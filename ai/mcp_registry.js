@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/suspicious/noConsole: MCP startup can run before a Slack logger is available. */
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -105,10 +106,7 @@ async function _ensureConnected(server) {
 	try {
 		console.log(`[MCP] Connecting to ${server.server_label}...`);
 		const transport = _createTransport(server);
-		const client = new Client(
-			{ name: "m8b-slackbot", version: "1.0.0" },
-			{ capabilities: { tools: {} } }
-		);
+		const client = new Client({ name: "m8b-slackbot", version: "1.0.0" }, { capabilities: {} });
 		await client.connect(transport);
 		server.client = client;
 		console.log(`[MCP] Connected to ${server.server_label}`);

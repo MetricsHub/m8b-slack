@@ -61,7 +61,7 @@ export async function respond({
 	say,
 	setTitle,
 	setStatus,
-	setSuggestedPrompts,
+	slackAppContext,
 }) {
 	// Skip non-text or incomplete messages
 	if (!("text" in message) || !("thread_ts" in message) || !message.text || !message.thread_ts) {
@@ -97,18 +97,7 @@ export async function respond({
 
 	// Helper to suggest follow-up when bot gets tired
 	async function suggestSummarizeNow() {
-		const payload = {
-			title: "Pfffff... I'm tired of this...",
-			prompts: [{ title: "📝 Oh come on!", message: "M8B, summarize now." }],
-		};
-
-		if (typeof setSuggestedPrompts === "function") {
-			try {
-				await setSuggestedPrompts(payload);
-			} catch (e) {
-				logger.warn?.("setSuggestedPrompts failed", { e: String(e) });
-			}
-		} else if (say) {
+		if (say) {
 			await say({ text: "I'm tired of this... Say the magic word." });
 		}
 	}
@@ -196,6 +185,7 @@ export async function respond({
 			userProfile,
 			userDisplayName: `<@${userId}>`,
 			uploadOnce: fileManager.uploadOnce,
+			slackAppContext,
 		});
 
 		// Pre-flight context check
@@ -505,7 +495,14 @@ function buildInitialInput({ codeContainerFiles, includeBasePrompt = true }) {
 /**
  * Append current message to input.
  */
-async function appendCurrentMessage({ input, message, userProfile, userDisplayName, uploadOnce }) {
+async function appendCurrentMessage({
+	input,
+	message,
+	userProfile,
+	userDisplayName,
+	uploadOnce,
+	slackAppContext,
+}) {
 	const contentItems = [{ type: "input_text", text: message.text }];
 
 	// Upload any attached files
@@ -527,6 +524,18 @@ async function appendCurrentMessage({ input, message, userProfile, userDisplayNa
 	);
 	if (userProfile.userTimezone) {
 		userContextParts.push(`User's timezone: ${userProfile.userTimezone}`);
+	}
+	const slackEntities = Array.isArray(slackAppContext?.entities)
+		? slackAppContext.entities
+				.filter((entity) => entity?.type && entity?.value)
+				.map((entity) => {
+					const value =
+						typeof entity.value === "string" ? entity.value : JSON.stringify(entity.value);
+					return `${entity.type}: ${value}`;
+				})
+		: [];
+	if (slackEntities.length > 0) {
+		userContextParts.push(`User's current Slack context:\n${slackEntities.join("\n")}`);
 	}
 
 	input.push({

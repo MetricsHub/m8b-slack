@@ -425,7 +425,7 @@ export async function streamOnce(
 						if (tool.type === "namespace") {
 							return tool.tools.map((nestedTool) => `${tool.name}.${nestedTool.name}`);
 						}
-						return [tool.name || tool.type];
+						return ["name" in tool && tool.name ? tool.name : tool.type];
 					});
 					logger?.info?.("[TOOL_SEARCH] Loaded deferred tools", {
 						execution: evt.item.execution,
