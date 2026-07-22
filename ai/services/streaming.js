@@ -148,6 +148,34 @@ function detectRepetition(text, windowSize = SAFETY_LIMITS.repetitionWindowSize)
 }
 
 /**
+ * Build a GPT Responses API streaming request.
+ *
+ * @param {Object} params - Response request parameters
+ * @returns {Object} OpenAI Responses API request
+ */
+export function buildResponseRequest({
+	input,
+	tools,
+	tool_choice,
+	previous_response_id,
+	safety_identifier,
+}) {
+	return {
+		model: MODEL_CONFIG.model,
+		reasoning: MODEL_CONFIG.reasoning,
+		previous_response_id,
+		safety_identifier,
+		max_output_tokens: MODEL_CONFIG.maxOutputTokens,
+		tool_choice: tool_choice ?? "auto",
+		parallel_tool_calls: true,
+		tools,
+		text: MODEL_CONFIG.text,
+		input,
+		stream: true,
+	};
+}
+
+/**
  * Stream one turn of OpenAI response.
  *
  * @param {Object} params - Stream parameters
@@ -155,6 +183,7 @@ function detectRepetition(text, windowSize = SAFETY_LIMITS.repetitionWindowSize)
  * @param {Array} params.tools - Available tools
  * @param {string} params.tool_choice - Tool choice setting
  * @param {string} params.previous_response_id - Previous response ID for continuity
+ * @param {string} params.safety_identifier - Hashed stable end-user identifier
  * @param {Object} callbacks - Callback functions
  * @param {Function} callbacks.setStatus - Status update callback
  * @param {Function} callbacks.onTextChunk - Text chunk callback
@@ -162,7 +191,10 @@ function detectRepetition(text, windowSize = SAFETY_LIMITS.repetitionWindowSize)
  * @param {Object} callbacks.logger - Logger instance
  * @returns {Promise<Object>} Stream result
  */
-export async function streamOnce({ input, tools, tool_choice, previous_response_id }, callbacks) {
+export async function streamOnce(
+	{ input, tools, tool_choice, previous_response_id, safety_identifier },
+	callbacks
+) {
 	const { setStatus, onTextChunk, onStreamStart, logger } = callbacks;
 
 	let newResponseId = null;
@@ -173,6 +205,9 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 	let incompleteReason = null;
 	let sawCompleted = false;
 	let lastContainerId = null; // Track container ID for end-of-stream file query
+	let resolvedModel = null;
+	let effectiveReasoningContext = null;
+	let responseUsage = null;
 	const streamStartTime = Math.floor(Date.now() / 1000); // Unix timestamp for filtering old files
 
 	// Event counters for diagnostics
@@ -183,8 +218,6 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 		output_item_added_function_call: 0,
 		output_item_done_function_call: 0,
 		function_call_args_delta: 0,
-		output_item_added_file: 0,
-		output_item_added_image: 0,
 		response_error: 0,
 		response_completed: 0,
 		other: 0,
@@ -233,25 +266,30 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 	}
 
 	// Create the stream
-	const stream = await openai.responses.create({
-		model: MODEL_CONFIG.model,
-		reasoning: MODEL_CONFIG.reasoning,
-		previous_response_id,
-		max_output_tokens: MODEL_CONFIG.maxOutputTokens,
-		tool_choice: tool_choice ?? "auto",
-		parallel_tool_calls: true,
-		tools,
-		text: MODEL_CONFIG.text,
-		input,
-		stream: true,
-	});
+	const stream = await openai.responses.create(
+		/** @type {import("openai/resources/responses/responses").ResponseCreateParamsStreaming} */ (
+			buildResponseRequest({
+				input,
+				tools,
+				tool_choice,
+				previous_response_id,
+				safety_identifier,
+			})
+		)
+	);
 
 	let streamController = null;
 
 	try {
 		for await (const evt of stream) {
+			if ("response" in evt && evt.response) {
+				resolvedModel = evt.response.model || resolvedModel;
+				effectiveReasoningContext = evt.response.reasoning?.context || effectiveReasoningContext;
+				responseUsage = evt.response.usage || responseUsage;
+			}
+
 			// Track response ID
-			if (!newResponseId && evt?.response?.id) {
+			if (!newResponseId && "response" in evt && evt.response?.id) {
 				newResponseId = evt.response.id;
 			}
 
@@ -300,14 +338,6 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 						name: item.name,
 						call_id: item.call_id,
 					});
-				} else if (item?.type === "output_file") {
-					evtCounters.output_item_added_file++;
-					// Capture file info - will be populated fully in output_item.done
-					outputFiles[evt.output_index] = { type: "file", ...item };
-				} else if (item?.type === "output_image") {
-					evtCounters.output_item_added_image++;
-					// Capture image info - will be populated fully in output_item.done
-					outputFiles[evt.output_index] = { type: "image", ...item };
 				} else {
 					evtCounters.other++;
 				}
@@ -329,7 +359,7 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 					functionCalls[idx] = { ...evt.item, arguments: prior.arguments };
 					// Log full arguments when function call is complete
 					const argsPreview =
-						prior.arguments.length > 500 ? prior.arguments.slice(0, 500) + "..." : prior.arguments;
+						prior.arguments.length > 500 ? `${prior.arguments.slice(0, 500)}...` : prior.arguments;
 					logger?.info?.(
 						`[ACTION] Function call ready: ${evt.item.name}\n  Arguments: ${argsPreview}`
 					);
@@ -350,18 +380,23 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 										filename: annotation.filename,
 										container_id: annotation.container_id,
 									});
+								} else if (annotation.type === "file_path" && annotation.file_id) {
+									outputFiles.push({
+										type: "file",
+										file_id: annotation.file_id,
+										filename: "generated_file",
+									});
 								}
 							}
 						}
 					}
 				} else if (evt.item?.type === "code_interpreter_call") {
 					// Track container ID for querying files at the end
-					const code = evt.item?.code_interpreter?.input || evt.item?.input || evt.item?.code || "";
+					const code = evt.item.code || "";
 					const containerId = evt.item?.container_id;
-					const results = evt.item?.results || [];
 
 					// Log code in a readable format (as a code block)
-					const codePreview = code.length > 300 ? code.slice(0, 300) + "..." : code;
+					const codePreview = code.length > 300 ? `${code.slice(0, 300)}...` : code;
 					logger?.info?.(
 						`[CODE_INTERPRETER] LLM executed Python code (${code.length} chars):\n\`\`\`python\n${codePreview}\n\`\`\``
 					);
@@ -370,44 +405,6 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 					if (containerId) {
 						lastContainerId = containerId;
 					}
-
-					// Process files from results if explicitly returned
-					for (const result of results) {
-						if (result?.type === "files") {
-							for (const file of result.files || []) {
-								if (file?.file_id) {
-									outputFiles.push({
-										type: "file",
-										file_id: file.file_id,
-										filename: file.filename || file.name,
-										mime_type: file.mime_type,
-										container_id: containerId,
-									});
-									logger?.info?.("[CODE_INTERPRETER] Generated file from results", {
-										file_id: file.file_id,
-										filename: file.filename || file.name,
-									});
-								}
-							}
-						}
-					}
-				} else if (evt.item?.type === "output_file" || evt.item?.type === "output_image") {
-					// Update with final file info
-					const idx = evt.output_index;
-					if (outputFiles[idx]) {
-						outputFiles[idx] = {
-							...outputFiles[idx],
-							...evt.item,
-							file_id: evt.item.file_id || evt.item.id,
-						};
-					} else {
-						outputFiles.push({
-							type: evt.item?.type === "output_image" ? "image" : "file",
-							...evt.item,
-							file_id: evt.item.file_id || evt.item.id,
-						});
-					}
-					logger?.info?.("Output file/image done", { item: evt.item });
 				} else {
 					evtCounters.other++;
 				}
@@ -474,25 +471,20 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 
 			// Handle annotation.added events - annotations are streamed as separate events
 			if (evt.type === "response.output_text.annotation.added") {
-				const annotation = evt.annotation;
-				if (annotation?.type === "file_path" && annotation.file_path?.file_id) {
-					const fileId = annotation.file_path.file_id;
-					const text = annotation.text || "";
-					// Extract filename from sandbox path
-					const filenameMatch = text.match(/sandbox:\/mnt\/data\/([^)\s]+)/);
-					const filename = filenameMatch?.[1] || "generated_file";
+				const annotation = /** @type {any} */ (evt.annotation);
+				if (annotation?.type === "file_path" && annotation.file_id) {
+					const fileId = annotation.file_id;
+					const filename = annotation.filename || "generated_file";
 
 					outputFiles.push({
 						type: "file",
 						file_id: fileId,
 						filename: filename,
-						annotation_text: text,
 					});
 
 					logger?.info?.("[CODE_INTERPRETER] File annotation from stream", {
 						file_id: fileId,
 						filename: filename,
-						annotation_text: text,
 					});
 				}
 				continue;
@@ -502,11 +494,19 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 			if (evt.type === "response.completed") {
 				evtCounters.response_completed++;
 				sawCompleted = true;
-			} else if (evt.type === "response.error") {
+			} else if (evt.type === "error") {
 				evtCounters.response_error++;
-				logger?.info?.("OpenAI stream error event", { error: evt.error || null });
+				logger?.info?.("OpenAI stream error event", {
+					code: evt.code,
+					message: evt.message,
+					param: evt.param,
+				});
+			} else if (evt.type === "response.failed") {
+				evtCounters.response_error++;
+				incompleteReason = evt.response.error?.code || "failed";
+				logger?.info?.("OpenAI response failed", { error: evt.response.error });
 			} else if (evt.type === "response.incomplete") {
-				incompleteReason = evt.reason || evt?.response?.status_reason || "unknown";
+				incompleteReason = evt.response.incomplete_details?.reason || "unknown";
 				otherEventTypes["response.incomplete"] = (otherEventTypes["response.incomplete"] || 0) + 1;
 			} else {
 				// Count event types we don't explicitly handle
@@ -519,7 +519,8 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 					"response.output_text.delta",
 					"response.output_text.annotation.added",
 					"response.completed",
-					"response.error",
+					"error",
+					"response.failed",
 					"response.incomplete",
 				];
 
@@ -586,6 +587,8 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 	// Summary log for key actions
 	logger?.info?.("[STREAM_COMPLETE] Turn finished", {
 		responseId: newResponseId,
+		model: resolvedModel || MODEL_CONFIG.model,
+		reasoningContext: effectiveReasoningContext,
 		hadReasoning: reasoningBuf.length > 0,
 		reasoningLength: reasoningBuf.length,
 		hadTextOutput: hadText,
@@ -604,6 +607,16 @@ export async function streamOnce({ input, tools, tool_choice, previous_response_
 			: incompleteReason
 				? `incomplete: ${incompleteReason}`
 				: "unknown",
+		usage: responseUsage
+			? {
+					inputTokens: responseUsage.input_tokens,
+					cachedTokens: responseUsage.input_tokens_details?.cached_tokens,
+					cacheWriteTokens: responseUsage.input_tokens_details?.cache_write_tokens,
+					outputTokens: responseUsage.output_tokens,
+					reasoningTokens: responseUsage.output_tokens_details?.reasoning_tokens,
+					totalTokens: responseUsage.total_tokens,
+				}
+			: undefined,
 	});
 
 	// Only log detailed summary if there's something notable

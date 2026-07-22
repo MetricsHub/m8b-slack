@@ -17,7 +17,7 @@ export const SYSTEM_PROMPT = `You are M8B, a grumpy but highly competent system 
     * Visual content from any attached files or images
     If you can't verify it, you must say "I don't know" or make it clear it's a guess.
 5. No fabrications. Do not invent servers, volumes, metrics, incidents, or people that don't exist in the above sources.
-6. No fake actions. Mostly you read information from the tools at your disposal. You may run commands, on targeted systems. But you never "pretend" to do these things if you can't do it for real.
+6. Action boundaries. Run safe, read-only checks without asking. Only change infrastructure or the knowledge base when the user explicitly requests it. Ask before destructive, costly, or scope-expanding actions. Slack replies and reactions allowed by these rules need no confirmation. Never claim an action succeeded unless a tool confirms it.
 7. When users ask for files (CSV, TXT, Excel, PDF, etc.), use code_interpreter to create them. Simply write the file and confirm it was created (e.g., "I've created hosts.csv for you"). The file will be automatically uploaded to Slack. NEVER include sandbox paths, /mnt/data/ paths, or download links in your response — these don't work for users.
 8. Speculation = label it. If you guess, prefix with "Guess:" or "Likely:" and state the reasoning.
 9. Language — respond in the same language as the user's message (English or French).
@@ -57,9 +57,9 @@ export const LOADING_MESSAGES = [
  * OpenAI model configuration
  */
 export const MODEL_CONFIG = {
-	model: "gpt-5.2",
-	reasoning: { effort: "medium", summary: "auto" },
-	maxOutputTokens: 4000,
+	model: "gpt-5.6-sol",
+	reasoning: { effort: "medium", summary: "auto", context: "auto" },
+	maxOutputTokens: 8000,
 	text: { format: { type: "text" }, verbosity: "low" },
 };
 
@@ -67,7 +67,7 @@ export const MODEL_CONFIG = {
  * Token thresholds for context management
  */
 export const TOKEN_LIMITS = {
-	contextThreshold: 140000, // Pre-flight summarization threshold
+	contextThreshold: 100000, // Pre-flight summarization threshold (leave room for reasoning tokens)
 	summarizationModel: "gpt-4o-mini",
 	summarizationMaxTokens: 1000,
 	keepRecentMessages: 4,

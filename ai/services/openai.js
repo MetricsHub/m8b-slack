@@ -2,6 +2,7 @@
  * OpenAI client initialization and response helpers.
  */
 
+import { createHash } from "node:crypto";
 import { OpenAI } from "openai";
 
 // OpenAI client singleton
@@ -10,12 +11,26 @@ export const openai = new OpenAI({
 });
 
 /**
+ * Create a stable, privacy-preserving identifier for OpenAI safety controls.
+ *
+ * @param {string} userId - Slack user ID
+ * @param {string} teamId - Slack workspace/team ID
+ * @returns {string|undefined} SHA-256 identifier, or undefined when no identity is available
+ */
+export function createSafetyIdentifier(userId, teamId) {
+	const identity = [teamId, userId].filter(Boolean).join(":");
+	if (!identity) return undefined;
+
+	return createHash("sha256").update(`m8b-slackbot:${identity}`).digest("hex");
+}
+
+/**
  * Poll an OpenAI response until it reaches a terminal state.
  *
  * @param {string} responseId - The response ID to poll
  * @param {Object} options - Polling options
- * @param {number} options.intervalMs - Polling interval in milliseconds
- * @param {number} options.maxMs - Maximum time to poll in milliseconds
+ * @param {number} [options.intervalMs=800] - Polling interval in milliseconds
+ * @param {number} [options.maxMs=180000] - Maximum time to poll in milliseconds
  * @returns {Promise<Object|null>} The final response or null
  */
 export async function pollUntilTerminal(responseId, { intervalMs = 800, maxMs = 180000 } = {}) {
@@ -74,17 +89,22 @@ export function getTextFromResponse(response) {
  *
  * @param {Object} response - The incomplete response
  * @param {Object} options - Continuation options
- * @param {number} options.boostFactor - Multiplier for additional tokens
- * @param {number} options.maxOut - Maximum output tokens for continuation
+ * @param {number} [options.boostFactor=2] - Multiplier for additional tokens
+ * @param {number} [options.maxOut=4000] - Maximum output tokens for continuation
+ * @param {string} [options.safetyIdentifier] - Hashed stable end-user identifier
  * @returns {Promise<Object|null>} New response or null
  */
-export async function continueIfIncomplete(response, { boostFactor = 2, maxOut = 4000 } = {}) {
+export async function continueIfIncomplete(
+	response,
+	{ boostFactor = 2, maxOut = 4000, safetyIdentifier } = {}
+) {
 	if (!response || response.status !== "incomplete") return null;
 
 	const extra = Math.min(Math.max((response.usage?.output_tokens ?? 0) * boostFactor, 512), maxOut);
 
 	return openai.responses.create({
 		previous_response_id: response.id,
+		safety_identifier: safetyIdentifier,
 		input: [
 			{
 				role: "system",
@@ -107,9 +127,11 @@ export async function continueIfIncomplete(response, { boostFactor = 2, maxOut =
  *
  * @param {string} latestResponseId - The response ID to recover
  * @param {Object} logger - Logger instance
+ * @param {Object} options - Recovery options
+ * @param {string} [options.safetyIdentifier] - Hashed stable end-user identifier
  * @returns {Promise<Object|null>} Recovered response or null
  */
-export async function recoverFromTerminated(latestResponseId, logger) {
+export async function recoverFromTerminated(latestResponseId, logger, { safetyIdentifier } = {}) {
 	try {
 		if (!latestResponseId) return null;
 
@@ -118,7 +140,7 @@ export async function recoverFromTerminated(latestResponseId, logger) {
 		if (final?.status === "completed") return final;
 
 		if (final?.status === "incomplete") {
-			const continuation = await continueIfIncomplete(final);
+			const continuation = await continueIfIncomplete(final, { safetyIdentifier });
 			if (continuation?.id) {
 				return pollUntilTerminal(continuation.id);
 			}

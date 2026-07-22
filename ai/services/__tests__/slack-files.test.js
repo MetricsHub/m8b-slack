@@ -2,7 +2,44 @@
  * Tests for Slack files service.
  */
 
-import { extractPreviousUploads } from "../slack-files.js";
+import { buildOpenAIFileContentItem, extractPreviousUploads } from "../slack-files.js";
+
+describe("buildOpenAIFileContentItem", () => {
+	it("uses explicit high detail for technical images", () => {
+		expect(
+			buildOpenAIFileContentItem({
+				fileId: "file-image",
+				fileName: "dashboard.png",
+				mimetype: "image/png",
+			})
+		).toEqual({ type: "input_image", detail: "high", file_id: "file-image" });
+	});
+
+	it("uses explicit high detail for PDFs", () => {
+		expect(
+			buildOpenAIFileContentItem({
+				fileId: "file-pdf",
+				fileName: "report.pdf",
+				mimetype: "application/pdf",
+			})
+		).toEqual({
+			type: "input_file",
+			detail: "high",
+			file_id: "file-pdf",
+			filename: "report.pdf",
+		});
+	});
+
+	it("leaves other file types for code interpreter", () => {
+		expect(
+			buildOpenAIFileContentItem({
+				fileId: "file-csv",
+				fileName: "metrics.csv",
+				mimetype: "text/csv",
+			})
+		).toBeNull();
+	});
+});
 
 describe("extractPreviousUploads", () => {
 	it("should return empty map when no messages have uploads", () => {

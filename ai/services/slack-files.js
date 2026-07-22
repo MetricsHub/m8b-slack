@@ -9,10 +9,38 @@ import path from "node:path";
 import { openai } from "./openai.js";
 
 /**
+ * Build a Responses API content item for a Slack image or PDF.
+ * GPT-5.6 treats image `auto` detail as original-size input, so use explicit high
+ * detail for predictable technical screenshot and document analysis costs.
+ *
+ * @param {Object} params
+ * @param {string} params.fileId - OpenAI file ID
+ * @param {string} params.fileName - Original filename
+ * @param {string} params.mimetype - MIME type
+ * @returns {Object|null} Responses API input content item
+ */
+export function buildOpenAIFileContentItem({ fileId, fileName, mimetype }) {
+	if (mimetype.startsWith("image/")) {
+		return { type: "input_image", detail: "high", file_id: fileId };
+	}
+
+	if (mimetype === "application/pdf" || fileName.toLowerCase().endsWith(".pdf")) {
+		return {
+			type: "input_file",
+			detail: "high",
+			file_id: fileId,
+			filename: fileName,
+		};
+	}
+
+	return null;
+}
+
+/**
  * Download a Slack file and upload to OpenAI as user_data.
  *
  * @param {Object} file - Slack file object
- * @param {Object} logger - Logger instance
+ * @param {Object} _logger - Logger instance
  * @returns {Promise<{contentItem: Object|null, fileId: string}|null>}
  */
 export async function slackFileToOpenAIContent(file, _logger) {
@@ -59,23 +87,13 @@ export async function slackFileToOpenAIContent(file, _logger) {
 	// Cleanup temp file (async, don't wait)
 	fsp.rm(tmpDir, { recursive: true }).catch(() => {});
 
-	const mimetype = file.mimetype || "";
-	const lower = (fileName || "").toLowerCase();
+	const contentItem = buildOpenAIFileContentItem({
+		fileId: uploaded.id,
+		fileName,
+		mimetype: file.mimetype || "",
+	});
 
-	if (mimetype.startsWith("image/")) {
-		return {
-			contentItem: { type: "input_image", detail: "auto", file_id: uploaded.id },
-			fileId: uploaded.id,
-		};
-	}
-
-	const isPdf = mimetype === "application/pdf" || lower.endsWith(".pdf");
-	if (isPdf) {
-		return {
-			contentItem: { type: "input_file", file_id: uploaded.id },
-			fileId: uploaded.id,
-		};
-	}
+	if (contentItem) return { contentItem, fileId: uploaded.id };
 
 	// Other types are for code_interpreter only
 	return { contentItem: null, fileId: uploaded.id };
@@ -117,19 +135,11 @@ export function createFileUploadManager(previousUploads, logger) {
 			const reused = previousUploads.get(file.id);
 
 			if (reused) {
-				const mimetype = file.mimetype || "";
-				const lower = (file.name || "").toLowerCase();
-				let contentItem = null;
-
-				if (mimetype.startsWith("image/")) {
-					contentItem = { type: "input_image", detail: "auto", file_id: reused };
-				} else if (mimetype === "application/pdf" || lower.endsWith(".pdf")) {
-					contentItem = {
-						type: "input_file",
-						file_id: reused,
-						filename: file.name,
-					};
-				}
+				const contentItem = buildOpenAIFileContentItem({
+					fileId: reused,
+					fileName: file.name || "file",
+					mimetype: file.mimetype || "",
+				});
 
 				// non-image/PDF goes to code interpreter
 				if (!contentItem) {

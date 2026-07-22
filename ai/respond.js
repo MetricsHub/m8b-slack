@@ -19,6 +19,7 @@ import {
 import { processFunctionCall } from "./services/function-calls.js";
 import {
 	continueIfIncomplete,
+	createSafetyIdentifier,
 	getTextFromResponse,
 	getVectorStoreIds,
 	pollUntilTerminal,
@@ -83,9 +84,11 @@ export async function respond({
 		body?.team_id ||
 		body?.event?.team ||
 		body?.team?.id ||
-		(context && context.enterpriseId ? context.teamId : undefined);
+		(context?.enterpriseId ? context.teamId : undefined);
 
 	const userDisplayName = `<@${userId}>`;
+	const safetyIdentifier = createSafetyIdentifier(userId, teamId);
+	let lastSeenResponseId = null;
 
 	logger.info(`Processing message in thread ${thread_ts} from ${userDisplayName}: ${message.text}`);
 
@@ -212,7 +215,6 @@ export async function respond({
 		// State for the conversation loop
 		let _previousResponseId = previousResponseId;
 		let responseIdFromFinalTurn = null;
-		let _lastSeenResponseId = null;
 		let anyTextStreamed = false;
 		let sawAnyIncomplete = false;
 		let lastFullText = "";
@@ -246,6 +248,7 @@ export async function respond({
 					channel,
 					teamId,
 					userId,
+					safetyIdentifier,
 					thread_ts,
 					fileManager,
 					say,
@@ -271,6 +274,7 @@ export async function respond({
 						channel,
 						teamId,
 						userId,
+						safetyIdentifier,
 						thread_ts,
 						fileManager,
 						say,
@@ -301,7 +305,7 @@ export async function respond({
 			// Update state
 			if (responseId) {
 				responseIdFromFinalTurn = responseId;
-				_lastSeenResponseId = responseId;
+				lastSeenResponseId = responseId;
 				_previousResponseId = responseId;
 				// Cache the response ID for this thread
 				threadResponseCache.set(thread_ts, responseId);
@@ -387,6 +391,7 @@ export async function respond({
 					say,
 					suggestSummarizeNow,
 					uploadedFilesThisTurn: fileManager.uploadedFilesThisTurn,
+					safetyIdentifier,
 					logger,
 				});
 			}
@@ -424,13 +429,15 @@ export async function respond({
 				.includes("server_error")
 		) {
 			try {
-				const recovered = await recoverFromTerminated(lastSeenResponseId, logger);
+				const recovered = await recoverFromTerminated(lastSeenResponseId, logger, {
+					safetyIdentifier,
+				});
 				if (recovered?.status === "completed") {
 					const text = getTextFromResponse(recovered);
 					if (text) return await say({ text });
 				}
 				if (recovered?.status === "incomplete") {
-					const cont = await continueIfIncomplete(recovered);
+					const cont = await continueIfIncomplete(recovered, { safetyIdentifier });
 					const polled = cont?.id ? await pollUntilTerminal(cont.id) : null;
 					const text = getTextFromResponse(polled);
 					if (text) return await say({ text });
@@ -543,12 +550,12 @@ async function executeStreamWithRetry({
 	channel,
 	teamId,
 	userId,
+	safetyIdentifier,
 	thread_ts,
 	fileManager,
 	say,
 	logger,
 }) {
-	let streamer = null;
 	let postedFirstLine = false;
 	let totalCharsStreamed = 0; // Track message length
 	let truncated = false;
@@ -559,14 +566,15 @@ async function executeStreamWithRetry({
 			tools,
 			tool_choice: forceToolChoiceNext,
 			previous_response_id: previousResponseId,
+			safety_identifier: safetyIdentifier,
 		},
 		{
 			setStatus,
 			logger,
 			onStreamStart: async (responseId) => {
-				// Create Slack streamer on first text output
+				// streamOnce owns this stream's lifecycle and stops it in its finally block.
 				try {
-					streamer = client.chatStream({
+					return client.chatStream({
 						channel,
 						recipient_team_id: teamId,
 						recipient_user_id: userId,
@@ -581,7 +589,6 @@ async function executeStreamWithRetry({
 								}
 							: undefined,
 					});
-					return streamer;
 				} catch (err) {
 					logger?.info?.("Failed to create chatStream streamer", { err: String(err) });
 					return null;
@@ -639,16 +646,6 @@ async function executeStreamWithRetry({
 		}
 	);
 
-	// Stop the streamer
-	if (streamer) {
-		try {
-			await streamer.stop();
-			logger?.info?.("Stopped stream", { response_id: result.responseId });
-		} catch (e) {
-			logger?.warn?.("Failed to stop stream", { error: String(e) });
-		}
-	}
-
 	return { ...result, contextSummarized };
 }
 
@@ -661,6 +658,7 @@ async function handleNoTextStreamed({
 	say,
 	suggestSummarizeNow,
 	uploadedFilesThisTurn,
+	safetyIdentifier,
 	logger,
 }) {
 	try {
@@ -682,7 +680,7 @@ async function handleNoTextStreamed({
 				return;
 			}
 		} else if (final?.status === "incomplete" && sawAnyIncomplete) {
-			const cont = await continueIfIncomplete(final);
+			const cont = await continueIfIncomplete(final, { safetyIdentifier });
 			const polled = cont?.id ? await pollUntilTerminal(cont.id) : null;
 			const text = getTextFromResponse(polled);
 			if (text) {

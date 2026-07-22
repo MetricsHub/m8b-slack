@@ -56,7 +56,7 @@ export async function processFunctionCall(functionCall, context) {
 				break;
 
 			case "update_knowledge":
-				output = await handleUpdateKnowledge(args, vectorStoreIds, say);
+				output = await handleUpdateKnowledge(args, vectorStoreIds, say, logger);
 				break;
 
 			// Prometheus - use middleware for potential large results
@@ -166,7 +166,7 @@ async function handleSlackReply(args, say, logger) {
 /**
  * Handle update_knowledge function call.
  */
-async function handleUpdateKnowledge(args, vectorStoreIds, say) {
+async function handleUpdateKnowledge(args, vectorStoreIds, say, logger) {
 	const content = String(args.content || "").trim();
 	const title = String(args.title || "knowledge-entry").trim();
 	const existingFileId = args.fileId ? String(args.fileId).trim() : null;
@@ -200,14 +200,14 @@ async function handleUpdateKnowledge(args, vectorStoreIds, say) {
 		if (existingFileId) {
 			for (const vsId of validVectorStoreIds) {
 				try {
-					await openai.vectorStores.files.del(existingFileId, {
+					await openai.vectorStores.files.delete(existingFileId, {
 						vector_store_id: vsId,
 					});
-					console.log(
+					logger?.info?.(
 						`[update_knowledge] Detached old file ${existingFileId} from vector store ${vsId}`
 					);
 				} catch (e) {
-					console.log(
+					logger?.info?.(
 						`[update_knowledge] Could not detach ${existingFileId} from ${vsId}: ${e.message}`
 					);
 				}
@@ -216,9 +216,11 @@ async function handleUpdateKnowledge(args, vectorStoreIds, say) {
 			// Optionally delete the underlying file
 			try {
 				await openai.files.delete(existingFileId);
-				console.log(`[update_knowledge] Deleted old file object ${existingFileId}`);
+				logger?.info?.(`[update_knowledge] Deleted old file object ${existingFileId}`);
 			} catch (e) {
-				console.log(`[update_knowledge] Could not delete old file ${existingFileId}: ${e.message}`);
+				logger?.info?.(
+					`[update_knowledge] Could not delete old file ${existingFileId}: ${e.message}`
+				);
 			}
 		}
 
@@ -227,17 +229,17 @@ async function handleUpdateKnowledge(args, vectorStoreIds, say) {
 			file: fs.createReadStream(tmpPath),
 			purpose: "assistants",
 		});
-		console.log(`[update_knowledge] Uploaded file ${uploaded.id}: ${fileName}`);
+		logger?.info?.(`[update_knowledge] Uploaded file ${uploaded.id}: ${fileName}`);
 
 		// Add to all configured vector stores
 		const attachResults = [];
 		for (const vsId of validVectorStoreIds) {
 			try {
 				await openai.vectorStores.files.create(vsId, { file_id: uploaded.id });
-				console.log(`[update_knowledge] Attached file ${uploaded.id} to vector store ${vsId}`);
+				logger?.info?.(`[update_knowledge] Attached file ${uploaded.id} to vector store ${vsId}`);
 				attachResults.push({ vsId, ok: true });
 			} catch (e) {
-				console.error(`[update_knowledge] Failed to attach file to vector store ${vsId}:`, e);
+				logger?.error?.(`[update_knowledge] Failed to attach file to vector store ${vsId}:`, e);
 				attachResults.push({ vsId, ok: false, error: e.message });
 			}
 		}

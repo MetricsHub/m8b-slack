@@ -188,8 +188,10 @@ export async function buildConversationInput(
 		if (rawText) {
 			if (authoredByBot) {
 				// Assistant role requires output item types
+				// Mark replayed Slack messages as completed answers, not commentary/preambles.
 				input.push({
 					role: "assistant",
+					phase: "final_answer",
 					content: [{ type: "output_text", text: rawText }],
 				});
 			} else {

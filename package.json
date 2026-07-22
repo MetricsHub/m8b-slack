@@ -42,7 +42,7 @@
 		"@slack/bolt": "^4.5.0",
 		"dotenv": "~17.2.3",
 		"mcp-client": "^1.13.1",
-		"openai": "^6.7.0",
+		"openai": "^6.48.0",
 		"undici": "^7.20.0"
 	},
 	"devDependencies": {

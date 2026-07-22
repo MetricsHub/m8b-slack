@@ -71,7 +71,7 @@ export function stripFileCiteTokens(text) {
  * @param {Object} params - Processing parameters
  * @param {string} params.responseId - OpenAI response ID
  * @param {string} params.fullText - Full response text
- * @param {Map} params.streamCitationMap - Citations captured during streaming
+ * @param {Map} [params.streamCitationMap] - Citations captured during streaming
  * @param {Array} params.vectorStoreIds - Vector store IDs to search
  * @param {string} params.channel - Slack channel ID
  * @param {string} params.thread_ts - Thread timestamp

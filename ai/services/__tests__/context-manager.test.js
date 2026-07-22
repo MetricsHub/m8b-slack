@@ -2,7 +2,7 @@
  * Tests for context manager service.
  */
 
-import { findLastBotMessage } from "../context-manager.js";
+import { buildConversationInput, findLastBotMessage } from "../context-manager.js";
 
 describe("findLastBotMessage", () => {
 	const mockContext = {
@@ -111,5 +111,29 @@ describe("findLastBotMessage", () => {
 		const result = findLastBotMessage(messages, mockContext);
 
 		expect(result.index).toBe(-1);
+	});
+});
+
+describe("buildConversationInput", () => {
+	it("marks replayed bot messages as final answers", async () => {
+		const messages = [
+			{ ts: "1", bot_id: "B12345", text: "Completed answer" },
+			{ ts: "2", user: "U99999", text: "Follow-up" },
+			{ ts: "3", user: "U99999", text: "Current message" },
+		];
+
+		const result = await buildConversationInput(
+			messages,
+			-1,
+			"3",
+			{ BOT_ID: "B12345", userId: "U99999" },
+			async () => null
+		);
+
+		expect(result[0]).toEqual({
+			role: "assistant",
+			phase: "final_answer",
+			content: [{ type: "output_text", text: "Completed answer" }],
+		});
 	});
 });
