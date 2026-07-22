@@ -1,15 +1,18 @@
 # M8B Slack Bot (MetricsHub)
 
-M8B is a grumpy but competent Slack bot that helps solve IT issues. It uses OpenAI for reasoning and can query one or more MetricsHub MCP servers for real metrics. Built with Slack Bolt (Node.js).
+M8B is a grumpy but competent Slack bot that helps solve IT issues. It uses GPT-5.6 Sol through
+the OpenAI Responses API and can query one or more MetricsHub MCP servers for real monitoring
+data. It is built with Slack Bolt for Node.js.
 
 ## Features
 
-- 🤖 AI-powered IT troubleshooting using OpenAI GPT models
+- 🤖 IT troubleshooting with `gpt-5.6-sol`, reasoning summaries, and streamed Responses API output
 - 📊 Real-time metrics from MetricsHub MCP servers
+- 🧰 Hosted tool search with deferred MetricsHub, Prometheus, and knowledge-write schemas
 - 🔍 Prometheus PromQL query support
-- 📁 File analysis (images, PDFs, code files)
+- 📁 Image and PDF analysis plus Code Interpreter support for data and code files
 - 🧠 Knowledge base with vector store search
-- 💬 Slack-native with streaming responses
+- 💬 Slack Assistant threads and mentions with streaming responses and conversation continuity
 - 🔧 Grumpy personality for maximum entertainment
 
 ## Project Structure
@@ -30,25 +33,28 @@ m8b-slackbot/
 │   │   ├── context-manager.js # Conversation context management
 │   │   ├── function-calls.js # Tool call processing
 │   │   ├── slack-files.js    # File upload handling
-│   │   └── citations.js      # Citation post-processing
+│   │   ├── tool-middleware.js # Caching, pagination, and large tool outputs
+│   │   └── citations.js       # Citation post-processing
 │   ├── tools/
-│   │   └── index.js          # Tool definitions
+│   │   ├── index.js          # Tool definitions and deferred namespaces
+│   │   └── __tests__/        # Tool tests
 │   └── utils/
 │       ├── tokens.js         # Token estimation utilities
 │       ├── output-handler.js # Large output handling
-│       └── json-parser.js    # JSON parsing utilities
+│       ├── json-parser.js    # JSON parsing utilities
+│       └── __tests__/        # Utility tests
 ├── listeners/
 │   ├── actions/              # Slack action handlers
 │   ├── assistant/            # Assistant thread handlers
 │   └── events/               # Event handlers (app_mention, etc.)
-└── tests/                    # Test files (in __tests__ directories)
+└── manifest.json             # Slack app manifest
 ```
 
 ## Prerequisites
 
 - Node.js 20+ and npm
 - A Slack workspace where you can install apps
-- OpenAI API key
+- OpenAI API key with access to `gpt-5.6-sol` and the required Responses API tools
 - Optional: MetricsHub MCP servers (URLs + API tokens)
 - Optional: Prometheus server for PromQL queries
 
@@ -90,7 +96,7 @@ npm run dev
 | `npm run lint:fix`      | Fix linting issues                  |
 | `npm run format`        | Format code                         |
 | `npm run check`         | TypeScript type checking            |
-| `npm run validate`      | Run lint + check + test             |
+| `npm run validate`      | Run format check + lint + tests     |
 
 ## Configuration
 
@@ -109,6 +115,7 @@ SLACK_API_URL=https://slack.com/api
 # MetricsHub MCP Server (single server mode)
 MCP_AGENT_URL=https://metricshub.example.com/sse
 MCP_AGENT_TOKEN=...
+# MCP_ALLOW_SELF_SIGNED_CERT=true
 
 # Prometheus
 M8B_PROMETHEUS_URL=http://prometheus.example.com:9090
@@ -119,9 +126,19 @@ OPENAI_VECTOR_STORE_IDS=vs_123,vs_456
 OPENAI_VECTOR_STORE_ID=vs_123
 ```
 
+`NODE_ENV` controls Bolt logging:
+
+- `production`: warnings and errors
+- `test`: info and above
+- Any other value or an unset value: debug logging
+
+Info/debug logs include reasoning summaries, tool activity, token/cache usage, and the complete
+LLM response. Treat development logs as potentially sensitive operational data.
+
 ### Multiple MCP Servers
 
-Create `ai/mcp.config.local.js` (not tracked by git):
+Copy `ai/mcp.config.sample.js` to `ai/mcp.config.local.js` (not tracked by git), then configure
+the servers:
 
 ```javascript
 export default [
@@ -138,6 +155,24 @@ export default [
 ];
 ```
 
+When a valid local configuration contains at least one server, it takes precedence over the
+single-server `MCP_AGENT_URL`/`MCP_AGENT_TOKEN` fallback.
+
+### OpenAI Model and Tools
+
+The active model configuration is in `ai/config/system-prompt.js`:
+
+- Model: `gpt-5.6-sol`
+- Reasoning effort: `medium`, with automatic summaries and reasoning context
+- Output: low verbosity, up to 8,000 tokens
+- Conversation continuity: `previous_response_id`
+- End-user safety identifier: a privacy-preserving hash of the Slack workspace and user IDs
+
+MetricsHub tools are grouped into namespaces of fewer than ten functions. `ListHosts` and
+`SearchHost` remain immediately callable; larger MetricsHub schemas, PromQL, and knowledge-base
+writes are loaded through hosted tool search only when needed. Large MCP outputs are uploaded as
+files so Code Interpreter can analyze the complete result instead of a truncated inline preview.
+
 ## Create and Install the Slack App
 
 1. Go to <https://api.slack.com/apps/new> and choose "From an app manifest"
@@ -145,6 +180,12 @@ export default [
 3. Paste the contents of `manifest.json` (JSON tab) and click Next
 4. Review and Create the app
 5. On the app page, go to Install App and install to your workspace
+
+> **Slack compatibility:** `manifest.json` currently uses Slack's legacy `assistant_view` and
+> `assistant_thread_*` events. Existing Assistant-view installations can continue to use it, but
+> Slack requires the newer `agent_view` for newly created agent apps. Migrating the manifest and
+> event flow to Agent View is separate work; see Slack's
+> [Agent messaging migration guidance](https://docs.slack.dev/ai/developing-agents/).
 
 You will need two tokens from Slack:
 
@@ -203,7 +244,7 @@ npm run format
 # Type checking
 npm run check
 
-# Run all validations
+# Run formatting checks, linting, and tests
 npm run validate
 ```
 
@@ -212,18 +253,20 @@ npm run validate
 The codebase is organized into clear modules:
 
 - **Config**: System prompts, model settings, constants
-- **Services**: Core business logic (OpenAI, streaming, context)
-- **Tools**: Function definitions for AI tool calls
+- **Services**: OpenAI Responses API streaming, context, files, citations, and tool execution
+- **Tools**: Immediate and deferred function definitions grouped for hosted tool search
 - **Utils**: Helper functions (token counting, output handling)
 
-Each module is testable and has a single responsibility.
+Conversation history uses OpenAI response IDs when available. On a cold start it reconstructs
+history from Slack, excluding Slack's synthetic `assistant_app_thread` root so the initial user
+question is not replayed as an assistant message.
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run `npm run validate` to ensure quality
+4. Run `npm run validate` and, when working on typed interfaces, `npm run check`
 5. Submit a pull request
 
 ## License

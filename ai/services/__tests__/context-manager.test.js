@@ -136,4 +136,35 @@ describe("buildConversationInput", () => {
 			content: [{ type: "output_text", text: "Completed answer" }],
 		});
 	});
+
+	it("skips Slack's synthetic Assistant thread root", async () => {
+		const messages = [
+			{
+				ts: "1",
+				thread_ts: "1",
+				bot_id: "B12345",
+				subtype: "assistant_app_thread",
+				text: "Current question",
+				assistant_app_thread: { title: "Current question" },
+			},
+			{ ts: "2", bot_id: "B12345", text: "Hi, how can I help?" },
+			{ ts: "3", user: "U99999", text: "Current question" },
+		];
+
+		const result = await buildConversationInput(
+			messages,
+			-1,
+			"3",
+			{ BOT_ID: "B12345", userId: "U99999" },
+			async () => null
+		);
+
+		expect(result).toEqual([
+			{
+				role: "assistant",
+				phase: "final_answer",
+				content: [{ type: "output_text", text: "Hi, how can I help?" }],
+			},
+		]);
+	});
 });

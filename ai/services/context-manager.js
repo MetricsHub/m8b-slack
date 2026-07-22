@@ -175,6 +175,17 @@ export async function buildConversationInput(
 		// Skip the current incoming message
 		if (!msg || msg.ts === currentMessageTs) continue;
 
+		// Slack creates a synthetic root for legacy Assistant threads. Its text mirrors
+		// the thread title (usually the user's first question), so it is UI metadata rather
+		// than a conversational turn and must not be replayed to the model.
+		if (
+			msg.subtype === "assistant_app_thread" ||
+			msg.message?.subtype === "assistant_app_thread" ||
+			msg.assistant_app_thread
+		) {
+			continue;
+		}
+
 		const rawText = (msg.text || "").trim();
 		const authorId = msg.user || msg.bot_id || msg.app_id;
 

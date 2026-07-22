@@ -327,7 +327,7 @@ export function getOpenAiFunctionTools() {
 		type: "function",
 		name: "ListHosts",
 		description:
-			"Return all monitored host entries across MetricsHub agents, keyed by monitoring identifier. Multiple entries may describe the same physical system. Preserve every entry unless the user explicitly asks for unique systems; disclose the original and transformed counts when grouping, normalizing, or deduplicating. Returns {ok, hosts} or {ok:false, error}.",
+			"Return the consolidated list of all known hosts across all MetricsHub agents/servers (on-prem).",
 		parameters: { type: "object", properties: {}, additionalProperties: false },
 	});
 
