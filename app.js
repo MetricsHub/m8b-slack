@@ -43,7 +43,6 @@ const app = new App({
 		// Initialize MetricsHub MCP registry (discover tools/hosts)
 		try {
 			await initializeMcpRegistry(app.logger);
-			app.logger.info("MCP registry initialized");
 		} catch (e) {
 			app.logger.warn("Failed to initialize MCP registry", e);
 		}

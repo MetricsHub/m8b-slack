@@ -217,6 +217,8 @@ export async function streamOnce(
 		output_text_delta: 0,
 		output_item_added_function_call: 0,
 		output_item_done_function_call: 0,
+		tool_search_calls: 0,
+		tool_search_outputs: 0,
 		function_call_args_delta: 0,
 		response_error: 0,
 		response_completed: 0,
@@ -240,6 +242,11 @@ export async function streamOnce(
 		"response.content_part.added",
 		"response.content_part.done",
 		"response.output_text.done",
+		"response.code_interpreter_call_code.delta",
+		"response.code_interpreter_call_code.done",
+		"response.code_interpreter_call.in_progress",
+		"response.code_interpreter_call.interpreting",
+		"response.code_interpreter_call.completed",
 	]);
 
 	// Reasoning buffer for status updates
@@ -336,7 +343,14 @@ export async function streamOnce(
 					// Note: arguments are streamed incrementally, so we log them when complete
 					logger?.info?.("[ACTION] LLM initiated function call", {
 						name: item.name,
+						namespace: item.namespace,
 						call_id: item.call_id,
+					});
+				} else if (item?.type === "tool_search_call") {
+					evtCounters.tool_search_calls++;
+					logger?.info?.("[TOOL_SEARCH] LLM searching deferred tools", {
+						execution: item.execution,
+						arguments: item.arguments,
 					});
 				} else {
 					evtCounters.other++;
@@ -405,6 +419,18 @@ export async function streamOnce(
 					if (containerId) {
 						lastContainerId = containerId;
 					}
+				} else if (evt.item?.type === "tool_search_output") {
+					evtCounters.tool_search_outputs++;
+					const loadedTools = (evt.item.tools || []).flatMap((tool) => {
+						if (tool.type === "namespace") {
+							return tool.tools.map((nestedTool) => `${tool.name}.${nestedTool.name}`);
+						}
+						return [tool.name || tool.type];
+					});
+					logger?.info?.("[TOOL_SEARCH] Loaded deferred tools", {
+						execution: evt.item.execution,
+						tools: loadedTools,
+					});
 				} else {
 					evtCounters.other++;
 				}
@@ -584,6 +610,12 @@ export async function streamOnce(
 	const validFunctionCalls = functionCalls.filter(Boolean);
 	const validFiles = outputFiles.filter((f) => f?.file_id);
 
+	if (fullResponseText) {
+		logger?.info?.(
+			`[OUTPUT] LLM response (${fullResponseText.length} chars):\n${fullResponseText}`
+		);
+	}
+
 	// Summary log for key actions
 	logger?.info?.("[STREAM_COMPLETE] Turn finished", {
 		responseId: newResponseId,
@@ -595,6 +627,7 @@ export async function streamOnce(
 		textLength: fullResponseText.length,
 		functionCalls: validFunctionCalls.map((fc) => ({
 			name: fc.name,
+			namespace: fc.namespace,
 			call_id: fc.call_id,
 		})),
 		outputFiles: validFiles.map((f) => ({

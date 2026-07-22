@@ -5,6 +5,49 @@
 import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
 
+const MAX_NAMESPACE_TOOLS = 9;
+const IMMEDIATE_MCP_TOOLS = new Set(["ListHosts", "SearchHost"]);
+
+/**
+ * Group function tools into small namespaces for hosted tool search.
+ * Deferred definitions stay out of the initial model context until they are relevant.
+ *
+ * @param {Object} options - Namespace options
+ * @param {string} options.name - Namespace base name
+ * @param {string} options.description - High-level namespace description
+ * @param {Array} options.functionTools - Function tools to group
+ * @param {Set<string>} [options.immediateToolNames] - Tools available without a search
+ * @returns {Array} Namespace tool definitions
+ */
+export function buildFunctionNamespaces({
+	name,
+	description,
+	functionTools,
+	immediateToolNames = new Set(),
+}) {
+	const namespaces = [];
+
+	for (let offset = 0; offset < functionTools.length; offset += MAX_NAMESPACE_TOOLS) {
+		const chunk = functionTools.slice(offset, offset + MAX_NAMESPACE_TOOLS);
+		const chunkIndex = namespaces.length + 1;
+		const chunkCount = Math.ceil(functionTools.length / MAX_NAMESPACE_TOOLS);
+		const namespaceName = chunkCount === 1 ? name : `${name}_${chunkIndex}`;
+		const capabilityNames = chunk.map((tool) => tool.name).join(", ");
+
+		namespaces.push({
+			type: "namespace",
+			name: namespaceName,
+			description: `${description} Capabilities: ${capabilityNames}.`,
+			tools: chunk.map((tool) => ({
+				...tool,
+				defer_loading: !immediateToolNames.has(tool.name),
+			})),
+		});
+	}
+
+	return namespaces;
+}
+
 /**
  * Slack tool definitions.
  */
@@ -85,6 +128,7 @@ export const KNOWLEDGE_TOOL = {
  */
 export function buildToolsArray({ vectorStoreIds = [], codeFileIds = new Set() }) {
 	const tools = [];
+	let hasDeferredTools = false;
 
 	// File search tool (if vector stores configured)
 	if (vectorStoreIds.length > 0) {
@@ -95,13 +139,46 @@ export function buildToolsArray({ vectorStoreIds = [], codeFileIds = new Set() }
 		});
 	}
 
-	// MCP function tools
-	tools.push(...getOpenAiFunctionTools());
+	// MCP function tools. Keep host discovery immediately callable; defer the larger
+	// per-host schemas until GPT-5.6 determines that it needs them.
+	const mcpNamespaces = buildFunctionNamespaces({
+		name: "metricshub",
+		description: "MetricsHub infrastructure discovery, monitoring, and diagnostics.",
+		functionTools: getOpenAiFunctionTools(),
+		immediateToolNames: IMMEDIATE_MCP_TOOLS,
+	});
+	tools.push(...mcpNamespaces);
+	hasDeferredTools ||= mcpNamespaces.some((namespace) =>
+		namespace.tools.some((tool) => tool.defer_loading)
+	);
 
 	// Prometheus PromQL tool (if configured)
 	const promqlTool = getPromQLTool();
 	if (promqlTool) {
-		tools.push(promqlTool);
+		tools.push(
+			...buildFunctionNamespaces({
+				name: "prometheus",
+				description: "Prometheus metric queries and time-series analysis.",
+				functionTools: [promqlTool],
+			})
+		);
+		hasDeferredTools = true;
+	}
+
+	// Knowledge updates are useful but infrequent, so load their schema on demand.
+	if (vectorStoreIds.length > 0) {
+		tools.push(
+			...buildFunctionNamespaces({
+				name: "knowledge_base",
+				description: "Store reusable operational and troubleshooting knowledge.",
+				functionTools: [KNOWLEDGE_TOOL],
+			})
+		);
+		hasDeferredTools = true;
+	}
+
+	if (hasDeferredTools) {
+		tools.push({ type: "tool_search" });
 	}
 
 	// Code interpreter
@@ -115,11 +192,6 @@ export function buildToolsArray({ vectorStoreIds = [], codeFileIds = new Set() }
 
 	// Slack tools
 	tools.push(...SLACK_TOOLS);
-
-	// Knowledge tool (only if vector stores configured)
-	if (vectorStoreIds.length > 0) {
-		tools.push(KNOWLEDGE_TOOL);
-	}
 
 	return tools;
 }

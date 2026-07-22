@@ -57,17 +57,20 @@ export function summarizeInputItems(items) {
 		return (items || []).map((item) => {
 			const content = Array.isArray(item?.content) ? item.content : [];
 			const types = content.map((c) => c?.type).filter(Boolean);
+			if (types.length === 0 && item?.type) types.push(item.type);
+			const textContent = content.filter(
+				(c) => c?.type === "input_text" || c?.type === "output_text"
+			);
+			const topLevelText = typeof item?.output === "string" ? item.output : "";
 
 			// Get text preview from first text content
-			const firstText = content.find((c) => c?.type === "input_text");
-			const textPreview = firstText?.text
-				? firstText.text.slice(0, 80).replace(/\n/g, " ") +
-					(firstText.text.length > 80 ? "..." : "")
+			const firstText = textContent[0]?.text || topLevelText;
+			const textPreview = firstText
+				? firstText.slice(0, 80).replace(/\n/g, " ") + (firstText.length > 80 ? "..." : "")
 				: null;
 
-			const totalText = content
-				.filter((c) => c?.type === "input_text")
-				.reduce((sum, c) => sum + (c.text || "").length, 0);
+			const totalText =
+				textContent.reduce((sum, c) => sum + (c.text || "").length, 0) + topLevelText.length;
 
 			// Build compact summary string
 			const typeSummary = types.join(",") || "empty";

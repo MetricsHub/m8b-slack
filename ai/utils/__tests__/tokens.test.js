@@ -99,4 +99,33 @@ describe("summarizeInputItems", () => {
 			preview: "World",
 		});
 	});
+
+	it("should summarize assistant output and function output items", () => {
+		const summary = summarizeInputItems([
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "Previous answer" }],
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_123",
+				output: '{"ok":true}',
+			},
+		]);
+
+		expect(summary).toEqual([
+			{
+				role: "assistant",
+				types: "output_text",
+				chars: 15,
+				preview: "Previous answer",
+			},
+			{
+				role: "?",
+				types: "function_call_output",
+				chars: 11,
+				preview: '{"ok":true}',
+			},
+		]);
+	});
 });
