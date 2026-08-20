@@ -3,6 +3,7 @@ import {
 	clearCache,
 	compressMcpOutput,
 	executeWithMiddleware,
+	filterTelemetryMonitorTypes,
 	telemetryToMarkdown,
 } from "../tool-middleware.js";
 
@@ -889,5 +890,159 @@ describe("compressMcpOutput (current-shape summary fields)", () => {
 
 		expect(numeric["hw.host.power"]).toEqual({ avg: 120, count: 2 });
 		expect(Object.keys(numeric).filter((k) => k.startsWith("metricshub.job."))).toHaveLength(0);
+	});
+});
+
+describe("monitor-type summarization and filtering", () => {
+	/** One small type (pool) and one type big enough to summarize (fan). */
+	function makeTwoTypeFixture({ withSummaryInstance = true } = {}) {
+		const fan = Array.from({ length: 3 }, (_, i) => ({
+			attributes: { entityName: `Fan ${i + 1}`, "sensor.location": `bay${i + 1}` },
+			metrics: { 'hw.status{hw.type="fan"}': "ok", "hw.fan.speed": 4180 + i * 15 },
+		}));
+		if (withSummaryInstance) {
+			fan.push({
+				type: "summary",
+				totalMonitors: 3,
+				numericMetrics: {
+					"hw.fan.speed": { avg: 4195, min: 4180, max: 4210, sum: 12585, count: 3 },
+				},
+				stateSetMetrics: { 'hw.status{hw.type="fan"}': [{ value: "ok", count: 3 }] },
+			});
+		}
+		return {
+			ok: true,
+			results: [
+				{
+					ok: true,
+					result: {
+						hosts: [
+							{
+								hostname: "vmax-storage",
+								response: {
+									telemetry: {
+										monitors: {
+											fan,
+											pool: [
+												{
+													attributes: { entityName: "SRP_1" },
+													metrics: { 'storage.usage{state="free"}': 4892830000000 },
+												},
+											],
+										},
+									},
+								},
+							},
+						],
+					},
+				},
+			],
+		};
+	}
+
+	it("collapses an oversized type to its aggregates with a drill-down hint", () => {
+		const markdown = telemetryToMarkdown(makeTwoTypeFixture(), { maxTableChars: 300 });
+
+		expect(markdown).toContain("## fan (3 instances — rows omitted)");
+		// Aggregates from the MetricsHub summary instance survive
+		expect(markdown).toContain("| hw.fan.speed | 4195 | 4180 | 4210 | 12585 | 3 |");
+		expect(markdown).toContain('State summary — hw.status{hw.type="fan"}: ok ×3');
+		// Per-instance rows are gone
+		expect(markdown).not.toContain("| Fan 1 |");
+		// Drill-down hint names the tool argument
+		expect(markdown).toContain('monitorTypes: ["fan"]');
+		// The small type keeps its full table
+		expect(markdown).toContain("| SRP_1 | 4892830000000 |");
+	});
+
+	it("computes fallback aggregates when the telemetry has no summary instance", () => {
+		const fixture = makeTwoTypeFixture({ withSummaryInstance: false });
+		// Lower threshold: without the summary instance the section is smaller
+		const markdown = telemetryToMarkdown(fixture, { maxTableChars: 100 });
+
+		expect(markdown).toContain("## fan (3 instances — rows omitted)");
+		// avg (4180+4195+4210)/3 = 4195, min/max/sum/count computed app-side
+		expect(markdown).toContain("| hw.fan.speed | 4195 | 4180 | 4210 | 12585 | 3 |");
+		expect(markdown).toContain('State summary — hw.status{hw.type="fan"}: ok ×3');
+	});
+
+	it("always renders full rows for explicitly requested types", () => {
+		const markdown = telemetryToMarkdown(makeTwoTypeFixture(), {
+			maxTableChars: 300,
+			requestedTypes: ["fan"],
+		});
+
+		expect(markdown).toContain("## fan (3)");
+		expect(markdown).toContain("| Fan 1 | bay1 | ok | 4180 |");
+		expect(markdown).not.toContain("rows omitted");
+	});
+
+	it("filterTelemetryMonitorTypes keeps only requested types (case-insensitive)", () => {
+		const { filtered, matchedTypes, availableTypes } = filterTelemetryMonitorTypes(
+			makeTwoTypeFixture(),
+			["POOL"]
+		);
+
+		const monitors = filtered.results[0].result.hosts[0].response.telemetry.monitors;
+		expect(Object.keys(monitors)).toEqual(["pool"]);
+		expect(matchedTypes).toEqual(["pool"]);
+		expect(availableTypes.sort()).toEqual(["fan", "pool"]);
+	});
+
+	it("filterTelemetryMonitorTypes returns null for non-telemetry shapes", () => {
+		expect(filterTelemetryMonitorTypes({ ok: true, hosts: [] }, ["cpu"])).toBeNull();
+		expect(filterTelemetryMonitorTypes({ ok: true, results: [{ value: 1 }] }, ["cpu"])).toBeNull();
+	});
+
+	describe("executeWithMiddleware with monitorTypes", () => {
+		beforeEach(() => {
+			clearCache();
+		});
+
+		it("filters the response and never forwards monitorTypes to the tool", async () => {
+			let receivedArgs = null;
+			const output = await executeWithMiddleware(
+				"GetMetricsFromCacheForHost",
+				{ hosts: ["vmax-storage"], monitorTypes: ["pool"] },
+				async (_name, cleanArgs) => {
+					receivedArgs = cleanArgs;
+					return makeTwoTypeFixture();
+				},
+				{}
+			);
+
+			expect(receivedArgs.monitorTypes).toBeUndefined();
+			expect(typeof output).toBe("string");
+			expect(output).toContain("## pool (1)");
+			expect(output).not.toContain("## fan");
+			expect(output).toContain("Output filtered to monitor types: pool");
+			expect(output).toContain("Other types available on these host(s): fan");
+		});
+
+		it("reports available types when no requested type matches", async () => {
+			const output = await executeWithMiddleware(
+				"GetMetricsFromCacheForHost",
+				{ hosts: ["vmax-storage"], monitorTypes: ["gpu"] },
+				async () => makeTwoTypeFixture(),
+				{}
+			);
+
+			expect(output.ok).toBe(false);
+			expect(output.error).toContain("gpu");
+			expect(output.availableTypes.sort()).toEqual(["fan", "pool"]);
+			expect(output.hint).toContain("monitorTypes");
+		});
+
+		it("ignores monitorTypes on non-telemetry outputs", async () => {
+			const output = await executeWithMiddleware(
+				"SomeOtherTool",
+				{ monitorTypes: ["cpu"] },
+				async () => ({ ok: true, items: [{ id: 1 }] }),
+				{}
+			);
+
+			expect(output.ok).toBe(true);
+			expect(output.items).toHaveLength(1);
+		});
 	});
 });

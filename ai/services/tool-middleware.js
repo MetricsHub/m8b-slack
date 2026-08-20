@@ -42,6 +42,7 @@ function generateCacheKey(toolName, args) {
 	delete normalizedArgs.offset;
 	delete normalizedArgs.maxResults;
 	delete normalizedArgs._cacheId;
+	delete normalizedArgs.monitorTypes;
 
 	const sortedArgs = JSON.stringify(normalizedArgs, Object.keys(normalizedArgs).sort());
 	const hash = crypto.createHash("sha256").update(`${toolName}:${sortedArgs}`).digest("hex");
@@ -379,11 +380,18 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 		return ensureSafeSize(paginatedOutput, name, logger);
 	}
 
-	// Strip pagination params before calling the actual tool
+	// monitorTypes is an app-side argument (injected into the tool schema by
+	// the registry): filter the telemetry response instead of forwarding it
+	const monitorTypes = Array.isArray(args?.monitorTypes)
+		? args.monitorTypes.map((t) => String(t)).filter(Boolean)
+		: [];
+
+	// Strip pagination and app-side params before calling the actual tool
 	const cleanArgs = { ...args };
 	delete cleanArgs.offset;
 	delete cleanArgs.maxResults;
 	delete cleanArgs._cacheId;
+	delete cleanArgs.monitorTypes;
 
 	// Execute the actual tool call
 	let result;
@@ -397,6 +405,27 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 	// Compress MCP output to reduce payload size (removes verbose/redundant fields)
 	result = compressMcpOutput(result, name, logger);
 
+	// Apply the monitorTypes filter on telemetry-shaped outputs
+	let monitorTypeFilter = null;
+	if (monitorTypes.length > 0) {
+		const filterResult = filterTelemetryMonitorTypes(result, monitorTypes);
+		if (filterResult) {
+			if (filterResult.matchedTypes.length === 0) {
+				return {
+					ok: false,
+					error: `No monitors of type [${monitorTypes.join(", ")}] on the requested host(s).`,
+					availableTypes: filterResult.availableTypes,
+					hint: "Call this tool again with monitorTypes set to one or more of availableTypes, or without monitorTypes to get every type.",
+				};
+			}
+			logger?.info?.(
+				`[MIDDLEWARE] Filtered ${name} telemetry to monitor types: ${filterResult.matchedTypes.join(", ")}`
+			);
+			result = filterResult.filtered;
+			monitorTypeFilter = filterResult;
+		}
+	}
+
 	// Always upload the full result as a file (if we have the client)
 	let uploadedFile = null;
 	if (openaiClient && fileTracking) {
@@ -407,7 +436,9 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 	// (~65% fewer tokens than the compressed JSON, content-lossless). The
 	// uploaded file keeps the full JSON for code_interpreter, which genuinely
 	// parses it programmatically.
-	const telemetryMarkdown = telemetryToMarkdown(result);
+	const telemetryMarkdown = telemetryToMarkdown(result, {
+		requestedTypes: monitorTypeFilter ? monitorTypeFilter.matchedTypes : [],
+	});
 	if (telemetryMarkdown !== null) {
 		const jsonSize = JSON.stringify(result).length;
 		const savingsPercent = (((jsonSize - telemetryMarkdown.length) / jsonSize) * 100).toFixed(1);
@@ -416,6 +447,12 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 		);
 
 		let inline = telemetryMarkdown;
+		if (monitorTypeFilter) {
+			const otherTypes = monitorTypeFilter.availableTypes.filter(
+				(type) => !monitorTypeFilter.matchedTypes.includes(type)
+			);
+			inline += `\n\n> Output filtered to monitor types: ${monitorTypeFilter.matchedTypes.join(", ")}. Other types available on these host(s): ${otherTypes.join(", ") || "(none)"}.`;
+		}
 		if (uploadedFile) {
 			inline += `\n\n> Full JSON (${jsonSize} chars) uploaded as "${uploadedFile.fileName}". Use code_interpreter to read and analyze it programmatically.`;
 		}
@@ -807,6 +844,15 @@ function compressMcpTelemetry(data) {
 const MIN_METRIC_PREFIX_LENGTH = 8;
 
 /**
+ * A monitor-type table larger than this (chars) collapses to its aggregate
+ * stats plus a drill-down hint, unless that type was explicitly requested
+ * via the monitorTypes argument. Sized so that a host with one dominating
+ * type (e.g. 301 VMAX volumes at ~70K chars) still fits every other type's
+ * full table in the response.
+ */
+const MAX_MONITOR_TABLE_CHARS = 10000;
+
+/**
  * Render a value as a Markdown table cell: pipes and newlines would break the
  * table grid, everything else stays verbatim so the model can copy values into
  * follow-up tool calls.
@@ -1008,17 +1054,78 @@ function buildAggregateBlock(aggregateInstances, regularCount) {
 }
 
 /**
+ * Compute a MetricsHub-style aggregate instance from regular instances, for
+ * monitor types whose telemetry lacks a summary instance: numeric metrics
+ * become {avg,min,max,sum,count}, string/boolean metrics become state sets.
+ * @param {Array} flattened - Rows from flattenMonitorInstance
+ * @returns {Object|null} A synthetic summary instance, or null when empty
+ */
+function computeAggregateInstance(flattened) {
+	const numeric = {};
+	const stateCounts = {};
+
+	for (const row of flattened) {
+		for (const [name, value] of row.metrics) {
+			if (typeof value === "number" && Number.isFinite(value)) {
+				if (!numeric[name]) {
+					numeric[name] = { avg: 0, min: value, max: value, sum: 0, count: 0 };
+				}
+				const stats = numeric[name];
+				stats.min = Math.min(stats.min, value);
+				stats.max = Math.max(stats.max, value);
+				stats.sum += value;
+				stats.count += 1;
+			} else if (typeof value === "string" || typeof value === "boolean") {
+				if (!stateCounts[name]) {
+					stateCounts[name] = new Map();
+				}
+				const key = String(value);
+				stateCounts[name].set(key, (stateCounts[name].get(key) || 0) + 1);
+			}
+		}
+	}
+
+	for (const stats of Object.values(numeric)) {
+		stats.avg = stats.count > 0 ? stats.sum / stats.count : 0;
+	}
+
+	const stateSetMetrics = {};
+	for (const [name, counts] of Object.entries(stateCounts)) {
+		stateSetMetrics[name] = [...counts.entries()].map(([value, count]) => ({ value, count }));
+	}
+
+	if (Object.keys(numeric).length === 0 && Object.keys(stateSetMetrics).length === 0) {
+		return null;
+	}
+	return {
+		type: "summary",
+		totalMonitors: flattened.length,
+		numericMetrics: numeric,
+		stateSetMetrics,
+	};
+}
+
+/**
  * Build one Markdown table for a monitor type. Columns are the union of
  * attribute keys, then metric names, then remaining instance fields (each
  * group in first-seen order) — identity attributes lead the table and text
  * blobs like StatusInformation trail it; rows are instances; missing cells
  * stay empty; all-empty rows are skipped. Aggregate-only instances render
  * as a separate stat block below the table.
+ *
+ * A section exceeding options.maxTableChars collapses to its aggregate
+ * stats plus a drill-down hint — unless options.requested marks the type as
+ * explicitly asked for via the monitorTypes argument, which always gets the
+ * full rows.
  * @param {string} monitorType - The monitor type key (file_system, cpu, ...)
  * @param {Array} instances - Monitor instances of that type
+ * @param {Object} [options]
+ * @param {number} [options.maxTableChars] - Summarization threshold in chars
+ * @param {boolean} [options.requested] - Type was explicitly requested
  * @returns {string|null} Markdown section, or null when nothing renders
  */
-function buildMonitorTable(monitorType, instances) {
+function buildMonitorTable(monitorType, instances, options = {}) {
+	const { maxTableChars = MAX_MONITOR_TABLE_CHARS, requested = false } = options;
 	const aggregateInstances = [];
 	const regularInstances = [];
 	for (const instance of instances) {
@@ -1129,7 +1236,88 @@ function buildMonitorTable(monitorType, instances) {
 	const parts = [heading, [headerLine, separator, ...rows].join("\n")];
 	if (duplicateNotes.length > 0) parts.push(duplicateNotes.join("\n"));
 	if (aggregateBlock) parts.push(aggregateBlock);
-	return parts.join("\n\n");
+	const section = parts.join("\n\n");
+
+	// Oversized and not explicitly requested: keep only the aggregates.
+	// MetricsHub usually ships them in the summary instance; compute them
+	// ourselves otherwise.
+	if (!requested && section.length > maxTableChars) {
+		const aggregates =
+			aggregateBlock ??
+			buildAggregateBlock([computeAggregateInstance(flattened)].filter(Boolean), rows.length);
+		const summaryParts = [`## ${monitorType} (${rows.length} instances — rows omitted)`];
+		if (aggregates) summaryParts.push(aggregates);
+		summaryParts.push(
+			`> The ${rows.length} per-instance rows (${section.length} chars) were omitted to keep this response compact; the aggregates above summarize them. Call this tool again with monitorTypes: ["${monitorType}"] to get the full ${monitorType} table.`
+		);
+		return summaryParts.join("\n\n");
+	}
+
+	return section;
+}
+
+/**
+ * Keep only the requested monitor types in a telemetry-shaped output
+ * (case-insensitive). This is the app-side implementation of the
+ * monitorTypes tool argument — the MCP server never sees it.
+ *
+ * @param {*} output - Compressed tool output
+ * @param {string[]} monitorTypes - Requested monitor type names
+ * @returns {{filtered: Object, matchedTypes: string[], availableTypes: string[]}|null}
+ *   The filtered copy plus which types matched/exist, or null when the
+ *   output is not telemetry-shaped (filter does not apply)
+ */
+export function filterTelemetryMonitorTypes(output, monitorTypes) {
+	if (!output || typeof output !== "object" || Array.isArray(output)) return null;
+	if (!Array.isArray(output.results)) return null;
+
+	const wanted = new Set(monitorTypes.map((t) => String(t).toLowerCase()));
+	const availableTypes = new Set();
+	const matchedTypes = new Set();
+	let sawTelemetry = false;
+
+	const filtered = {
+		...output,
+		results: output.results.map((entry) => {
+			const hosts = entry?.result?.hosts;
+			if (!Array.isArray(hosts)) return entry;
+			return {
+				...entry,
+				result: {
+					...entry.result,
+					hosts: hosts.map((host) => {
+						const monitors = host?.response?.telemetry?.monitors;
+						if (!monitors || typeof monitors !== "object" || Array.isArray(monitors)) {
+							return host;
+						}
+						sawTelemetry = true;
+						const kept = {};
+						for (const [type, instances] of Object.entries(monitors)) {
+							availableTypes.add(type);
+							if (wanted.has(type.toLowerCase())) {
+								kept[type] = instances;
+								matchedTypes.add(type);
+							}
+						}
+						return {
+							...host,
+							response: {
+								...host.response,
+								telemetry: { ...host.response.telemetry, monitors: kept },
+							},
+						};
+					}),
+				},
+			};
+		}),
+	};
+
+	if (!sawTelemetry) return null;
+	return {
+		filtered,
+		matchedTypes: [...matchedTypes],
+		availableTypes: [...availableTypes],
+	};
 }
 
 /**
@@ -1147,9 +1335,19 @@ function buildMonitorTable(monitorType, instances) {
  * returns null so the caller keeps the JSON representation.
  *
  * @param {*} output - Compressed tool output
+ * @param {Object} [options]
+ * @param {Set<string>|string[]} [options.requestedTypes] - Monitor types (lowercase)
+ *   explicitly requested via monitorTypes: these always render full rows
+ * @param {number} [options.maxTableChars] - Per-type summarization threshold
  * @returns {string|null} Markdown document, or null when the shape does not match
  */
-export function telemetryToMarkdown(output) {
+export function telemetryToMarkdown(output, options = {}) {
+	const requestedTypes =
+		options.requestedTypes instanceof Set
+			? options.requestedTypes
+			: new Set((options.requestedTypes || []).map((t) => String(t).toLowerCase()));
+	const maxTableChars = options.maxTableChars ?? MAX_MONITOR_TABLE_CHARS;
+
 	if (!output || typeof output !== "object" || Array.isArray(output)) return null;
 	if (output.ok === false) return null;
 	if (!Array.isArray(output.results) || output.results.length === 0) return null;
@@ -1179,7 +1377,10 @@ export function telemetryToMarkdown(output) {
 
 			for (const [monitorType, instances] of monitorTypes) {
 				if (!Array.isArray(instances)) return null;
-				const table = buildMonitorTable(monitorType, instances);
+				const table = buildMonitorTable(monitorType, instances, {
+					maxTableChars,
+					requested: requestedTypes.has(monitorType.toLowerCase()),
+				});
 				if (table) hostLines.push(table);
 			}
 

@@ -376,6 +376,19 @@ export function getOpenAiFunctionTools() {
 			if (!Array.isArray(params.required)) params.required = [];
 			if (!params.required.includes("hosts")) params.required.push("hosts");
 
+			// Telemetry tools get an app-side monitorTypes filter (handled by the
+			// tool middleware and stripped before the MCP call): the response
+			// only includes the requested monitor types, with full per-instance
+			// rows even for types large enough to be summarized otherwise
+			if (/Metrics/i.test(name)) {
+				params.properties.monitorTypes = {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Optional: return only these monitor types (e.g. ["pool", "volume", "cpu", "fan"]). Omit to get every type. Use this to drill into a type whose per-instance rows were summarized or truncated in a previous response.',
+				};
+			}
+
 			tools.push({
 				type: "function",
 				name,
