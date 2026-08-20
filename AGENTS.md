@@ -105,6 +105,20 @@ npm run test:watch    # Watch mode
 npm run test:coverage # With coverage report
 ```
 
+### Live AI Tests (require the dev environment)
+
+Scenario-based tests against the real AI provider and MCP servers (see `e2e/README.md`):
+
+```bash
+npm run test:live   # Drives ai/respond.js directly (fake Slack client, real LLM + MCP)
+npm run test:e2e    # Full Slack round-trip: spawns the bot, DMs it, asserts on the reply
+```
+
+Both need the dev variables loaded first (e.g. `cmd /c "call .env.dev.cmd && npm run test:live"`).
+`test:e2e` additionally needs `SLACK_TEST_USER_TOKEN`. Scenarios are shared in `e2e/scenarios.js`;
+soft expectations are graded by an LLM judge on the same provider. These are NOT run by `npm test`
+or `npm run validate` — they need live backends.
+
 ### Writing Tests
 
 - Place test files in `__tests__/` directories next to the source files
