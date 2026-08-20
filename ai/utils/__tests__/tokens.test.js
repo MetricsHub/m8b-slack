@@ -2,7 +2,12 @@
  * Tests for token utility functions.
  */
 
-import { estimateTokenCount, isContextWindowError, summarizeInputItems } from "../tokens.js";
+import {
+	estimatePayloadTokens,
+	estimateTokenCount,
+	isContextWindowError,
+	summarizeInputItems,
+} from "../tokens.js";
 
 describe("estimateTokenCount", () => {
 	it("should return 0 for empty input", () => {
@@ -46,16 +51,45 @@ describe("estimateTokenCount", () => {
 		expect(estimateTokenCount(input)).toBe(9);
 	});
 
-	it("weighs tool payloads at the measured density (2.5 chars/token), not the prose 4", () => {
-		// Measured live on qwen3.8:27b: Markdown tables / JSON tokenize at
-		// ~2.4-2.6 chars/token; underestimating lets requests overflow the
-		// context window on ANY window size
+	it("weighs tool payloads with the content-aware estimator", () => {
+		const args = "x".repeat(500); // pure letters: ~3.9 chars/token
+		const output = "9".repeat(3000); // pure digits: worst-case ~1.48 chars/token
 		const input = [
-			{ type: "function_call", call_id: "c1", arguments: "x".repeat(500) },
-			{ type: "function_call_output", call_id: "c1", output: "y".repeat(3000) },
+			{ type: "function_call", call_id: "c1", arguments: args },
+			{ type: "function_call_output", call_id: "c1", output },
 		];
-		// (500 + 3000) / 2.5 = 1400 tokens
-		expect(estimateTokenCount(input)).toBe(1400);
+
+		// ceil(500/3.9) + ceil(3000/1.48) = 129 + 2028
+		expect(estimateTokenCount(input)).toBe(
+			estimatePayloadTokens(args) + estimatePayloadTokens(output)
+		);
+		expect(estimateTokenCount(input)).toBe(129 + 2028);
+	});
+});
+
+describe("estimatePayloadTokens", () => {
+	it("returns 0 for empty input", () => {
+		expect(estimatePayloadTokens("")).toBe(0);
+		expect(estimatePayloadTokens(null)).toBe(0);
+		expect(estimatePayloadTokens(undefined)).toBe(0);
+	});
+
+	it("estimates prose-like payloads at ~3.9 chars/token", () => {
+		const text = "the quick brown fox jumps over the lazy dog ".repeat(20);
+		expect(estimatePayloadTokens(text)).toBe(Math.ceil(text.length / 3.9));
+	});
+
+	it("estimates digit- and punctuation-heavy tables at the worst-case density", () => {
+		// Modeled on the VMAX volume rows that measured 1.49 chars/token live
+		const text = "| 000297800620-00A1F | 5864777842688 | 1019200000000 |\n".repeat(50);
+		expect(estimatePayloadTokens(text)).toBe(Math.ceil(text.length / 1.48));
+	});
+
+	it("is monotone: structurally denser content costs more tokens at equal length", () => {
+		const prose = "monitoring status report ".repeat(40);
+		const table = '| 4892830000000 | {"avg":0.84} |'.repeat(31);
+		expect(table.length).toBeLessThanOrEqual(prose.length);
+		expect(estimatePayloadTokens(table)).toBeGreaterThan(estimatePayloadTokens(prose));
 	});
 });
 
@@ -65,6 +99,8 @@ describe("isContextWindowError", () => {
 		expect(isContextWindowError({ message: "Request exceeds limit" })).toBe(true);
 		expect(isContextWindowError({ message: "too many tokens" })).toBe(true);
 		expect(isContextWindowError({ type: "invalid_request_error", param: "input" })).toBe(true);
+		// Ollama's overflow symptom: prompt front-truncated, user message lost
+		expect(isContextWindowError({ message: "500 no user query found in messages" })).toBe(true);
 	});
 
 	it("should return false for other errors", () => {

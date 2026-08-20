@@ -10,6 +10,7 @@ import { executeMcpFunctionCall, getOpenAiFunctionTools } from "../mcp_registry.
 import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
+import { estimatePayloadTokens, PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
 import { openai } from "./openai.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
 import { executeWebSearch } from "./web-search.js";
@@ -129,31 +130,39 @@ export async function processFunctionCall(functionCall, context) {
 		});
 	}
 
-	// Provider-specific inline cap: small-context providers (Ollama at 32K)
-	// cannot absorb tool outputs sized for OpenAI's context window. Keep a
-	// truncated payload so the model can still extract the key facts.
+	// Provider-specific inline cap: small-context providers (Ollama) cannot
+	// absorb tool outputs sized for OpenAI's context window. The char cap
+	// encodes a TOKEN budget at the nominal payload density; dense payloads
+	// (numeric tables at ~1.5 chars/token) must be cut proportionally shorter
+	// to stay within the same token budget.
 	const maxToolOutputChars = provider?.maxToolOutputChars;
-	if (maxToolOutputChars && finalOutputStr.length > maxToolOutputChars) {
-		logger?.warn?.(
-			`[FUNCTION] ${name} output (${finalOutputStr.length} chars) exceeds the provider inline cap (${maxToolOutputChars}); truncating`
-		);
-		const truncationHint =
-			"Tool output was TRUNCATED to fit the local model's context window; data for some requested items may be missing entirely. Do NOT guess, assume, or invent values for items you cannot see in the data above. Either call this tool again for ONE host/item at a time to get complete data, or explicitly tell the user that data is missing.";
-		if (typeof output === "string") {
-			// Markdown outputs truncate as plain text: JSON-wrapping would
-			// escape every newline and quote, inflating the payload and making
-			// the surviving tables much harder for the model to read
-			const originalChars = finalOutputStr.length;
-			const kept = finalOutputStr.slice(0, Math.max(maxToolOutputChars - 600, 1000));
-			finalOutputStr = `${kept}\n\n[TRUNCATED: showing ${kept.length} of ${originalChars} chars. ${truncationHint}]`;
-		} else {
-			finalOutputStr = JSON.stringify({
-				ok: output?.ok ?? true,
-				truncated: true,
-				originalChars: finalOutputStr.length,
-				data: finalOutputStr.slice(0, Math.max(maxToolOutputChars - 500, 1000)),
-				hint: truncationHint,
-			});
+	if (maxToolOutputChars) {
+		const tokenBudget = Math.floor(maxToolOutputChars / PAYLOAD_CHARS_PER_TOKEN);
+		const estimatedTokens = estimatePayloadTokens(finalOutputStr);
+		if (estimatedTokens > tokenBudget) {
+			const density = finalOutputStr.length / estimatedTokens;
+			const charCap = Math.min(maxToolOutputChars, Math.floor(tokenBudget * density));
+			logger?.warn?.(
+				`[FUNCTION] ${name} output (~${estimatedTokens} tokens, ${finalOutputStr.length} chars) exceeds the provider inline cap (~${tokenBudget} tokens); truncating to ${charCap} chars`
+			);
+			const truncationHint =
+				"Tool output was TRUNCATED to fit the local model's context window; data for some requested items may be missing entirely. Do NOT guess, assume, or invent values for items you cannot see in the data above. Either call this tool again for ONE host/item at a time to get complete data, or explicitly tell the user that data is missing.";
+			if (typeof output === "string") {
+				// Markdown outputs truncate as plain text: JSON-wrapping would
+				// escape every newline and quote, inflating the payload and making
+				// the surviving tables much harder for the model to read
+				const originalChars = finalOutputStr.length;
+				const kept = finalOutputStr.slice(0, Math.max(charCap - 600, 1000));
+				finalOutputStr = `${kept}\n\n[TRUNCATED: showing ${kept.length} of ${originalChars} chars. ${truncationHint}]`;
+			} else {
+				finalOutputStr = JSON.stringify({
+					ok: output?.ok ?? true,
+					truncated: true,
+					originalChars: finalOutputStr.length,
+					data: finalOutputStr.slice(0, Math.max(charCap - 500, 1000)),
+					hint: truncationHint,
+				});
+			}
 		}
 	}
 

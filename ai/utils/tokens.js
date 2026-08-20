@@ -8,27 +8,73 @@
 export const PROSE_CHARS_PER_TOKEN = 4;
 
 /**
- * Chars per token for tool payloads (JSON, Markdown tables: numbers, pipes,
- * braces, quoted metric labels). Measured live on qwen3.8:27b: a request with
- * ~109K chars of telemetry tables cost 55.4K real input tokens, i.e. payloads
- * tokenize at ~2.4-2.6 chars/token. Underestimating lets oversized requests
- * through to the model, where the server silently drops prompt from the front
- * ("no user query found in messages"), so every chars↔tokens conversion for
- * payloads must use this density.
+ * Nominal chars per token for tool payloads, used to convert token budgets
+ * into character caps (context-budget truncation, the provider inline cap,
+ * the tool-schema reserve). Actual token ESTIMATION is content-aware — see
+ * estimatePayloadTokens — because real density varies from ~1.5 chars/token
+ * (tables of long numbers) to ~4 (prose), measured live on qwen3.8:27b.
  */
 export const PAYLOAD_CHARS_PER_TOKEN = 2.5;
 
 /**
+ * Content-aware token estimate for a tool payload string.
+ *
+ * Density tracks the share of "structural" characters (digits and
+ * punctuation/symbols vs letters and spaces). Piecewise-linear curve
+ * calibrated against real qwen3.8:27b prompt token counts (2026-08-20):
+ *
+ *   sample            structural ratio  real chars/token  estimate error
+ *   English prose     0.15              3.95              +1.3%
+ *   tool-schema JSON  0.19              4.28              +9.7%
+ *   ECS telemetry MD  0.35              2.22              +1.5%
+ *   summarized MD     0.42              2.01              +2.4%
+ *   VMAX volume MD    0.55              1.49              +0.4%
+ *
+ * All errors are on the conservative side (estimate >= real): an
+ * underestimate lets an oversized request through to the model, where the
+ * server silently drops prompt from the front ("no user query found in
+ * messages").
+ *
+ * @param {string} text - The payload string
+ * @returns {number} Estimated token count
+ */
+export function estimatePayloadTokens(text) {
+	if (!text) return 0;
+	const str = String(text);
+
+	let structural = 0;
+	for (let i = 0; i < str.length; i++) {
+		const c = str.charCodeAt(i);
+		const isLetterOrSpace = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c === 32;
+		if (!isLetterOrSpace) structural++;
+	}
+	const ratio = structural / str.length;
+
+	let density;
+	if (ratio <= 0.2) {
+		density = 3.9;
+	} else if (ratio <= 0.35) {
+		density = 3.9 + ((2.2 - 3.9) * (ratio - 0.2)) / 0.15;
+	} else if (ratio <= 0.55) {
+		density = 2.2 + ((1.48 - 2.2) * (ratio - 0.35)) / 0.2;
+	} else {
+		density = 1.48;
+	}
+
+	return Math.ceil(str.length / density);
+}
+
+/**
  * Estimate rough token count for input items.
- * Prose text is weighted at PROSE_CHARS_PER_TOKEN, tool payloads at the
- * denser PAYLOAD_CHARS_PER_TOKEN (see the constants above).
+ * Prose text is weighted at PROSE_CHARS_PER_TOKEN; tool payloads get the
+ * content-aware estimate (see estimatePayloadTokens).
  *
  * @param {Array} inputItems - Array of input items with content
  * @returns {number} Estimated token count
  */
 export function estimateTokenCount(inputItems) {
 	let chars = 0;
-	let payloadChars = 0;
+	let payloadTokens = 0;
 
 	for (const item of inputItems || []) {
 		const content = item?.content || [];
@@ -44,14 +90,14 @@ export function estimateTokenCount(inputItems) {
 
 		// Tool-call items carry their payload at the top level
 		if (typeof item?.arguments === "string") {
-			payloadChars += item.arguments.length;
+			payloadTokens += estimatePayloadTokens(item.arguments);
 		}
 		if (typeof item?.output === "string") {
-			payloadChars += item.output.length;
+			payloadTokens += estimatePayloadTokens(item.output);
 		}
 	}
 
-	return Math.ceil(chars / PROSE_CHARS_PER_TOKEN + payloadChars / PAYLOAD_CHARS_PER_TOKEN);
+	return Math.ceil(chars / PROSE_CHARS_PER_TOKEN) + payloadTokens;
 }
 
 /**
@@ -68,6 +114,10 @@ export function isContextWindowError(error) {
 		msg.includes("context window") ||
 		msg.includes("exceeds") ||
 		msg.includes("too many tokens") ||
+		// Ollama's overflow symptom: it front-truncates an oversized prompt,
+		// the user message falls out of the window, and the request is
+		// rejected with this message instead of a context-length error
+		msg.includes("no user query found") ||
 		(type === "invalid_request_error" && error?.param === "input")
 	);
 }
