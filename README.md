@@ -156,7 +156,7 @@ AI_PROVIDER=openai
 # Optional
 NODE_ENV=production
 SLACK_API_URL=https://slack.com/api
-AI_MAX_AGENT_ITERATIONS=10   # cap on model->tools->model loops per message
+AI_MAX_AGENT_ITERATIONS=15   # cap on model->tools->model loops per message
 
 # MetricsHub MCP Server (single server mode)
 MCP_AGENT_URL=https://metricshub.example.com/sse

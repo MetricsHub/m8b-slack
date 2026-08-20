@@ -41,6 +41,7 @@ jest.unstable_mockModule("./ai/providers/index", () => ({
 }));
 
 const { respond } = await import("../respond.js");
+const { MAX_AGENT_ITERATIONS } = await import("../config/providers.js");
 const conversationStore = await import("../services/conversation-store.js");
 const { clearConversationStore, conversationKey, getConversation } = conversationStore;
 
@@ -391,10 +392,10 @@ describe("respond in Ollama mode", () => {
 		const harness = makeHarness();
 		await runRespond(harness);
 
-		// Capped at MAX_AGENT_ITERATIONS (default 10), then a friendly message
-		expect(streamOnceMock.mock.calls.length).toBeLessThanOrEqual(10);
+		// Capped at MAX_AGENT_ITERATIONS, then a friendly message
+		expect(streamOnceMock.mock.calls.length).toBeLessThanOrEqual(MAX_AGENT_ITERATIONS);
 		// The final permitted iteration attempted a text-only wrap-up
-		const finalParams = streamOnceMock.mock.calls[9][0];
+		const finalParams = streamOnceMock.mock.calls[MAX_AGENT_ITERATIONS - 1][0];
 		expect(finalParams.tool_choice).toBe("none");
 		expect(allText(finalParams.input)).toContain("Tool-call limit reached");
 		expect(harness.say).toHaveBeenCalledWith(
@@ -421,9 +422,9 @@ describe("respond in Ollama mode", () => {
 		const harness = makeHarness();
 		await runRespond(harness);
 
-		// 9 tool turns + 1 forced text-only wrap-up = the cap, not the cap + apology
-		expect(streamOnceMock.mock.calls.length).toBe(10);
-		const finalParams = streamOnceMock.mock.calls[9][0];
+		// (cap - 1) tool turns + 1 forced text-only wrap-up = the cap, not the cap + apology
+		expect(streamOnceMock.mock.calls.length).toBe(MAX_AGENT_ITERATIONS);
+		const finalParams = streamOnceMock.mock.calls[MAX_AGENT_ITERATIONS - 1][0];
 		expect(finalParams.tool_choice).toBe("none");
 		expect(allText(finalParams.input)).toContain("Tool-call limit reached");
 		// The wrap-up answer stands; no "running in circles" apology

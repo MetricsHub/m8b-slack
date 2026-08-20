@@ -12,11 +12,14 @@ export const PROVIDER_OLLAMA = "ollama";
 
 /**
  * Maximum agent-loop iterations (model -> tool calls -> model) per Slack message.
- * Prevents runaway tool loops on both providers.
+ * Prevents runaway tool loops on both providers. The final permitted iteration
+ * forces a text-only answer, so a capped run still reports what it found; 15
+ * leaves headroom for genuine multi-step investigations (check -> spot anomaly
+ * -> drill down -> verify) above the ~4-turn happy path.
  */
 export const MAX_AGENT_ITERATIONS = (() => {
 	const parsed = Number.parseInt(process.env.AI_MAX_AGENT_ITERATIONS || "", 10);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 15;
 })();
 
 function parsePositiveInt(value, fallback) {
