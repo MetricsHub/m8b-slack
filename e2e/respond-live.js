@@ -20,6 +20,7 @@ import {
 	evaluateScenario,
 	fakeSlackTs,
 	printResults,
+	selectScenarios,
 	timeoutAfter,
 } from "./harness.js";
 import { SCENARIOS } from "./scenarios.js";
@@ -134,7 +135,7 @@ async function main() {
 	}
 
 	const results = [];
-	for (const scenario of SCENARIOS) {
+	for (const scenario of selectScenarios(SCENARIOS)) {
 		console.log(`\n--- ${scenario.name}: ${scenario.prompt}`);
 		const started = Date.now();
 		let answer = "";

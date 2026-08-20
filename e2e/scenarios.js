@@ -13,6 +13,7 @@
  *                  Only observable by the respond-live harness (ignored in the Slack round-trip).
  * - judge:         optional criteria string graded by the LLM judge (soft assertion)
  * - timeoutMs:     per-scenario timeout waiting for the answer
+ * - skipUnlessEnv: optional env var name; the scenario is skipped when it is not set
  */
 
 export const SCENARIOS = [
@@ -31,6 +32,18 @@ export const SCENARIOS = [
 			"clearly summarizes real monitoring data it looked up. It must NOT claim that it has no " +
 			"way to check the monitored hosts.",
 		timeoutMs: 300000,
+	},
+	{
+		name: "web-search",
+		prompt:
+			"Search the web for the official website of the MetricsHub product and give me its URL.",
+		expectToolCall: true,
+		mustMatch: /metricshub\.(com|org)/i,
+		judge:
+			"The answer provides a URL on the metricshub.com or metricshub.org domain as the official " +
+			"MetricsHub website. It must not claim that web search is unavailable.",
+		skipUnlessEnv: "WEB_SEARCH_PROVIDER",
+		timeoutMs: 240000,
 	},
 	{
 		name: "honest-about-capabilities",

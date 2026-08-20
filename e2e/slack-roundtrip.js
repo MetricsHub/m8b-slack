@@ -23,7 +23,7 @@ import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { WebClient } from "@slack/web-api";
-import { evaluateScenario, printResults } from "./harness.js";
+import { evaluateScenario, printResults, selectScenarios } from "./harness.js";
 import { SCENARIOS } from "./scenarios.js";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -163,7 +163,7 @@ async function main() {
 
 	const results = [];
 	try {
-		for (const scenario of SCENARIOS) {
+		for (const scenario of selectScenarios(SCENARIOS)) {
 			console.log(`\n--- ${scenario.name}: ${scenario.prompt}`);
 			const started = Date.now();
 			let answer = "";

@@ -117,6 +117,37 @@ export function printResults(results) {
 }
 
 /**
+ * Select the scenarios to run: applies the optional `--only <name>` CLI filter
+ * and drops scenarios whose `skipUnlessEnv` variable is not set (with a note).
+ *
+ * @param {Array<Object>} scenarios
+ * @param {string[]} [argv] - defaults to process.argv
+ * @returns {Array<Object>}
+ */
+export function selectScenarios(scenarios, argv = process.argv) {
+	let selected = scenarios;
+
+	const onlyIndex = argv.indexOf("--only");
+	if (onlyIndex !== -1) {
+		const name = argv[onlyIndex + 1];
+		selected = selected.filter((s) => s.name === name);
+		if (selected.length === 0) {
+			console.error(
+				`No scenario named "${name}" (available: ${scenarios.map((s) => s.name).join(", ")})`
+			);
+		}
+	}
+
+	return selected.filter((s) => {
+		if (s.skipUnlessEnv && !process.env[s.skipUnlessEnv]) {
+			console.log(`Skipping ${s.name} (${s.skipUnlessEnv} is not set)`);
+			return false;
+		}
+		return true;
+	});
+}
+
+/**
  * Reject after the given delay; race against a scenario run.
  *
  * @param {number} ms

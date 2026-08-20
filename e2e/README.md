@@ -44,6 +44,17 @@ user token (`xoxp-...`):
 | `E2E_DM_CHANNEL=D…` | Use this DM channel instead of `conversations.open`           |
 | `E2E_VERBOSE=1`     | Stream bot logs / verbose harness output                      |
 
+## Running a single scenario
+
+Both runners accept `--only <name>`:
+
+```cmd
+cmd /c "call .env.dev.cmd && npm run test:live -- --only web-search"
+```
+
+Scenarios with `skipUnlessEnv` (e.g. `web-search` needs `WEB_SEARCH_PROVIDER`) are skipped with a
+note when the variable is not set.
+
 ## Adding scenarios
 
 Append to `SCENARIOS` in [`scenarios.js`](scenarios.js):
