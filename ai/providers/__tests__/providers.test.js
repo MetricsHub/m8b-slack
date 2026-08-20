@@ -90,13 +90,14 @@ describe("provider selection", () => {
 	});
 
 	it("scales the default tool-output cap with the context window", () => {
-		// 32K: (32768 - 4000 - 1500) * 4 chars * 0.4
+		// 32K: 40% of the usable budget, at the measured payload density
+		// (PAYLOAD_CHARS_PER_TOKEN = 2.5 chars/token)
 		const at32k = getOllamaConfig().maxToolOutputChars;
-		expect(at32k).toBe(Math.floor((32768 - 4000 - 1500) * 4 * 0.4));
+		expect(at32k).toBe(Math.floor((32768 - 4000 - 1500) * 2.5 * 0.4));
 
 		process.env.OLLAMA_CONTEXT_LENGTH = "65536";
 		const at64k = getOllamaConfig().maxToolOutputChars;
-		expect(at64k).toBe(Math.floor((65536 - 4000 - 1500) * 4 * 0.4));
+		expect(at64k).toBe(Math.floor((65536 - 4000 - 1500) * 2.5 * 0.4));
 		expect(at64k).toBeGreaterThan(at32k * 2 * 0.9);
 
 		// Explicit override always wins

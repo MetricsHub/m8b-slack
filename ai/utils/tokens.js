@@ -3,14 +3,32 @@
  */
 
 /**
+ * Chars per token for prose (the classic ~4 chars ≈ 1 token heuristic).
+ */
+export const PROSE_CHARS_PER_TOKEN = 4;
+
+/**
+ * Chars per token for tool payloads (JSON, Markdown tables: numbers, pipes,
+ * braces, quoted metric labels). Measured live on qwen3.8:27b: a request with
+ * ~109K chars of telemetry tables cost 55.4K real input tokens, i.e. payloads
+ * tokenize at ~2.4-2.6 chars/token. Underestimating lets oversized requests
+ * through to the model, where the server silently drops prompt from the front
+ * ("no user query found in messages"), so every chars↔tokens conversion for
+ * payloads must use this density.
+ */
+export const PAYLOAD_CHARS_PER_TOKEN = 2.5;
+
+/**
  * Estimate rough token count for input items.
- * Uses the heuristic that ~4 characters ≈ 1 token.
+ * Prose text is weighted at PROSE_CHARS_PER_TOKEN, tool payloads at the
+ * denser PAYLOAD_CHARS_PER_TOKEN (see the constants above).
  *
  * @param {Array} inputItems - Array of input items with content
  * @returns {number} Estimated token count
  */
 export function estimateTokenCount(inputItems) {
 	let chars = 0;
+	let payloadChars = 0;
 
 	for (const item of inputItems || []) {
 		const content = item?.content || [];
@@ -26,14 +44,14 @@ export function estimateTokenCount(inputItems) {
 
 		// Tool-call items carry their payload at the top level
 		if (typeof item?.arguments === "string") {
-			chars += item.arguments.length;
+			payloadChars += item.arguments.length;
 		}
 		if (typeof item?.output === "string") {
-			chars += item.output.length;
+			payloadChars += item.output.length;
 		}
 	}
 
-	return Math.ceil(chars / 4);
+	return Math.ceil(chars / PROSE_CHARS_PER_TOKEN + payloadChars / PAYLOAD_CHARS_PER_TOKEN);
 }
 
 /**

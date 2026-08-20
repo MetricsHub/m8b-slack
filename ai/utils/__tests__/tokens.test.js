@@ -45,6 +45,18 @@ describe("estimateTokenCount", () => {
 		// 13 + 12 + 8 = 33 chars / 4 = 9 tokens (rounded up)
 		expect(estimateTokenCount(input)).toBe(9);
 	});
+
+	it("weighs tool payloads at the measured density (2.5 chars/token), not the prose 4", () => {
+		// Measured live on qwen3.8:27b: Markdown tables / JSON tokenize at
+		// ~2.4-2.6 chars/token; underestimating lets requests overflow the
+		// context window on ANY window size
+		const input = [
+			{ type: "function_call", call_id: "c1", arguments: "x".repeat(500) },
+			{ type: "function_call_output", call_id: "c1", output: "y".repeat(3000) },
+		];
+		// (500 + 3000) / 2.5 = 1400 tokens
+		expect(estimateTokenCount(input)).toBe(1400);
+	});
 });
 
 describe("isContextWindowError", () => {

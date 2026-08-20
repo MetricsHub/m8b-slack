@@ -5,6 +5,8 @@
  * exposing the OpenAI-compatible /v1/responses API.
  */
 
+import { PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
+
 export const PROVIDER_OPENAI = "openai";
 export const PROVIDER_OLLAMA = "ollama";
 
@@ -33,6 +35,22 @@ export function getAiProviderName() {
 }
 
 /**
+ * Default inline cap for a single tool result: ~40% of the usable budget,
+ * converted to characters at the measured payload token density, so it
+ * scales with the context window and stays honest about what tool outputs
+ * actually cost the model.
+ *
+ * @param {number} contextWindow - Model context window in tokens
+ * @param {number} maxOutputTokens - Reserved output tokens
+ * @returns {number} Inline cap in characters
+ */
+export function defaultToolOutputChars(contextWindow, maxOutputTokens) {
+	const usableBudgetChars =
+		Math.max(contextWindow - maxOutputTokens - 1500, 4000) * PAYLOAD_CHARS_PER_TOKEN;
+	return Math.max(20000, Math.floor(usableBudgetChars * 0.4));
+}
+
+/**
  * Get the Ollama backend configuration from environment variables.
  *
  * OLLAMA_API_KEY is a dummy value required by the OpenAI SDK; the local
@@ -52,11 +70,8 @@ export function getOllamaConfig() {
 	);
 	const maxOutputTokens = parsePositiveInt(process.env.OLLAMA_MAX_OUTPUT_TOKENS, 4000);
 
-	// Inline cap for a single tool result. Default scales with the context
-	// window (~40% of the usable budget, in chars at ~4 chars/token) so raising
-	// OLLAMA_CONTEXT_LENGTH automatically allows bigger tool outputs.
-	const usableBudgetChars = Math.max(contextWindow - maxOutputTokens - 1500, 4000) * 4;
-	const defaultToolOutputChars = Math.max(20000, Math.floor(usableBudgetChars * 0.4));
+	// Inline cap for a single tool result: scales with the context window so
+	// raising OLLAMA_CONTEXT_LENGTH automatically allows bigger tool outputs
 
 	return {
 		baseUrl: (process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1").replace(/\/+$/, ""),
@@ -68,7 +83,7 @@ export function getOllamaConfig() {
 		requestTimeoutMs: parsePositiveInt(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 300000),
 		maxToolOutputChars: parsePositiveInt(
 			process.env.OLLAMA_MAX_TOOL_OUTPUT_CHARS,
-			defaultToolOutputChars
+			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
 	};
 }

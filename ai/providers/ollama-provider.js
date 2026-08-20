@@ -12,7 +12,7 @@
  */
 
 import { OpenAI } from "openai";
-import { getOllamaConfig } from "../config/providers.js";
+import { defaultToolOutputChars, getOllamaConfig } from "../config/providers.js";
 
 function isContextLengthExplicit() {
 	return Boolean(process.env.OLLAMA_CONTEXT_LENGTH || process.env.OLLAMA_CONTEXT_WINDOW);
@@ -201,6 +201,15 @@ export function createOllamaProvider() {
 						contextDetail = `context ${detected.value} (server-limited)`;
 					} else {
 						contextDetail = `context ${provider.contextWindow} (configured; server allows ${detected.value})`;
+					}
+
+					// The default inline tool-output cap is derived from the context
+					// window; keep it consistent when the window was reconciled
+					if (!process.env.OLLAMA_MAX_TOOL_OUTPUT_CHARS) {
+						provider.maxToolOutputChars = defaultToolOutputChars(
+							provider.contextWindow,
+							config.maxOutputTokens
+						);
 					}
 				}
 

@@ -52,7 +52,12 @@ import {
 } from "./services/slack-files.js";
 import { streamOnce } from "./services/streaming.js";
 import { buildToolsArray, logToolWarnings } from "./tools/index.js";
-import { estimateTokenCount, isContextWindowError, summarizeInputItems } from "./utils/tokens.js";
+import {
+	estimateTokenCount,
+	isContextWindowError,
+	PAYLOAD_CHARS_PER_TOKEN,
+	summarizeInputItems,
+} from "./utils/tokens.js";
 
 /**
  * In-memory cache: threadTs -> last OpenAI response_id
@@ -214,6 +219,12 @@ export async function respond({
 		// Log any configuration warnings
 		await logToolWarnings({ vectorStoreIds, provider, knowledgeBaseAvailable, say, logger });
 
+		// Tool schemas ride along with every request but are not input items, so
+		// the context-budget trimmer cannot see them; reserve their share
+		// explicitly (base 1500 covers the chat template and framing)
+		const trimReserveTokens =
+			1500 + Math.ceil(JSON.stringify(tools || []).length / PAYLOAD_CHARS_PER_TOKEN);
+
 		// Determine conversation continuity strategy
 		let previousResponseId = null;
 		if (!stateless) {
@@ -292,6 +303,7 @@ export async function respond({
 			input = trimToContextBudget(input, {
 				contextWindow: provider.contextWindow,
 				maxOutputTokens: provider.maxOutputTokens,
+				reserveTokens: trimReserveTokens,
 				logger,
 			});
 		} else {
@@ -342,6 +354,7 @@ export async function respond({
 				requestInput = trimToContextBudget([...input, ...turnItems, ...transientItems], {
 					contextWindow: provider.contextWindow,
 					maxOutputTokens: provider.maxOutputTokens,
+					reserveTokens: trimReserveTokens,
 					logger,
 				});
 			} else {
@@ -389,6 +402,7 @@ export async function respond({
 						requestInput = trimToContextBudget(requestInput, {
 							contextWindow: Math.floor(provider.contextWindow / 2),
 							maxOutputTokens: provider.maxOutputTokens,
+							reserveTokens: trimReserveTokens,
 							logger,
 						});
 					} else {

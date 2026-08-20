@@ -17,7 +17,7 @@
  * OpenAI, and a deterministic trim keeps behavior predictable.
  */
 
-import { estimateTokenCount } from "../utils/tokens.js";
+import { estimateTokenCount, PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
 
 const TRIM_NOTICE = {
 	role: "system",
@@ -31,7 +31,8 @@ const TRIM_NOTICE = {
 
 /**
  * First-pass cap for a single tool output when over budget: a quarter of the
- * budget, in characters (~4 chars/token), so it scales with the context window.
+ * budget, in characters at the measured payload density, so it scales with
+ * the context window.
  */
 const OUTPUT_TRUNCATE_BUDGET_FRACTION = 0.25;
 const OUTPUT_TRUNCATE_MIN_FLOOR_CHARS = 4000;
@@ -149,7 +150,7 @@ export function trimToContextBudget(
 	// must never force the rest of the conversation out of the window)
 	const firstPassCap = Math.max(
 		OUTPUT_TRUNCATE_MIN_FLOOR_CHARS,
-		Math.floor(budget * 4 * OUTPUT_TRUNCATE_BUDGET_FRACTION)
+		Math.floor(budget * PAYLOAD_CHARS_PER_TOKEN * OUTPUT_TRUNCATE_BUDGET_FRACTION)
 	);
 	groups = truncateToolOutputs(groups, firstPassCap);
 
