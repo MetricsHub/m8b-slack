@@ -7,6 +7,7 @@
  * - Consistent pagination for large results
  * - Size-aware output limiting
  * - File uploads for very large outputs (accessible via code_interpreter)
+ * - Markdown table rendering for MetricsHub telemetry (token-efficient inline form)
  */
 
 import crypto from "node:crypto";
@@ -339,7 +340,8 @@ async function uploadOutputAsFile(output, toolName, openaiClient, fileTracking, 
  * @param {Object} [options.logger] - Logger instance
  * @param {Object} [options.openaiClient] - OpenAI client for file uploads
  * @param {Object} [options.fileTracking] - File tracking state for uploaded files
- * @returns {Promise<Object>} Processed output with pagination and file reference
+ * @returns {Promise<Object|string>} Processed output with pagination and file reference;
+ *   telemetry-shaped outputs return a Markdown string instead of JSON
  */
 export async function executeWithMiddleware(name, args, executor, options = {}) {
 	const { logger, openaiClient, fileTracking } = options;
@@ -399,6 +401,30 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 	let uploadedFile = null;
 	if (openaiClient && fileTracking) {
 		uploadedFile = await uploadOutputAsFile(result, name, openaiClient, fileTracking, logger);
+	}
+
+	// Inline representation: MetricsHub telemetry renders as Markdown tables
+	// (~65% fewer tokens than the compressed JSON, content-lossless). The
+	// uploaded file keeps the full JSON for code_interpreter, which genuinely
+	// parses it programmatically.
+	const telemetryMarkdown = telemetryToMarkdown(result);
+	if (telemetryMarkdown !== null) {
+		const jsonSize = JSON.stringify(result).length;
+		const savingsPercent = (((jsonSize - telemetryMarkdown.length) / jsonSize) * 100).toFixed(1);
+		logger?.info?.(
+			`[MIDDLEWARE] Rendered ${name} telemetry as Markdown: ${jsonSize} → ${telemetryMarkdown.length} chars (${savingsPercent}% reduction)`
+		);
+
+		let inline = telemetryMarkdown;
+		if (uploadedFile) {
+			inline += `\n\n> Full JSON (${jsonSize} chars) uploaded as "${uploadedFile.fileName}". Use code_interpreter to read and analyze it programmatically.`;
+		}
+
+		if (inline.length <= HARD_MAX_OUTPUT_CHARS) {
+			return inline;
+		}
+		// Over the hard limit even as Markdown: fall through to the JSON path,
+		// whose size handling (pagination + ensureSafeSize) already covers it
 	}
 
 	// Check if result needs pagination
@@ -691,11 +717,33 @@ function compressMonitor(monitor) {
 			continue;
 		}
 
-		// Deduplicate StatusInformation
-		if (key === "legacyTextParameters" && value?.StatusInformation) {
+		// Deduplicate StatusInformation (textParams is the current-shape name
+		// for what the legacy shape called legacyTextParameters)
+		if ((key === "legacyTextParameters" || key === "textParams") && value?.StatusInformation) {
 			const deduped = deduplicateStatusInformation(value.StatusInformation);
 			if (deduped?.trim()) {
 				compressed[key] = { ...value, StatusInformation: deduped };
+			}
+			continue;
+		}
+
+		// Aggregate metric maps (numericMetrics: {name: {avg,min,...}},
+		// stateSetMetrics: {name: [{value,count}]}) get the same
+		// internal-telemetry filtering as per-instance metrics
+		if (
+			(key === "numericMetrics" || key === "stateSetMetrics") &&
+			value &&
+			typeof value === "object"
+		) {
+			const filtered = {};
+			for (const [metricName, metricValue] of Object.entries(value)) {
+				if (METRIC_NAME_PREFIXES_TO_REMOVE.some((prefix) => metricName.startsWith(prefix))) {
+					continue;
+				}
+				filtered[metricName] = metricValue;
+			}
+			if (Object.keys(filtered).length > 0) {
+				compressed[key] = filtered;
 			}
 			continue;
 		}
@@ -746,6 +794,401 @@ function compressMcpTelemetry(data) {
 	}
 
 	return result;
+}
+
+// ============================================================================
+// Telemetry Markdown tables
+// ============================================================================
+
+/**
+ * Minimum length for a shared metric-name prefix to be worth factoring out of
+ * table column headers (shorter prefixes save less than the heading note costs).
+ */
+const MIN_METRIC_PREFIX_LENGTH = 8;
+
+/**
+ * Render a value as a Markdown table cell: pipes and newlines would break the
+ * table grid, everything else stays verbatim so the model can copy values into
+ * follow-up tool calls.
+ * @param {*} value - Cell value
+ * @returns {string} Sanitized cell text
+ */
+function sanitizeCell(value) {
+	if (value === null || value === undefined) return "";
+	// Non-integer numbers carry ~16 digits of collection noise; 6 significant
+	// digits keep full diagnostic value at a fraction of the tokens. Integers
+	// (byte counts, ids, flags) stay exact.
+	if (typeof value === "number" && !Number.isInteger(value)) {
+		return String(Number(value.toPrecision(6)));
+	}
+	const str = typeof value === "object" ? JSON.stringify(value) : String(value);
+	return str.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+}
+
+/**
+ * Flatten a monitor instance into three ordered column groups:
+ * top-level fields (nested one-level objects like legacyTextParameters become
+ * dotted keys), attributes, and metrics.
+ * @param {Object} instance - A monitor instance ({attributes, metrics, ...})
+ * @returns {{fields: Map, attributes: Map, metrics: Map}|null} Flattened row
+ */
+function flattenMonitorInstance(instance) {
+	if (!instance || typeof instance !== "object" || Array.isArray(instance)) {
+		return null;
+	}
+
+	const fields = new Map();
+	const attributes = new Map();
+	const metrics = new Map();
+
+	for (const [key, value] of Object.entries(instance)) {
+		if (key === "attributes" && value && typeof value === "object" && !Array.isArray(value)) {
+			for (const [attrKey, attrValue] of Object.entries(value)) {
+				attributes.set(attrKey, attrValue);
+			}
+		} else if (key === "metrics" && value && typeof value === "object" && !Array.isArray(value)) {
+			for (const [metricName, metricValue] of Object.entries(value)) {
+				metrics.set(metricName, metricValue);
+			}
+		} else if (value && typeof value === "object" && !Array.isArray(value)) {
+			for (const [nestedKey, nestedValue] of Object.entries(value)) {
+				fields.set(`${key}.${nestedKey}`, nestedValue);
+			}
+		} else {
+			fields.set(key, value);
+		}
+	}
+
+	return { fields, attributes, metrics };
+}
+
+/**
+ * Find a shared metric-name prefix that can be factored out of a table's
+ * metric column headers. The prefix must end at a "." inside the metric name
+ * part (never inside "rate(...)" wrappers or "{...}" labels) so full names
+ * reconstruct unambiguously as prefix + column header.
+ * @param {string[]} names - Metric column names
+ * @returns {string} The prefix, or "" when factoring does not apply
+ */
+function commonMetricPrefix(names) {
+	if (names.length < 2) return "";
+
+	let prefix = names[0];
+	for (const name of names.slice(1)) {
+		let i = 0;
+		while (i < prefix.length && i < name.length && prefix[i] === name[i]) i++;
+		prefix = prefix.slice(0, i);
+		if (!prefix) return "";
+	}
+
+	const braceIdx = prefix.indexOf("{");
+	if (braceIdx !== -1) prefix = prefix.slice(0, braceIdx);
+	const parenIdx = prefix.indexOf("(");
+	if (parenIdx !== -1) prefix = prefix.slice(0, parenIdx);
+
+	const lastDot = prefix.lastIndexOf(".");
+	if (lastDot === -1) return "";
+	prefix = prefix.slice(0, lastDot + 1);
+
+	if (prefix.length < MIN_METRIC_PREFIX_LENGTH) return "";
+	if (names.some((name) => name.length <= prefix.length)) return "";
+
+	return prefix;
+}
+
+/**
+ * Detect a monitor-type aggregate instance: MetricsHub appends one instance
+ * per monitor type that has no identity (no attributes) and no per-instance
+ * metrics — only numericMetrics ({name: {avg,min,max,sum,count}}) and/or
+ * stateSetMetrics ({name: [{value, count}]}) summarizing the other instances.
+ * Merged into the instance table these become one column per aggregate name
+ * with JSON-blob cells; they render far smaller as their own stat table.
+ * @param {*} instance - A monitor instance
+ * @returns {boolean} True when the instance holds only aggregate maps
+ */
+function isAggregateOnlyInstance(instance) {
+	if (!instance || typeof instance !== "object" || Array.isArray(instance)) return false;
+
+	// MetricsHub marks its per-type aggregate instance explicitly
+	if (instance.type === "summary") return true;
+
+	let hasAggregates = false;
+	for (const [key, value] of Object.entries(instance)) {
+		if (key === "numericMetrics" || key === "stateSetMetrics") {
+			hasAggregates = true;
+			continue;
+		}
+		if (key === "totalMonitors") continue;
+		if (
+			(key === "attributes" || key === "metrics") &&
+			value &&
+			typeof value === "object" &&
+			Object.keys(value).length === 0
+		) {
+			continue;
+		}
+		return false;
+	}
+
+	return hasAggregates;
+}
+
+/**
+ * Render a monitor type's aggregate instances as a compact stat table
+ * (one row per metric name, one column per stat) plus one line per
+ * state-set summary.
+ * @param {Array} aggregateInstances - Instances matched by isAggregateOnlyInstance
+ * @param {number} regularCount - Number of regular instances of the same type
+ * @returns {string|null} Markdown block, or null when there is nothing to render
+ */
+function buildAggregateBlock(aggregateInstances, regularCount) {
+	const numeric = {};
+	const stateSets = {};
+	let totalMonitors = null;
+	for (const instance of aggregateInstances) {
+		Object.assign(numeric, instance.numericMetrics || {});
+		Object.assign(stateSets, instance.stateSetMetrics || {});
+		if (typeof instance.totalMonitors === "number") totalMonitors = instance.totalMonitors;
+	}
+
+	// An aggregate over a single instance repeats that instance's row verbatim
+	// (avg = min = max = sum = value) — nothing worth rendering
+	if (totalMonitors === 1 && regularCount >= 1) return null;
+
+	const instancesLabel = totalMonitors !== null ? `${totalMonitors} instances` : "instances";
+	const parts = [];
+
+	const numericNames = Object.keys(numeric);
+	if (numericNames.length > 0) {
+		// Stat columns: union of the aggregate objects' keys (avg, min, ...)
+		const statCols = [];
+		const seenStats = new Set();
+		for (const name of numericNames) {
+			const stats = numeric[name];
+			if (!stats || typeof stats !== "object") continue;
+			for (const key of Object.keys(stats)) {
+				if (!seenStats.has(key)) {
+					seenStats.add(key);
+					statCols.push(key);
+				}
+			}
+		}
+
+		const prefix = commonMetricPrefix(numericNames);
+		const prefixNote = prefix ? ` — metric rows omit the prefix \`${prefix}\`` : "";
+		const headers = ["metric", ...statCols].map(sanitizeCell);
+		const rows = numericNames.map((name) => {
+			const stats = numeric[name] && typeof numeric[name] === "object" ? numeric[name] : {};
+			const shownName = prefix ? name.slice(prefix.length) : name;
+			const cells = [shownName, ...statCols.map((key) => stats[key])].map(sanitizeCell);
+			return `| ${cells.join(" | ")} |`;
+		});
+
+		parts.push(
+			`Aggregates across ${instancesLabel}${prefixNote}:\n\n${[
+				`| ${headers.join(" | ")} |`,
+				`|${headers.map(() => "---").join("|")}|`,
+				...rows,
+			].join("\n")}`
+		);
+	}
+
+	for (const [name, states] of Object.entries(stateSets)) {
+		const summary = (Array.isArray(states) ? states : [states])
+			.map((s) =>
+				s && typeof s === "object"
+					? `${sanitizeCell(s.value)} ×${sanitizeCell(s.count)}`
+					: sanitizeCell(s)
+			)
+			.join(", ");
+		parts.push(`State summary — ${sanitizeCell(name)}: ${summary}`);
+	}
+
+	return parts.length > 0 ? parts.join("\n\n") : null;
+}
+
+/**
+ * Build one Markdown table for a monitor type. Columns are the union of
+ * attribute keys, then metric names, then remaining instance fields (each
+ * group in first-seen order) — identity attributes lead the table and text
+ * blobs like StatusInformation trail it; rows are instances; missing cells
+ * stay empty; all-empty rows are skipped. Aggregate-only instances render
+ * as a separate stat block below the table.
+ * @param {string} monitorType - The monitor type key (file_system, cpu, ...)
+ * @param {Array} instances - Monitor instances of that type
+ * @returns {string|null} Markdown section, or null when nothing renders
+ */
+function buildMonitorTable(monitorType, instances) {
+	const aggregateInstances = [];
+	const regularInstances = [];
+	for (const instance of instances) {
+		(isAggregateOnlyInstance(instance) ? aggregateInstances : regularInstances).push(instance);
+	}
+
+	const aggregateBlock = buildAggregateBlock(aggregateInstances, regularInstances.length);
+
+	const flattened = regularInstances.map(flattenMonitorInstance).filter(Boolean);
+	if (flattened.length === 0) {
+		if (!aggregateBlock) return null;
+		return `## ${monitorType} (0)\n\n${aggregateBlock}`;
+	}
+
+	const fieldCols = [];
+	const attrCols = [];
+	const metricCols = [];
+	const seenFields = new Set();
+	const seenAttrs = new Set();
+	const seenMetrics = new Set();
+
+	for (const row of flattened) {
+		for (const key of row.fields.keys()) {
+			if (!seenFields.has(key)) {
+				seenFields.add(key);
+				fieldCols.push(key);
+			}
+		}
+		for (const key of row.attributes.keys()) {
+			if (!seenAttrs.has(key)) {
+				seenAttrs.add(key);
+				attrCols.push(key);
+			}
+		}
+		for (const key of row.metrics.keys()) {
+			if (!seenMetrics.has(key)) {
+				seenMetrics.add(key);
+				metricCols.push(key);
+			}
+		}
+	}
+
+	if (fieldCols.length + attrCols.length + metricCols.length === 0) return null;
+
+	// Assemble the cell matrix (rows × columns), dropping all-empty rows
+	const columns = [
+		...attrCols.map((key) => ({ name: key, group: "attributes" })),
+		...metricCols.map((key) => ({ name: key, group: "metrics" })),
+		...fieldCols.map((key) => ({ name: key, group: "fields" })),
+	];
+	const matrix = [];
+	for (const row of flattened) {
+		const cells = columns.map((col) => {
+			const map =
+				col.group === "attributes"
+					? row.attributes
+					: col.group === "metrics"
+						? row.metrics
+						: row.fields;
+			return sanitizeCell(map.get(col.name));
+		});
+		if (cells.every((cell) => cell === "")) continue;
+		matrix.push(cells);
+	}
+	if (matrix.length === 0) {
+		if (!aggregateBlock) return null;
+		return `## ${monitorType} (0)\n\n${aggregateBlock}`;
+	}
+
+	// Omit columns that duplicate another column's values on every row
+	// (MetricsHub often reports the same numbers under two names, e.g.
+	// rate(system.cpu.time{...}) === system.cpu.utilization{...}, and
+	// name === instanceName). Constant columns are never treated as
+	// duplicates — pairing two coincidentally identical constants would
+	// mislead more than it saves.
+	const duplicateNotes = [];
+	const keptIdx = [];
+	const signatureToColumn = new Map();
+	for (let i = 0; i < columns.length; i++) {
+		const values = matrix.map((cells) => cells[i]);
+		const distinct = new Set(values);
+		const signature = JSON.stringify(values);
+		const original = signatureToColumn.get(signature);
+		if (original !== undefined && distinct.size >= 2) {
+			duplicateNotes.push(
+				`Column \`${columns[i].name}\` is omitted: identical values to \`${columns[original].name}\`.`
+			);
+			continue;
+		}
+		if (original === undefined) signatureToColumn.set(signature, i);
+		keptIdx.push(i);
+	}
+
+	const keptColumns = keptIdx.map((i) => columns[i]);
+	const keptMetricNames = keptColumns.filter((c) => c.group === "metrics").map((c) => c.name);
+	const prefix = commonMetricPrefix(keptMetricNames);
+
+	const headers = keptColumns.map((col) =>
+		sanitizeCell(col.group === "metrics" && prefix ? col.name.slice(prefix.length) : col.name)
+	);
+	const rows = matrix.map((cells) => `| ${keptIdx.map((i) => cells[i]).join(" | ")} |`);
+
+	const prefixNote = prefix ? ` — metric columns omit the prefix \`${prefix}\`` : "";
+	const heading = `## ${monitorType} (${rows.length})${prefixNote}`;
+	const headerLine = `| ${headers.join(" | ")} |`;
+	const separator = `|${headers.map(() => "---").join("|")}|`;
+
+	const parts = [heading, [headerLine, separator, ...rows].join("\n")];
+	if (duplicateNotes.length > 0) parts.push(duplicateNotes.join("\n"));
+	if (aggregateBlock) parts.push(aggregateBlock);
+	return parts.join("\n\n");
+}
+
+/**
+ * Render MetricsHub telemetry output as Markdown tables.
+ *
+ * Applies only when the output matches the current MetricsHub shape:
+ * results[].result.hosts[].response.telemetry.monitors, with monitors keyed
+ * by type and each type an array of {attributes, metrics} instances. JSON
+ * repeats every metric name per instance; a table pays for each distinct name
+ * once as a column header (~65% fewer chars on real telemetry). The rendering
+ * is content-lossless: every field, attribute, metric name, value, and status
+ * survives — only the packaging changes.
+ *
+ * Any other shape (ListHosts, PromQL, legacy flat monitors arrays, errors)
+ * returns null so the caller keeps the JSON representation.
+ *
+ * @param {*} output - Compressed tool output
+ * @returns {string|null} Markdown document, or null when the shape does not match
+ */
+export function telemetryToMarkdown(output) {
+	if (!output || typeof output !== "object" || Array.isArray(output)) return null;
+	if (output.ok === false) return null;
+	if (!Array.isArray(output.results) || output.results.length === 0) return null;
+
+	const sections = [];
+
+	for (const entry of output.results) {
+		if (!entry || typeof entry !== "object" || entry.ok === false) return null;
+
+		const hosts = entry.result?.hosts;
+		if (!Array.isArray(hosts) || hosts.length === 0) return null;
+
+		for (const host of hosts) {
+			if (typeof host?.hostname !== "string") return null;
+
+			const monitors = host.response?.telemetry?.monitors;
+			if (!monitors || typeof monitors !== "object" || Array.isArray(monitors)) return null;
+
+			const monitorTypes = Object.entries(monitors);
+			if (monitorTypes.length === 0) return null;
+
+			// Two host entries can legitimately share one hostname (OS view +
+			// hardware view) — each keeps its own section
+			const agentLabel =
+				typeof entry.server_label === "string" ? ` (agent: ${entry.server_label})` : "";
+			const hostLines = [`# Host: ${host.hostname}${agentLabel}`];
+
+			for (const [monitorType, instances] of monitorTypes) {
+				if (!Array.isArray(instances)) return null;
+				const table = buildMonitorTable(monitorType, instances);
+				if (table) hostLines.push(table);
+			}
+
+			sections.push(hostLines.join("\n\n"));
+		}
+	}
+
+	if (sections.length === 0) return null;
+	return sections.join("\n\n");
 }
 
 /**

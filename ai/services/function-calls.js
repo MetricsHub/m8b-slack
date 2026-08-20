@@ -116,8 +116,10 @@ export async function processFunctionCall(functionCall, context) {
 	// Log summary
 	logger?.info?.(`[FUNCTION] ${name} → ${formatOutputSummary(output)}`);
 
-	// Final safety checks
-	let finalOutputStr = JSON.stringify(output);
+	// Final safety checks. String outputs (telemetry rendered as Markdown
+	// tables by the middleware) go out raw — JSON-escaping them would re-add
+	// the overhead the Markdown rendering removed.
+	let finalOutputStr = typeof output === "string" ? output : JSON.stringify(output);
 	if (finalOutputStr.length > HARD_MAX_OUTPUT_CHARS) {
 		logger?.warn?.(`[FUNCTION] Output too large (${finalOutputStr.length} chars)`);
 		finalOutputStr = JSON.stringify({
@@ -135,13 +137,24 @@ export async function processFunctionCall(functionCall, context) {
 		logger?.warn?.(
 			`[FUNCTION] ${name} output (${finalOutputStr.length} chars) exceeds the provider inline cap (${maxToolOutputChars}); truncating`
 		);
-		finalOutputStr = JSON.stringify({
-			ok: output?.ok ?? true,
-			truncated: true,
-			originalChars: finalOutputStr.length,
-			data: finalOutputStr.slice(0, Math.max(maxToolOutputChars - 500, 1000)),
-			hint: "Tool output was TRUNCATED to fit the local model's context window; data for some requested items may be missing entirely. Do NOT guess, assume, or invent values for items you cannot see in the data above. Either call this tool again for ONE host/item at a time to get complete data, or explicitly tell the user that data is missing.",
-		});
+		const truncationHint =
+			"Tool output was TRUNCATED to fit the local model's context window; data for some requested items may be missing entirely. Do NOT guess, assume, or invent values for items you cannot see in the data above. Either call this tool again for ONE host/item at a time to get complete data, or explicitly tell the user that data is missing.";
+		if (typeof output === "string") {
+			// Markdown outputs truncate as plain text: JSON-wrapping would
+			// escape every newline and quote, inflating the payload and making
+			// the surviving tables much harder for the model to read
+			const originalChars = finalOutputStr.length;
+			const kept = finalOutputStr.slice(0, Math.max(maxToolOutputChars - 600, 1000));
+			finalOutputStr = `${kept}\n\n[TRUNCATED: showing ${kept.length} of ${originalChars} chars. ${truncationHint}]`;
+		} else {
+			finalOutputStr = JSON.stringify({
+				ok: output?.ok ?? true,
+				truncated: true,
+				originalChars: finalOutputStr.length,
+				data: finalOutputStr.slice(0, Math.max(maxToolOutputChars - 500, 1000)),
+				hint: truncationHint,
+			});
+		}
 	}
 
 	return [
@@ -157,6 +170,12 @@ export async function processFunctionCall(functionCall, context) {
  * Format output for logging.
  */
 function formatOutputSummary(output) {
+	// Markdown-rendered outputs are multiline; keep the log entry on one line
+	if (typeof output === "string") {
+		const firstLine = output.split("\n", 1)[0].slice(0, 60);
+		return `markdown, ${output.length} chars: ${firstLine}`;
+	}
+
 	if (!output || typeof output !== "object") {
 		return String(output).slice(0, 80);
 	}
