@@ -230,6 +230,33 @@ describe("respond in Ollama mode", () => {
 		expect(stored.some((i) => i?.type === "function_call_output")).toBe(true);
 	});
 
+	it("delivers streamed text via say() when the client has no chatStream", async () => {
+		// Regression: the say() fallback in executeStreamWithRetry used to read the
+		// still-uninitialized streamOnce result (TDZ crash) for the response ID
+		streamOnceMock.mockImplementationOnce(async (_params, callbacks) => {
+			const streamController = await callbacks.onStreamStart("resp_fallback");
+			expect(streamController).toBeNull();
+			await callbacks.onTextChunk("Hello from the fallback.", streamController);
+			return textResult("Hello from the fallback.", "resp_fallback");
+		});
+
+		const harness = makeHarness({ text: "Anyone home?" });
+		delete harness.client.chatStream;
+		await runRespond(harness);
+
+		expect(harness.say).toHaveBeenCalledWith(
+			expect.objectContaining({
+				text: "Hello from the fallback.",
+				metadata: expect.objectContaining({
+					event_payload: expect.objectContaining({ response_id: "resp_fallback" }),
+				}),
+			})
+		);
+		// No error fallback message was posted
+		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
+		expect(saidTexts.join("\n")).not.toContain("Friendly local AI error.");
+	});
+
 	it("supports multiple tool calls in a single turn", async () => {
 		streamOnceMock
 			.mockResolvedValueOnce(

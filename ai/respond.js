@@ -867,6 +867,7 @@ async function executeStreamWithRetry({
 	let postedFirstLine = false;
 	let totalCharsStreamed = 0; // Track message length
 	let truncated = false;
+	let seenResponseId = null; // Captured at stream start; the streamOnce result is not available yet
 
 	const result = await streamOnce(
 		{
@@ -881,6 +882,7 @@ async function executeStreamWithRetry({
 			setStatus,
 			logger,
 			onStreamStart: async (responseId) => {
+				if (responseId) seenResponseId = responseId;
 				// streamOnce owns this stream's lifecycle and stops it in its finally block.
 				try {
 					return client.chatStream({
@@ -939,11 +941,11 @@ async function executeStreamWithRetry({
 				} else {
 					// Fallback to say()
 					const payload = { text: cleaned };
-					if (!postedFirstLine && result?.responseId) {
+					if (!postedFirstLine && seenResponseId) {
 						payload.metadata = {
 							event_type: "openai_context",
 							event_payload: {
-								response_id: result.responseId,
+								response_id: seenResponseId,
 								uploaded_files: fileManager.uploadedFilesThisTurn,
 							},
 						};
