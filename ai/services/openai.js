@@ -5,9 +5,12 @@
 import { createHash } from "node:crypto";
 import { OpenAI } from "openai";
 
-// OpenAI client singleton
+// OpenAI client singleton.
+// The fallback key lets Ollama-only deployments (AI_PROVIDER=ollama, no OPENAI_API_KEY)
+// start without crashing at import time; any accidental OpenAI call then fails loudly
+// with an authentication error instead of silently falling back.
 export const openai = new OpenAI({
-	apiKey: process.env.OPENAI_API_KEY,
+	apiKey: process.env.OPENAI_API_KEY || "openai-api-key-not-configured",
 });
 
 /**

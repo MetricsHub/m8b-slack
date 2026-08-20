@@ -146,3 +146,6 @@ vite.config.ts.timestamp-*
 
 # Local MCP configuration (do not commit)
 ai/mcp.config.local.js
+
+# Local knowledge base data (Ollama mode)
+data/

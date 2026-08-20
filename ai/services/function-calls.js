@@ -6,15 +6,16 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeMcpFunctionCall } from "../mcp_registry.js";
+import { executeMcpFunctionCall, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
 import { openai } from "./openai.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
+import { executeWebSearch } from "./web-search.js";
 
 /**
- * Process a single function call from OpenAI.
+ * Process a single function call from the model.
  *
  * @param {Object} functionCall - The function call to process
  * @param {Object} context - Processing context
@@ -23,22 +24,28 @@ import { executeWithMiddleware } from "./tool-middleware.js";
  * @param {Function} context.say - Say function for replies
  * @param {Array} context.vectorStoreIds - Vector store IDs
  * @param {Object} context.fileTracking - File tracking state
+ * @param {import("../providers/index.js").AiProvider} [context.provider] - Active AI provider
+ * @param {Object} [context.knowledgeBase] - Local knowledge base (Ollama mode)
  * @param {Object} context.logger - Logger instance
  * @returns {Promise<Array>} Function call output items
  */
 export async function processFunctionCall(functionCall, context) {
 	const { name, call_id, arguments: argsStr } = functionCall;
-	const { client, message, say, vectorStoreIds, fileTracking, logger } = context;
+	const { client, message, say, vectorStoreIds, fileTracking, provider, knowledgeBase, logger } =
+		context;
 
 	logger?.info?.(`[FUNCTION] ${name}`, { call_id: call_id?.slice(-12) });
 
 	let output;
 
-	// Middleware options for caching/pagination/file uploads
+	// Middleware options for caching/pagination/file uploads.
+	// Large-output file uploads use the OpenAI Files API and are only enabled
+	// when the active provider supports them.
+	const providerFileUploads = provider ? provider.capabilities.providerFileUploads : true;
 	const middlewareOptions = {
 		logger,
-		openaiClient: openai,
-		fileTracking,
+		openaiClient: providerFileUploads ? openai : null,
+		fileTracking: providerFileUploads ? fileTracking : null,
 	};
 
 	try {
@@ -56,7 +63,21 @@ export async function processFunctionCall(functionCall, context) {
 				break;
 
 			case "update_knowledge":
-				output = await handleUpdateKnowledge(args, vectorStoreIds, say, logger);
+				output = knowledgeBase
+					? await handleLocalUpdateKnowledge(args, knowledgeBase, say, logger)
+					: await handleUpdateKnowledge(args, vectorStoreIds, say, logger);
+				break;
+
+			// Application-side web search (Ollama mode)
+			case "web_search":
+				output = await executeWebSearch(args, logger);
+				break;
+
+			// Local knowledge base retrieval (Ollama mode)
+			case "search_knowledge_base":
+				output = knowledgeBase
+					? await knowledgeBase.search(args?.query, args?.topK)
+					: { ok: false, error: "Knowledge base search is not available for this provider" };
 				break;
 
 			// Prometheus - use middleware for potential large results
@@ -70,7 +91,14 @@ export async function processFunctionCall(functionCall, context) {
 				break;
 
 			// MCP functions - use middleware for caching and pagination
-			default:
+			default: {
+				const knownMcpTools = new Set(getOpenAiFunctionTools().map((tool) => tool.name));
+				if (!knownMcpTools.has(name)) {
+					logger?.warn?.(`[FUNCTION] Unknown function requested: ${name}`);
+					output = { ok: false, error: `Unknown function: ${name}` };
+					break;
+				}
+
 				output = await executeWithMiddleware(
 					name,
 					args,
@@ -78,6 +106,7 @@ export async function processFunctionCall(functionCall, context) {
 					middlewareOptions
 				);
 				break;
+			}
 		}
 	} catch (err) {
 		logger?.error?.(`[FUNCTION] Error: ${name}`, { error: err });
@@ -87,7 +116,7 @@ export async function processFunctionCall(functionCall, context) {
 	// Log summary
 	logger?.info?.(`[FUNCTION] ${name} → ${formatOutputSummary(output)}`);
 
-	// Final safety check
+	// Final safety checks
 	let finalOutputStr = JSON.stringify(output);
 	if (finalOutputStr.length > HARD_MAX_OUTPUT_CHARS) {
 		logger?.warn?.(`[FUNCTION] Output too large (${finalOutputStr.length} chars)`);
@@ -95,6 +124,23 @@ export async function processFunctionCall(functionCall, context) {
 			ok: false,
 			error: "Output exceeded maximum size limit",
 			hint: "Use smaller maxResults or more specific query parameters.",
+		});
+	}
+
+	// Provider-specific inline cap: small-context providers (Ollama at 32K)
+	// cannot absorb tool outputs sized for OpenAI's context window. Keep a
+	// truncated payload so the model can still extract the key facts.
+	const maxToolOutputChars = provider?.maxToolOutputChars;
+	if (maxToolOutputChars && finalOutputStr.length > maxToolOutputChars) {
+		logger?.warn?.(
+			`[FUNCTION] ${name} output (${finalOutputStr.length} chars) exceeds the provider inline cap (${maxToolOutputChars}); truncating`
+		);
+		finalOutputStr = JSON.stringify({
+			ok: output?.ok ?? true,
+			truncated: true,
+			originalChars: finalOutputStr.length,
+			data: finalOutputStr.slice(0, Math.max(maxToolOutputChars - 500, 1000)),
+			hint: "Tool output was TRUNCATED to fit the local model's context window; data for some requested items may be missing entirely. Do NOT guess, assume, or invent values for items you cannot see in the data above. Either call this tool again for ONE host/item at a time to get complete data, or explicitly tell the user that data is missing.",
 		});
 	}
 
@@ -133,19 +179,47 @@ function formatOutputSummary(output) {
 }
 
 /**
+ * Common emoji names models emit that are not valid Slack shortcodes.
+ */
+const EMOJI_ALIASES = {
+	facepalm: "person_facepalming",
+	face_palm: "person_facepalming",
+	shrug: "person_shrugging",
+	thumbs_up: "thumbsup",
+	"thumbs-up": "thumbsup",
+	thumbs_down: "thumbsdown",
+	check: "white_check_mark",
+	party: "tada",
+};
+
+/**
  * Handle slack_add_reaction function call.
  */
 async function handleSlackReaction(args, client, message) {
 	const raw = String(args.emoji || "").trim();
-	const emoji = raw.replace(/^:+|:+$/g, "") || "thumbsup";
+	const cleaned = raw.replace(/^:+|:+$/g, "").toLowerCase() || "thumbsup";
+	const emoji = EMOJI_ALIASES[cleaned] || cleaned;
 
-	await client.reactions.add({
-		channel: message.channel,
-		name: emoji,
-		timestamp: message.ts,
-	});
-
-	return { ok: true };
+	try {
+		await client.reactions.add({
+			channel: message.channel,
+			name: emoji,
+			timestamp: message.ts,
+		});
+		return { ok: true };
+	} catch (e) {
+		if (e?.data?.error === "invalid_name") {
+			return {
+				ok: false,
+				error: `"${emoji}" is not a valid Slack emoji shortcode`,
+				hint: "Use a standard shortcode such as eyes, thumbsup, tada, person_facepalming, or person_shrugging. Do not retry more than once.",
+			};
+		}
+		if (e?.data?.error === "already_reacted") {
+			return { ok: true, note: "Reaction was already present" };
+		}
+		throw e;
+	}
 }
 
 /**
@@ -161,6 +235,37 @@ async function handleSlackReply(args, say, logger) {
 
 	logger?.debug?.("slack_add_reply called without text argument");
 	return { ok: false, error: "No text provided" };
+}
+
+/**
+ * Handle update_knowledge against the local knowledge base (Ollama mode).
+ */
+async function handleLocalUpdateKnowledge(args, knowledgeBase, say, logger) {
+	const content = String(args.content || "").trim();
+	const title = String(args.title || "knowledge-entry").trim();
+	const replaceDocId = args.fileId ? String(args.fileId).trim() : undefined;
+
+	if (!content) {
+		return { ok: false, error: "Content is required for update_knowledge" };
+	}
+
+	const result = await knowledgeBase.addDocument({ title, content, replaceDocId });
+
+	if (result.ok) {
+		await say({ text: `:brain: Knowledge updated: "${title}"` });
+		return {
+			ok: true,
+			message: `Knowledge entry "${title}" has been saved to the local knowledge base.`,
+			fileId: result.docId,
+			fileName: result.file,
+			replacedFileId: replaceDocId || null,
+		};
+	}
+
+	logger?.error?.("[update_knowledge] Local knowledge base write failed", {
+		error: result.error,
+	});
+	return result;
 }
 
 /**

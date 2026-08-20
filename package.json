@@ -15,7 +15,9 @@
 		"test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
 		"test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
 		"test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
-		"validate": "npm run format:check && npm run lint && npm run test"
+		"validate": "npm run format:check && npm run lint && npm run test",
+		"kb:export": "node scripts/export-openai-knowledge.js",
+		"kb:index": "node scripts/index-knowledge.js"
 	},
 	"author": "MetricsHub",
 	"license": "MIT",

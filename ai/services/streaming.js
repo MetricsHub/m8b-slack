@@ -184,6 +184,8 @@ export function buildResponseRequest({
  * @param {string} params.tool_choice - Tool choice setting
  * @param {string} params.previous_response_id - Previous response ID for continuity
  * @param {string} params.safety_identifier - Hashed stable end-user identifier
+ * @param {import("../providers/index.js").AiProvider} [params.provider] - Active AI provider
+ *   (defaults to the hosted OpenAI configuration when omitted)
  * @param {Object} callbacks - Callback functions
  * @param {Function} callbacks.setStatus - Status update callback
  * @param {Function} callbacks.onTextChunk - Text chunk callback
@@ -192,7 +194,7 @@ export function buildResponseRequest({
  * @returns {Promise<Object>} Stream result
  */
 export async function streamOnce(
-	{ input, tools, tool_choice, previous_response_id, safety_identifier },
+	{ input, tools, tool_choice, previous_response_id, safety_identifier, provider },
 	callbacks
 ) {
 	const { setStatus, onTextChunk, onStreamStart, logger } = callbacks;
@@ -272,16 +274,30 @@ export async function streamOnce(
 		await setStatus({ status: "working...", loading_messages: tail });
 	}
 
-	// Create the stream
-	const stream = await openai.responses.create(
-		/** @type {import("openai/resources/responses/responses").ResponseCreateParamsStreaming} */ (
-			buildResponseRequest({
+	// Build the request through the active provider so unsupported fields are
+	// never sent to backends that do not implement them (e.g. Ollama).
+	const requestParams = provider
+		? provider.buildRequest({
 				input,
 				tools,
 				tool_choice,
 				previous_response_id,
 				safety_identifier,
 			})
+		: buildResponseRequest({
+				input,
+				tools,
+				tool_choice,
+				previous_response_id,
+				safety_identifier,
+			});
+
+	const client = provider?.client || openai;
+
+	// Create the stream
+	const stream = await client.responses.create(
+		/** @type {import("openai/resources/responses/responses").ResponseCreateParamsStreaming} */ (
+			requestParams
 		)
 	);
 
@@ -618,8 +634,9 @@ export async function streamOnce(
 
 	// Summary log for key actions
 	logger?.info?.("[STREAM_COMPLETE] Turn finished", {
+		provider: provider?.name || "openai",
 		responseId: newResponseId,
-		model: resolvedModel || MODEL_CONFIG.model,
+		model: resolvedModel || provider?.model || MODEL_CONFIG.model,
 		reasoningContext: effectiveReasoningContext,
 		hadReasoning: reasoningBuf.length > 0,
 		reasoningLength: reasoningBuf.length,

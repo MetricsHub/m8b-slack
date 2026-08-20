@@ -23,6 +23,14 @@ export function estimateTokenCount(inputItems) {
 				chars += 4000;
 			}
 		}
+
+		// Tool-call items carry their payload at the top level
+		if (typeof item?.arguments === "string") {
+			chars += item.arguments.length;
+		}
+		if (typeof item?.output === "string") {
+			chars += item.output.length;
+		}
 	}
 
 	return Math.ceil(chars / 4);

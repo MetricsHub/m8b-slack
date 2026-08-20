@@ -190,6 +190,35 @@ export function createFileUploadManager(previousUploads, logger) {
 }
 
 /**
+ * Create a disabled file upload manager for providers without a Files API
+ * (Ollama mode). Exposes the same interface as createFileUploadManager but
+ * never uploads anything; attachments are surfaced to the model as text notes
+ * by the caller instead.
+ *
+ * @param {Object} [logger] - Logger instance
+ * @returns {Object} Upload manager with a no-op uploadOnce method
+ */
+export function createNoopFileUploadManager(logger) {
+	let warned = false;
+
+	return {
+		disabled: true,
+		codeFileIds: new Set(),
+		codeContainerFiles: new Map(),
+		uploadedFilesThisTurn: [],
+		async uploadOnce(file) {
+			if (!warned) {
+				warned = true;
+				logger?.info?.("File uploads are disabled for this AI provider; skipping attachments", {
+					firstFile: file?.name,
+				});
+			}
+			return null;
+		},
+	};
+}
+
+/**
  * Extract previous upload mappings from thread messages.
  *
  * @param {Array} messages - Array of Slack messages

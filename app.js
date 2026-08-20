@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
+import { getProvider } from "./ai/providers/index.js";
 import { registerListeners } from "./listeners/index.js";
 
 // Determine log level based on NODE_ENV
@@ -45,6 +46,28 @@ const app = new App({
 			await initializeMcpRegistry(app.logger);
 		} catch (e) {
 			app.logger.warn("Failed to initialize MCP registry", e);
+		}
+
+		// Resolve and verify the AI backend (never log keys)
+		const aiProvider = getProvider();
+		app.logger.info(`AI provider: ${aiProvider.name}`);
+		app.logger.info(`AI model: ${aiProvider.model}`);
+		app.logger.info(`AI endpoint: ${aiProvider.endpoint}`);
+		try {
+			if (aiProvider.name === "ollama") {
+				app.logger.info("Warming up the AI model (may take a minute on a cold server)...");
+			}
+			const health = await aiProvider.healthCheck();
+			if (health.ok) {
+				app.logger.info(`AI backend health check passed (${health.detail || "ok"})`);
+			} else {
+				app.logger.warn(`AI backend health check FAILED: ${health.error}`);
+			}
+			if (health.warning) {
+				app.logger.warn(health.warning);
+			}
+		} catch (e) {
+			app.logger.warn("AI backend health check errored", e);
 		}
 
 		// Register the action and event listeners

@@ -43,6 +43,67 @@ export const SYSTEM_PROMPT = `You are M8B, a grumpy but highly competent system 
 When a prompt has Slack's special syntax like <@USER_ID> or <#CHANNEL_ID>, you must keep them as-is in your response. When referring to users, always use <@USER_ID>.`;
 
 /**
+ * Build the system prompt adapted to the active provider's capabilities.
+ * With full OpenAI capabilities the prompt is returned unchanged; for
+ * function-only providers (Ollama) the hosted-tool instructions are rewritten
+ * so the model is never told to use tools it does not have.
+ *
+ * @param {Object} [capabilities] - Provider capability flags
+ * @param {boolean} [capabilities.codeInterpreter]
+ * @param {boolean} [capabilities.hostedFileSearch]
+ * @param {boolean} [capabilities.providerFileUploads]
+ * @param {Object} [options]
+ * @param {number} [options.contextWindow] - Hard context window in tokens (local models);
+ *   adds guidance about truncated tool outputs
+ * @returns {string} System prompt text
+ */
+export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
+	const {
+		codeInterpreter = true,
+		hostedFileSearch = true,
+		providerFileUploads = true,
+	} = capabilities;
+
+	let prompt = SYSTEM_PROMPT;
+
+	if (contextWindow) {
+		prompt += `
+
+**Local model constraints:**
+
+19. Your context window is limited (${contextWindow} tokens) and large tool outputs are truncated to fit it. For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), query ONE host per call. When a tool result says it was truncated, NEVER guess, assume, or report values for hosts/items missing from the data you actually received — re-query them one at a time, or tell the user their data is missing.`;
+	}
+
+	if (!providerFileUploads) {
+		prompt = prompt.replace(
+			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
+			"3. File analysis is not available in this deployment. If a user attaches a file, tell them you cannot read attachments right now."
+		);
+		prompt = prompt.replace("    * Visual content from any attached files or images\n", "");
+	}
+
+	if (!hostedFileSearch) {
+		prompt = prompt.replace(
+			"* Verified information from File Search (IT knowledge base)",
+			"* Verified information from the knowledge base (search_knowledge_base tool)"
+		);
+		prompt = prompt.replace(
+			"Search for the host with SearchHost or file_search",
+			"Search for the host with SearchHost or search_knowledge_base"
+		);
+	}
+
+	if (!codeInterpreter) {
+		prompt = prompt.replace(
+			"7. When users ask for files (CSV, TXT, Excel, PDF, etc.), use code_interpreter to create them. Simply write the file and confirm it was created (e.g., \"I've created hosts.csv for you\"). The file will be automatically uploaded to Slack. NEVER include sandbox paths, /mnt/data/ paths, or download links in your response — these don't work for users.",
+			"7. You cannot create or generate downloadable files in this deployment. If a user asks for a file (CSV, TXT, etc.), provide the content inline in a Slack code block instead, or say it is not possible."
+		);
+	}
+
+	return prompt;
+}
+
+/**
  * Loading messages displayed while bot is thinking
  */
 export const LOADING_MESSAGES = [

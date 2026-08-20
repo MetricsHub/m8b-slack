@@ -4,7 +4,7 @@ This document provides instructions for AI agents working on this codebase.
 
 ## Project Overview
 
-M8B is a Slack bot powered by OpenAI that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights.
+M8B is a Slack bot powered by OpenAI (hosted) or Ollama (local, OpenAI-compatible `/v1/responses`) that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights. The AI backend is selected with `AI_PROVIDER` and abstracted behind `ai/providers/` — application code depends on provider capability flags, not provider names.
 
 ## Tech Stack
 
@@ -20,15 +20,17 @@ M8B is a Slack bot powered by OpenAI that acts as a grumpy but competent system 
 
 ```
 m8b-slackbot/
-├── app.js                 # Entry point
+├── app.js                 # Entry point (logs AI provider + health check)
 ├── ai/
-│   ├── config/            # AI configuration (system prompt, model settings)
-│   ├── services/          # Core services (OpenAI, streaming, citations, etc.)
+│   ├── config/            # AI configuration (system prompt, model settings, provider env)
+│   ├── providers/         # AI provider abstraction (openai / ollama)
+│   ├── services/          # Core services (OpenAI, streaming, citations, local KB, etc.)
 │   ├── tools/             # OpenAI tool definitions
 │   ├── utils/             # Utilities (tokens, output handling, JSON parsing)
 │   ├── respond.js         # Main AI response orchestrator
 │   ├── mcp_registry.js    # MCP server management
 │   └── prometheus.js      # PromQL integration
+├── scripts/               # KB migration/indexing CLI scripts (kb:export, kb:index)
 ├── listeners/
 │   ├── actions/           # Slack interactive actions
 │   ├── assistant/         # Assistant thread handlers
@@ -151,7 +153,9 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 2. Fill in required values:
    - `SLACK_BOT_TOKEN` - Bot OAuth token (xoxb-...)
    - `SLACK_APP_TOKEN` - App-level token (xapp-...)
-   - `OPENAI_API_KEY` - OpenAI API key
+   - `OPENAI_API_KEY` - OpenAI API key (OpenAI mode)
+3. To use a local model instead of OpenAI, set `AI_PROVIDER=ollama` plus
+   `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_EMBEDDING_MODEL` (see README)
 
 ## Common Tasks
 
@@ -171,20 +175,36 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 
 ### Modifying AI Behavior
 
-1. Edit system prompt in `ai/config/system-prompt.js`
-2. Adjust model parameters in `MODEL_CONFIG` if needed
+1. Edit system prompt in `ai/config/system-prompt.js` (note: `buildSystemPrompt()` rewrites
+   hosted-tool instructions for providers without them — keep its replacement strings in sync)
+2. Adjust model parameters in `MODEL_CONFIG` (OpenAI) or `OLLAMA_*` env vars (Ollama) if needed
 3. Test conversationally before committing
+
+### Working on the Provider Abstraction
+
+- Provider selection/config: `ai/config/providers.js`; provider objects: `ai/providers/`
+- Never scatter `if (provider === "ollama")` through the app — branch on
+  `provider.capabilities.*` flags instead
+- Ollama's `/v1/responses` is stateless: no `previous_response_id`/`conversation`. Its request
+  builder must only emit fields Ollama supports (model, input, instructions, tools, stream,
+  temperature, top_p, max_output_tokens)
+- In Ollama mode, never send data to OpenAI (no silent fallback)
 
 ## Key Files Reference
 
-| File                            | Purpose                             |
-| ------------------------------- | ----------------------------------- |
-| `ai/respond.js`                 | Main AI response orchestrator       |
-| `ai/config/system-prompt.js`    | AI personality and configuration    |
-| `ai/services/streaming.js`      | OpenAI streaming response handling  |
-| `ai/services/function-calls.js` | Tool/function call processing       |
-| `ai/tools/index.js`             | OpenAI tool definitions             |
-| `ai/mcp_registry.js`            | MCP server discovery and management |
+| File                                | Purpose                             |
+| ----------------------------------- | ----------------------------------- |
+| `ai/respond.js`                     | Main AI response orchestrator       |
+| `ai/config/system-prompt.js`        | AI personality and configuration    |
+| `ai/services/streaming.js`          | OpenAI streaming response handling  |
+| `ai/services/function-calls.js`     | Tool/function call processing       |
+| `ai/tools/index.js`                 | OpenAI tool definitions             |
+| `ai/mcp_registry.js`                | MCP server discovery and management |
+| `ai/providers/index.js`             | AI provider abstraction             |
+| `ai/config/providers.js`            | Provider env configuration          |
+| `ai/services/conversation-store.js` | App-side thread state (Ollama)      |
+| `ai/services/knowledge-base.js`     | Local RAG knowledge base (Ollama)   |
+| `ai/services/web-search.js`         | App-side web search backends        |
 
 ## Error Handling
 

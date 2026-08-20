@@ -4,6 +4,8 @@
 
 import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
+import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
+import { getWebSearchTool } from "../services/web-search.js";
 
 const MAX_NAMESPACE_TOOLS = 9;
 const IMMEDIATE_MCP_TOOLS = new Set(["ListHosts", "SearchHost"]);
@@ -119,14 +121,73 @@ export const KNOWLEDGE_TOOL = {
 };
 
 /**
- * Build the complete tools array for OpenAI.
+ * Build a flat function-only tools array for providers without hosted tools
+ * (Ollama). The model sees ordinary function tools; the application executes them.
+ *
+ * @param {Object} options - Tool configuration options
+ * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base indexed and usable
+ * @returns {Array} Array of plain function tool definitions
+ */
+export function buildFunctionToolsArray({ knowledgeBaseAvailable = false } = {}) {
+	const tools = [];
+
+	// MCP function tools, flat (no namespaces, no deferred loading)
+	tools.push(...getOpenAiFunctionTools());
+
+	// Prometheus PromQL tool (if configured)
+	const promqlTool = getPromQLTool();
+	if (promqlTool) {
+		tools.push(promqlTool);
+	}
+
+	// Local knowledge base: retrieval + writes
+	if (knowledgeBaseAvailable) {
+		tools.push(SEARCH_KNOWLEDGE_TOOL);
+	}
+	tools.push({
+		...KNOWLEDGE_TOOL,
+		description: KNOWLEDGE_TOOL.description.replace(
+			"retrievable via file_search",
+			"retrievable via search_knowledge_base"
+		),
+	});
+
+	// Application-side web search (only when a search backend is configured)
+	const webSearchTool = getWebSearchTool();
+	if (webSearchTool) {
+		tools.push(webSearchTool);
+	}
+
+	// Slack tools
+	tools.push(...SLACK_TOOLS);
+
+	return tools;
+}
+
+/**
+ * Build the complete tools array for the active provider.
+ *
+ * With hosted-tool providers (OpenAI) this includes file_search, deferred tool
+ * namespaces, code_interpreter, and web_search. For function-only providers
+ * (Ollama) it delegates to buildFunctionToolsArray.
  *
  * @param {Object} options - Tool configuration options
  * @param {Array<string>} options.vectorStoreIds - Vector store IDs for file search
  * @param {Set<string>} options.codeFileIds - File IDs for code interpreter
+ * @param {import("../providers/index.js").AiProvider} [options.provider] - Active AI provider
+ * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base usable (Ollama mode)
  * @returns {Array} Array of tool definitions
  */
-export function buildToolsArray({ vectorStoreIds = [], codeFileIds = new Set() }) {
+export function buildToolsArray({
+	vectorStoreIds = [],
+	codeFileIds = new Set(),
+	provider,
+	knowledgeBaseAvailable = false,
+}) {
+	if (provider && !provider.capabilities.toolNamespaces) {
+		return buildFunctionToolsArray({ knowledgeBaseAvailable });
+	}
+
 	const tools = [];
 	let hasDeferredTools = false;
 
@@ -201,10 +262,18 @@ export function buildToolsArray({ vectorStoreIds = [], codeFileIds = new Set() }
  *
  * @param {Object} options - Configuration options
  * @param {Array<string>} options.vectorStoreIds - Vector store IDs
+ * @param {import("../providers/index.js").AiProvider} [options.provider] - Active AI provider
+ * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base usable (Ollama mode)
  * @param {Function} options.say - Say function for Slack messages
  * @param {Object} options.logger - Logger instance
  */
-export async function logToolWarnings({ vectorStoreIds, say, logger }) {
+export async function logToolWarnings({
+	vectorStoreIds,
+	provider,
+	knowledgeBaseAvailable,
+	say,
+	logger,
+}) {
 	// Check MCP server configuration
 	if (getMcpServerCount() === 0) {
 		logger?.warn?.(
@@ -221,7 +290,23 @@ export async function logToolWarnings({ vectorStoreIds, say, logger }) {
 		}
 	}
 
-	// Check vector store configuration
+	// Provider-specific capability warnings
+	if (provider && !provider.capabilities.toolNamespaces) {
+		if (!knowledgeBaseAvailable) {
+			logger?.warn?.(
+				"Local knowledge base is empty or not indexed. search_knowledge_base disabled. Run npm run kb:index (or npm run kb:export first)."
+			);
+		}
+		if (!getWebSearchTool()) {
+			logger?.info?.(
+				"No web-search backend configured (WEB_SEARCH_PROVIDER unset). web_search tool disabled."
+			);
+		}
+		logger?.info?.("Code interpreter is not available in Ollama mode.");
+		return;
+	}
+
+	// Check vector store configuration (OpenAI mode)
 	if (vectorStoreIds.length === 0) {
 		logger?.warn?.(
 			"No OpenAI vector stores configured. File Search tool disabled. Set OPENAI_VECTOR_STORE_IDS or OPENAI_VECTOR_STORE_ID."

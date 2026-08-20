@@ -2,7 +2,8 @@
  * Tests for GPT tool construction helpers.
  */
 
-import { buildFunctionNamespaces } from "../index.js";
+import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
+import { buildFunctionNamespaces, buildToolsArray } from "../index.js";
 
 function makeTool(name) {
 	return {
@@ -43,5 +44,99 @@ describe("buildFunctionNamespaces", () => {
 
 		expect(namespace.name).toBe("knowledge_base");
 		expect(namespace.tools[0].defer_loading).toBe(true);
+	});
+});
+
+describe("buildToolsArray", () => {
+	const HOSTED_TYPES = new Set([
+		"file_search",
+		"code_interpreter",
+		"web_search_preview",
+		"web_search",
+		"tool_search",
+		"namespace",
+	]);
+
+	const openAiProvider = {
+		name: "openai",
+		capabilities: { toolNamespaces: true },
+	};
+
+	const ollamaProvider = {
+		name: "ollama",
+		capabilities: { toolNamespaces: false },
+	};
+
+	const savedEnv = {};
+
+	beforeEach(() => {
+		for (const key of ["WEB_SEARCH_PROVIDER", "SEARXNG_URL"]) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+	});
+
+	afterEach(() => {
+		for (const key of ["WEB_SEARCH_PROVIDER", "SEARXNG_URL"]) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	it("keeps hosted tools for the OpenAI provider", () => {
+		const tools = buildToolsArray({
+			vectorStoreIds: ["vs_123"],
+			codeFileIds: new Set(),
+			provider: openAiProvider,
+		});
+
+		const types = tools.map((t) => t.type);
+		expect(types).toContain("file_search");
+		expect(types).toContain("code_interpreter");
+		expect(types).toContain("web_search_preview");
+	});
+
+	it("emits only plain function tools for the Ollama provider", () => {
+		const tools = buildToolsArray({
+			vectorStoreIds: [],
+			codeFileIds: new Set(),
+			provider: ollamaProvider,
+			knowledgeBaseAvailable: true,
+		});
+
+		expect(tools.length).toBeGreaterThan(0);
+		for (const tool of tools) {
+			expect(tool.type).toBe("function");
+			expect(HOSTED_TYPES.has(tool.type)).toBe(false);
+			expect(tool).not.toHaveProperty("defer_loading");
+		}
+
+		const names = tools.map((t) => t.name);
+		expect(names).toContain("search_knowledge_base");
+		expect(names).toContain("update_knowledge");
+		expect(names).toContain("slack_add_reaction");
+		expect(names).toContain("slack_add_reply");
+		expect(names).toContain("ListHosts");
+	});
+
+	it("omits knowledge search when the local knowledge base is unavailable", () => {
+		const tools = buildToolsArray({
+			provider: ollamaProvider,
+			knowledgeBaseAvailable: false,
+		});
+
+		expect(tools.map((t) => t.name)).not.toContain("search_knowledge_base");
+	});
+
+	it("exposes web_search as a function tool only when a backend is configured", () => {
+		const withoutSearch = buildToolsArray({ provider: ollamaProvider });
+		expect(withoutSearch.map((t) => t.name)).not.toContain("web_search");
+
+		process.env.WEB_SEARCH_PROVIDER = "searxng";
+		process.env.SEARXNG_URL = "http://searxng.internal:8080";
+
+		const withSearch = buildToolsArray({ provider: ollamaProvider });
+		const webSearch = withSearch.find((t) => t.name === "web_search");
+		expect(webSearch).toMatchObject({ type: "function", name: "web_search" });
 	});
 });
