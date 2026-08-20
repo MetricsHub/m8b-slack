@@ -371,7 +371,7 @@ export function getOpenAiFunctionTools() {
 				type: "array",
 				items: { type: "string" },
 				description:
-					"One or more host identifiers to target. Use ListHosts/SearchHost first to discover hosts.",
+					'Host key(s) exactly as returned by ListHosts/SearchHost (the keys of the "hosts" object, e.g. "ecs1-01"). Routes the call to the right MetricsHub agent. Never pass an agent label (e.g. "m8b-agent-01") here. Usually the same values as the tool\'s own hostname argument.',
 			};
 			if (!Array.isArray(params.required)) params.required = [];
 			if (!params.required.includes("hosts")) params.required.push("hosts");
@@ -499,19 +499,43 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 	}
 
 	// Other tools: partition by server and invoke
-	const hosts = Array.isArray(args?.hosts) ? args.hosts : args?.host ? [args.host] : [];
+	let hosts = Array.isArray(args?.hosts) ? args.hosts : args?.host ? [args.host] : [];
 	console.log(`[MCP] Tool ${name} targeting hosts:`, hosts);
 
-	const buckets = _bucketHostsByServer(hosts);
+	let buckets = _bucketHostsByServer(hosts);
+
+	// Models regularly fill "hosts" with an agent label or other junk while the
+	// tool's own hostname argument holds valid host keys — recover from those
+	// instead of failing the call
+	if (buckets.size === 0) {
+		const fallbackHosts = [args?.arg0, args?.hostname, args?.hostnames, args?.host]
+			.flatMap((v) => (Array.isArray(v) ? v : typeof v === "string" ? [v] : []))
+			.filter((h) => state.hosts.has(h));
+		if (fallbackHosts.length > 0) {
+			console.log(
+				`[MCP] "hosts" matched no registry entries; falling back to hostname args:`,
+				fallbackHosts
+			);
+			hosts = fallbackHosts;
+			buckets = _bucketHostsByServer(hosts);
+		}
+	}
+
 	console.log(`[MCP] Bucketed into ${buckets.size} server(s):`, [...buckets.keys()]);
 
 	// If no hosts matched any server, return an error
 	if (buckets.size === 0) {
+		const serverLabels = new Set(state.servers.map((s) => s.server_label));
+		const mistakenLabels = hosts.filter((h) => serverLabels.has(h));
 		const knownHosts = [...state.hosts.keys()].slice(0, 10).join(", ");
-		return {
+		const result = {
 			ok: false,
 			error: `No matching hosts found in registry. Requested: [${hosts.join(", ")}]. Known hosts (sample): ${knownHosts}...`,
 		};
+		if (mistakenLabels.length > 0) {
+			result.hint = `"${mistakenLabels.join('", "')}" ${mistakenLabels.length > 1 ? "are agent labels" : "is an agent label"}, not a host key. Pass host keys from ListHosts/SearchHost (the keys of the returned "hosts" object) in the "hosts" parameter.`;
+		}
+		return result;
 	}
 
 	const results = [];

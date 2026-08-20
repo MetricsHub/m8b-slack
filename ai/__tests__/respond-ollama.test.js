@@ -375,7 +375,8 @@ describe("respond in Ollama mode", () => {
 	});
 
 	it("stops a runaway tool loop at the iteration cap", async () => {
-		// The model keeps calling tools forever
+		// The model keeps calling tools forever — even on the forced
+		// text-only wrap-up turn (a provider that ignores tool_choice)
 		streamOnceMock.mockImplementation(async () =>
 			functionCallResult([
 				{
@@ -392,9 +393,48 @@ describe("respond in Ollama mode", () => {
 
 		// Capped at MAX_AGENT_ITERATIONS (default 10), then a friendly message
 		expect(streamOnceMock.mock.calls.length).toBeLessThanOrEqual(10);
+		// The final permitted iteration attempted a text-only wrap-up
+		const finalParams = streamOnceMock.mock.calls[9][0];
+		expect(finalParams.tool_choice).toBe("none");
+		expect(allText(finalParams.input)).toContain("Tool-call limit reached");
 		expect(harness.say).toHaveBeenCalledWith(
 			expect.objectContaining({ text: expect.stringContaining("circles") })
 		);
+	});
+
+	it("forces a final text-only answer at the iteration cap instead of dropping the data", async () => {
+		// The model keeps fetching data until the harness forces the wrap-up turn
+		streamOnceMock.mockImplementation(async (params) => {
+			if (params.tool_choice === "none") {
+				return textResult("Summary from the data gathered so far.");
+			}
+			return functionCallResult([
+				{
+					type: "function_call",
+					call_id: `call_${streamOnceMock.mock.calls.length}`,
+					name: "search_knowledge_base",
+					arguments: '{"query":"ecs"}',
+				},
+			]);
+		});
+
+		const harness = makeHarness();
+		await runRespond(harness);
+
+		// 9 tool turns + 1 forced text-only wrap-up = the cap, not the cap + apology
+		expect(streamOnceMock.mock.calls.length).toBe(10);
+		const finalParams = streamOnceMock.mock.calls[9][0];
+		expect(finalParams.tool_choice).toBe("none");
+		expect(allText(finalParams.input)).toContain("Tool-call limit reached");
+		// The wrap-up answer stands; no "running in circles" apology
+		expect(harness.say).not.toHaveBeenCalledWith(
+			expect.objectContaining({ text: expect.stringContaining("circles") })
+		);
+		// The answer is persisted as the turn's assistant message
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		expect(allText(getConversation(key))).toContain("Summary from the data gathered so far.");
+		// The wrap-up nudge is transient: never persisted
+		expect(allText(getConversation(key))).not.toContain("Tool-call limit reached");
 	});
 
 	it("reports errors with a short friendly message", async () => {

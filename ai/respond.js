@@ -348,6 +348,30 @@ export async function respond({
 				break;
 			}
 
+			// The final permitted iteration must produce the answer, not more tool
+			// calls: force a text-only turn so the data gathered so far reaches
+			// the user instead of the run dying mid-investigation
+			if (loopIteration === MAX_AGENT_ITERATIONS) {
+				logger.warn(
+					`[LOOP] Final agent iteration (${MAX_AGENT_ITERATIONS}); forcing a text-only answer`
+				);
+				forceToolChoiceNext = "none";
+				const wrapUpNudge = {
+					role: "system",
+					content: [
+						{
+							type: "input_text",
+							text: "Tool-call limit reached for this request. Do NOT call any more tools. Answer the user now using only the data already gathered above, and say explicitly which requested items are missing or unverified.",
+						},
+					],
+				};
+				if (stateless) {
+					transientItems = [...transientItems, wrapUpNudge];
+				} else {
+					input.push(wrapUpNudge);
+				}
+			}
+
 			// Assemble this iteration's input
 			let requestInput;
 			if (stateless) {
