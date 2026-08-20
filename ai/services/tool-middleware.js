@@ -488,6 +488,27 @@ const METRIC_FIELDS_TO_REMOVE = [
 const MONITOR_FIELDS_TO_REMOVE = ["discoveryTime", "identifyingAttributeKeys"];
 
 /**
+ * Metric name prefixes to drop entirely: MetricsHub's internal job telemetry
+ * (how long its own collection jobs took) — monitoring-of-the-monitor, with
+ * no diagnostic value for the monitored host itself.
+ */
+const METRIC_NAME_PREFIXES_TO_REMOVE = ["metricshub.job."];
+
+/**
+ * Monitor attribute keys that only exist for machine correlation (identifier
+ * plumbing) and carry no diagnostic value for the model. Human-meaningful
+ * attributes (mountpoint, filesystem type, sensor location, serial number,
+ * vendor, ...) are kept — this is a denylist, not an allowlist.
+ */
+const MONITOR_ATTRIBUTES_TO_REMOVE = [
+	"id",
+	"entityTypeId",
+	"connector_id",
+	"hw.parent.id",
+	"parent.id",
+];
+
+/**
  * Boolean flags to remove when false (they add no information).
  */
 const FALSE_FLAGS_TO_REMOVE = ["connector", "endpoint", "endpointHost", "is_endpoint"];
@@ -583,7 +604,42 @@ function compressMetrics(metrics) {
 
 	const compressed = {};
 	for (const [metricName, metricData] of Object.entries(metrics)) {
+		if (METRIC_NAME_PREFIXES_TO_REMOVE.some((prefix) => metricName.startsWith(prefix))) {
+			continue;
+		}
 		compressed[metricName] = compressMetric(metricData);
+	}
+
+	return compressed;
+}
+
+/**
+ * Compress a monitor's attributes object: drop identifier plumbing and
+ * names that are already embedded in entityName.
+ * @param {Object} attributes - Monitor attributes
+ * @returns {Object} Compressed attributes
+ */
+function compressAttributes(attributes) {
+	if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) {
+		return attributes;
+	}
+
+	const entityName = typeof attributes.entityName === "string" ? attributes.entityName : null;
+	const compressed = {};
+
+	for (const [key, value] of Object.entries(attributes)) {
+		if (MONITOR_ATTRIBUTES_TO_REMOVE.includes(key)) {
+			continue;
+		}
+		// instanceName/name usually duplicate a substring of entityName
+		if (
+			(key === "instanceName" || key === "name") &&
+			typeof value === "string" &&
+			entityName?.includes(value)
+		) {
+			continue;
+		}
+		compressed[key] = value;
 	}
 
 	return compressed;
@@ -604,6 +660,20 @@ function compressMonitor(monitor) {
 	for (const [key, value] of Object.entries(monitor)) {
 		// Skip fields we want to remove
 		if (MONITOR_FIELDS_TO_REMOVE.includes(key)) {
+			continue;
+		}
+
+		// The literal type "monitor" is tautological (real types like "cpu" are kept)
+		if (key === "type" && value === "monitor") {
+			continue;
+		}
+
+		// Strip identifier plumbing from attributes
+		if (key === "attributes" && value && typeof value === "object") {
+			const compressedAttributes = compressAttributes(value);
+			if (compressedAttributes && Object.keys(compressedAttributes).length > 0) {
+				compressed[key] = compressedAttributes;
+			}
 			continue;
 		}
 
@@ -655,8 +725,18 @@ function compressMcpTelemetry(data) {
 
 	for (const [key, value] of Object.entries(data)) {
 		if (key === "monitors" && Array.isArray(value)) {
-			// Compress each monitor in the array
+			// Legacy shape: monitors as a flat array
 			result[key] = value.map(compressMonitor);
+		} else if (key === "monitors" && typeof value === "object" && value !== null) {
+			// Current MetricsHub shape: monitors keyed by monitor type
+			// (file_system, cpu, memory, ...), each an array of monitor instances
+			const compressedMonitors = {};
+			for (const [monitorType, instances] of Object.entries(value)) {
+				compressedMonitors[monitorType] = Array.isArray(instances)
+					? instances.map(compressMonitor)
+					: compressMcpTelemetry(instances);
+			}
+			result[key] = compressedMonitors;
 		} else if (typeof value === "object" && value !== null) {
 			// Recurse into nested objects
 			result[key] = compressMcpTelemetry(value);
