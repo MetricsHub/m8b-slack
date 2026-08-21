@@ -14,6 +14,8 @@ const ENV_KEYS = [
 	"OLLAMA_CONTEXT_LENGTH",
 	"OLLAMA_CONTEXT_WINDOW",
 	"OLLAMA_MAX_OUTPUT_TOKENS",
+	"OLLAMA_VISION_MODEL",
+	"OLLAMA_VISION_MAX_OUTPUT_TOKENS",
 ];
 
 describe("provider selection", () => {
@@ -66,8 +68,19 @@ describe("provider selection", () => {
 			codeInterpreter: false,
 			hostedWebSearch: false,
 			providerFileUploads: false,
+			imageDescriptions: false,
 			toolNamespaces: false,
 		});
+	});
+
+	it("enables image descriptions when a vision model is configured", () => {
+		process.env.AI_PROVIDER = "ollama";
+		process.env.OLLAMA_VISION_MODEL = "qwen3-vl:8b-instruct-8k";
+
+		const provider = getProvider();
+		expect(provider.capabilities.imageDescriptions).toBe(true);
+		expect(getOllamaConfig().visionModel).toBe("qwen3-vl:8b-instruct-8k");
+		expect(getOllamaConfig().visionMaxOutputTokens).toBe(600);
 	});
 
 	it("uses a dummy API key for Ollama by default", () => {
@@ -287,6 +300,104 @@ describe("Ollama context-length detection", () => {
 		expect(health.ok).toBe(true);
 		expect(provider.contextWindow).toBe(32768);
 		expect(health.detail).toContain("configured");
+	});
+});
+
+describe("Ollama vision model", () => {
+	const savedFetch = global.fetch;
+	const savedEnv = {};
+
+	beforeEach(() => {
+		for (const key of ENV_KEYS) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		process.env.AI_PROVIDER = "ollama";
+		process.env.OLLAMA_MODEL = "qwen3.8:27b";
+		process.env.OLLAMA_VISION_MODEL = "qwen3-vl:8b-instruct-8k";
+		resetProviderCache();
+	});
+
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+		global.fetch = savedFetch;
+		resetProviderCache();
+	});
+
+	function mockModelsEndpoint(models) {
+		global.fetch = jest.fn(async (url) => {
+			const target = String(url);
+			if (target.endsWith("/v1/models")) {
+				return { ok: true, json: async () => ({ data: models.map((id) => ({ id })) }) };
+			}
+			if (target.endsWith("/api/generate") || target.endsWith("/api/ps")) {
+				return { ok: true, json: async () => ({ models: [] }) };
+			}
+			if (target.endsWith("/api/show")) {
+				return { ok: true, json: async () => ({ parameters: "" }) };
+			}
+			throw new Error(`Unexpected fetch: ${target}`);
+		});
+	}
+
+	it("describes an image through /v1/chat/completions with the vision model", async () => {
+		const provider = getProvider();
+		const create = jest.fn(async () => ({
+			choices: [{ message: { content: "  A red error dialog: DISK FULL on SRV-01.  " } }],
+		}));
+		provider.client.chat = { completions: { create } };
+
+		const description = await provider.describeImage({
+			buffer: Buffer.from("fake-png-bytes"),
+			mimetype: "image/png",
+			fileName: "error.png",
+			contextText: "user: my backup job failed tonight",
+		});
+
+		expect(description).toBe("A red error dialog: DISK FULL on SRV-01.");
+		expect(create).toHaveBeenCalledTimes(1);
+		const request = create.mock.calls[0][0];
+		expect(request.model).toBe("qwen3-vl:8b-instruct-8k");
+		expect(request.max_tokens).toBe(600);
+		expect(request.stream).toBeUndefined();
+
+		const userContent = request.messages.find((m) => m.role === "user").content;
+		expect(userContent.find((c) => c.type === "text").text).toContain("my backup job failed");
+		expect(userContent.find((c) => c.type === "image_url").image_url.url).toBe(
+			`data:image/png;base64,${Buffer.from("fake-png-bytes").toString("base64")}`
+		);
+	});
+
+	it("throws when the vision model returns no description", async () => {
+		const provider = getProvider();
+		provider.client.chat = {
+			completions: { create: jest.fn(async () => ({ choices: [{ message: { content: "" } }] })) },
+		};
+
+		await expect(
+			provider.describeImage({
+				buffer: Buffer.from("x"),
+				mimetype: "image/png",
+				fileName: "blank.png",
+			})
+		).rejects.toThrow(/no description/);
+	});
+
+	it("health check reports the vision model and warns when it is missing", async () => {
+		mockModelsEndpoint(["qwen3.8:27b", "qwen3-vl:8b-instruct-8k"]);
+		let health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.detail).toContain('vision model "qwen3-vl:8b-instruct-8k" available');
+		expect(health.warning).toBeUndefined();
+
+		resetProviderCache();
+		mockModelsEndpoint(["qwen3.8:27b"]);
+		health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.warning).toContain("OLLAMA_VISION_MODEL");
 	});
 });
 

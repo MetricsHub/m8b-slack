@@ -69,5 +69,11 @@ Append to `SCENARIOS` in [`scenarios.js`](scenarios.js):
 	timeoutMs: 180000,              // per turn
 	liveOnly: true,                 // optional: skip in the Slack round-trip
 	verifyLive: async () => [],     // optional: deterministic post-checks (test:live, local KB only)
+	files: [{ fixture: "x.png", name: "x.png", mimetype: "image/png" }],
+	//                              // optional: attachments on the first prompt, served from
+	//                              // e2e/fixtures/ over a local HTTP server (test:live only)
 }
 ```
+
+The `screenshot-analysis` scenario exercises the vision pipeline (Ollama mode) and is skipped
+unless `OLLAMA_VISION_MODEL` is set.

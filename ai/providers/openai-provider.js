@@ -26,6 +26,7 @@ export function createOpenAiProvider() {
 			codeInterpreter: true,
 			hostedWebSearch: true,
 			providerFileUploads: true,
+			imageDescriptions: false,
 			toolNamespaces: true,
 		},
 		buildRequest(params) {

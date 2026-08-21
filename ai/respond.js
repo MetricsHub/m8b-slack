@@ -26,6 +26,7 @@ import { processCitations } from "./services/citations.js";
 import { trimToContextBudget } from "./services/context-budget.js";
 import {
 	buildConversationInput,
+	buildVisionContext,
 	findLastBotMessage,
 	summarizeConversationHistory,
 } from "./services/context-manager.js";
@@ -45,6 +46,7 @@ import {
 	recoverFromTerminated,
 } from "./services/openai.js";
 import {
+	createDescribingFileUploadManager,
 	createFileUploadManager,
 	createNoopFileUploadManager,
 	extractPreviousUploads,
@@ -192,14 +194,24 @@ export async function respond({
 		});
 		const messages = thread.messages || [];
 
-		// Set up file upload manager (no-op when the provider has no Files API)
+		// Set up file upload manager: real uploads (OpenAI Files API), vision
+		// descriptions (local vision model), or no-op (attachments become notes)
 		const previousUploads = extractPreviousUploads(messages);
 		const fileManager = provider.capabilities.providerFileUploads
 			? createFileUploadManager(previousUploads, logger)
-			: createNoopFileUploadManager(logger);
+			: provider.capabilities.imageDescriptions
+				? createDescribingFileUploadManager({
+						describeImage: (params) => provider.describeImage(params),
+						contextText: buildVisionContext(messages, message),
+						logger,
+					})
+				: createNoopFileUploadManager(logger);
 
-		// Upload all files from thread
-		if (!fileManager.disabled) {
+		// Upload all files from thread (providers with a Files API only: uploads
+		// must exist before the tools array is built so code_interpreter sees
+		// them; the describing manager is invoked lazily instead, so cached
+		// conversation turns never re-run the vision model)
+		if (provider.capabilities.providerFileUploads) {
 			for (const msg of messages) {
 				const files = Array.isArray(msg.files) ? msg.files : [];
 				for (const file of files) {

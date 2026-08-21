@@ -18,8 +18,10 @@
  * @property {boolean} capabilities.codeInterpreter - Hosted code_interpreter
  * @property {boolean} capabilities.hostedWebSearch - Hosted web_search tool
  * @property {boolean} capabilities.providerFileUploads - Files API for Slack attachments
+ * @property {boolean} capabilities.imageDescriptions - Sidecar vision model describes image attachments as text
  * @property {boolean} capabilities.toolNamespaces - Deferred tool_search namespaces
  * @property {Function} buildRequest - Build a Responses API streaming request
+ * @property {Function} [describeImage] - Describe an image attachment as text (imageDescriptions providers)
  * @property {Function} healthCheck - Async health check: {ok, detail?, error?}
  */
 

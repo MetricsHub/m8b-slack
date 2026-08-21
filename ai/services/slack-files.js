@@ -37,19 +37,16 @@ export function buildOpenAIFileContentItem({ fileId, fileName, mimetype }) {
 }
 
 /**
- * Download a Slack file and upload to OpenAI as user_data.
+ * Download a Slack file's bytes using the bot token.
  *
  * @param {Object} file - Slack file object
- * @param {Object} _logger - Logger instance
- * @returns {Promise<{contentItem: Object|null, fileId: string}|null>}
+ * @returns {Promise<{buffer: Buffer, fileName: string, mimetype: string}|null>}
  */
-export async function slackFileToOpenAIContent(file, _logger) {
+export async function downloadSlackFile(file) {
 	const url = file.url_private_download || file.url_private;
 	if (!url) return null;
 
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-"));
 	const fileName = file.name || `slack-file-${file.id || Date.now()}`;
-	const tmpPath = path.join(tmpDir, fileName);
 
 	const headers = {
 		Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
@@ -77,7 +74,24 @@ export async function slackFileToOpenAIContent(file, _logger) {
 	}
 
 	const ab = await res.arrayBuffer();
-	await fsp.writeFile(tmpPath, Buffer.from(ab));
+	return { buffer: Buffer.from(ab), fileName, mimetype: file.mimetype || "" };
+}
+
+/**
+ * Download a Slack file and upload to OpenAI as user_data.
+ *
+ * @param {Object} file - Slack file object
+ * @param {Object} _logger - Logger instance
+ * @returns {Promise<{contentItem: Object|null, fileId: string}|null>}
+ */
+export async function slackFileToOpenAIContent(file, _logger) {
+	const downloaded = await downloadSlackFile(file);
+	if (!downloaded) return null;
+
+	const { buffer, fileName } = downloaded;
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-"));
+	const tmpPath = path.join(tmpDir, fileName);
+	await fsp.writeFile(tmpPath, buffer);
 
 	const uploaded = await openai.files.create({
 		file: fs.createReadStream(tmpPath),
@@ -100,6 +114,22 @@ export async function slackFileToOpenAIContent(file, _logger) {
 }
 
 /**
+ * Stable per-conversation cache key for a Slack file object.
+ *
+ * @param {Object} file - Slack file object
+ * @returns {string}
+ */
+function fileCacheKey(file) {
+	return (
+		file.id ||
+		file.url_private_download ||
+		file.url_private ||
+		file.permalink ||
+		`${file.name}-${file.timestamp || ""}`
+	);
+}
+
+/**
  * Creates a file upload manager for caching uploads within a conversation.
  *
  * @param {Map<string, string>} previousUploads - Map of slack_file_id -> openai_file_id
@@ -119,12 +149,7 @@ export function createFileUploadManager(previousUploads, logger) {
 	 * @returns {Promise<{contentItem: Object|null, fileId: string}|null>}
 	 */
 	async function uploadOnce(file) {
-		const key =
-			file.id ||
-			file.url_private_download ||
-			file.url_private ||
-			file.permalink ||
-			`${file.name}-${file.timestamp || ""}`;
+		const key = fileCacheKey(file);
 
 		if (cache.has(key)) {
 			return cache.get(key);
@@ -215,6 +240,84 @@ export function createNoopFileUploadManager(logger) {
 			}
 			return null;
 		},
+	};
+}
+
+/**
+ * Create a file "upload" manager that turns image attachments into text
+ * descriptions using a local vision model (Ollama mode with OLLAMA_VISION_MODEL).
+ *
+ * Exposes the same interface as createFileUploadManager, but instead of
+ * uploading, uploadOnce returns an input_text content item carrying the vision
+ * model's description of the image. Descriptions end up embedded in the stored
+ * conversation input, so each image is described once per store lifetime.
+ * Non-image files (and failed descriptions) degrade to a bracketed text note.
+ *
+ * @param {Object} params
+ * @param {Function} params.describeImage - Provider hook: async ({buffer, mimetype, fileName, contextText}) => string
+ * @param {string} [params.contextText] - Short conversation-context snippet for the vision prompt
+ * @param {Object} [params.logger] - Logger instance
+ * @returns {Object} Upload manager with uploadOnce method and state
+ */
+export function createDescribingFileUploadManager({ describeImage, contextText, logger }) {
+	const cache = new Map(); // key -> { contentItem, fileId }
+
+	function note(text) {
+		return { contentItem: { type: "input_text", text }, fileId: null };
+	}
+
+	async function uploadOnce(file) {
+		const key = fileCacheKey(file);
+		if (cache.has(key)) {
+			return cache.get(key);
+		}
+
+		const fileName = file.name || "unknown";
+		let result;
+
+		if (!String(file.mimetype || "").startsWith("image/")) {
+			result = note(
+				`[Attached file "${fileName}" (${file.mimetype || "unknown type"}) — only images can be analyzed on the local AI backend.]`
+			);
+		} else {
+			try {
+				const downloaded = await downloadSlackFile(file);
+				if (!downloaded) throw new Error("file has no downloadable URL");
+
+				const description = await describeImage({
+					buffer: downloaded.buffer,
+					mimetype: downloaded.mimetype || "image/png",
+					fileName,
+					contextText,
+				});
+
+				result = note(
+					`[Image "${fileName}" attached by the user. It cannot be shown to you directly; a vision model described it as follows:]\n${description}`
+				);
+				logger?.info?.("Described image attachment with the vision model", {
+					name: fileName,
+					descriptionChars: description.length,
+				});
+			} catch (err) {
+				logger?.warn?.("Vision description failed for Slack image", {
+					name: fileName,
+					err: String(err),
+				});
+				result = note(
+					`[Image "${fileName}" attached by the user could not be analyzed (vision backend error). Tell the user you could not look at it.]`
+				);
+			}
+		}
+
+		cache.set(key, result);
+		return result;
+	}
+
+	return {
+		uploadOnce,
+		codeFileIds: new Set(),
+		codeContainerFiles: new Map(),
+		uploadedFilesThisTurn: [],
 	};
 }
 

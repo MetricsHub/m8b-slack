@@ -2,7 +2,45 @@
  * Tests for context manager service.
  */
 
-import { buildConversationInput, findLastBotMessage } from "../context-manager.js";
+import {
+	buildConversationInput,
+	buildVisionContext,
+	findLastBotMessage,
+} from "../context-manager.js";
+
+describe("buildVisionContext", () => {
+	const current = { ts: "5", text: "Here is the screenshot of the error" };
+
+	it("joins the last few messages with the current one", () => {
+		const messages = [
+			{ ts: "1", text: "old message" },
+			{ ts: "2", text: "my backup failed" },
+			{ ts: "5", text: "Here is the screenshot of the error" }, // current, deduped by ts
+		];
+
+		const snippet = buildVisionContext(messages, current);
+
+		expect(snippet).toBe("old message\nmy backup failed\nHere is the screenshot of the error");
+	});
+
+	it("keeps only the most recent messages and caps the length from the start", () => {
+		const messages = Array.from({ length: 10 }, (_, i) => ({
+			ts: String(i),
+			text: `message number ${i} ${"x".repeat(300)}`,
+		}));
+
+		const snippet = buildVisionContext(messages, current, { maxMessages: 4, maxChars: 200 });
+
+		expect(snippet.length).toBeLessThanOrEqual(201); // cap + leading ellipsis
+		expect(snippet.startsWith("…")).toBe(true);
+		expect(snippet).toContain("screenshot of the error"); // current message survives
+	});
+
+	it("handles empty threads", () => {
+		expect(buildVisionContext([], { ts: "1", text: "hello" })).toBe("hello");
+		expect(buildVisionContext([], {})).toBe("");
+	});
+});
 
 describe("findLastBotMessage", () => {
 	const mockContext = {

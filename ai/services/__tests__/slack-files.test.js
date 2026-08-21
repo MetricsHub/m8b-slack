@@ -2,7 +2,12 @@
  * Tests for Slack files service.
  */
 
-import { buildOpenAIFileContentItem, extractPreviousUploads } from "../slack-files.js";
+import { jest } from "@jest/globals";
+import {
+	buildOpenAIFileContentItem,
+	createDescribingFileUploadManager,
+	extractPreviousUploads,
+} from "../slack-files.js";
 
 describe("buildOpenAIFileContentItem", () => {
 	it("uses explicit high detail for technical images", () => {
@@ -38,6 +43,101 @@ describe("buildOpenAIFileContentItem", () => {
 				mimetype: "text/csv",
 			})
 		).toBeNull();
+	});
+});
+
+describe("createDescribingFileUploadManager", () => {
+	const savedFetch = global.fetch;
+
+	const imageFile = {
+		id: "F_IMG",
+		name: "dashboard.png",
+		mimetype: "image/png",
+		url_private_download: "https://files.slack.com/dashboard.png",
+	};
+
+	beforeEach(() => {
+		global.fetch = jest.fn(async () => ({
+			ok: true,
+			status: 200,
+			headers: { get: (name) => (name === "content-type" ? "image/png" : null) },
+			arrayBuffer: async () => Buffer.from("png-bytes").buffer,
+		}));
+	});
+
+	afterEach(() => {
+		global.fetch = savedFetch;
+	});
+
+	it("turns an image into an input_text description content item", async () => {
+		const describeImage = jest.fn(async () => "A CPU graph spiking to 100% at 14:02.");
+		const manager = createDescribingFileUploadManager({
+			describeImage,
+			contextText: "user: why is srv-web-01 slow?",
+		});
+
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain('"dashboard.png"');
+		expect(result.contentItem.text).toContain("A CPU graph spiking to 100% at 14:02.");
+		expect(result.fileId).toBeNull();
+
+		expect(describeImage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				mimetype: "image/png",
+				fileName: "dashboard.png",
+				contextText: "user: why is srv-web-01 slow?",
+			})
+		);
+		expect(describeImage.mock.calls[0][0].buffer).toBeInstanceOf(Buffer);
+	});
+
+	it("describes each image only once per conversation turn", async () => {
+		const describeImage = jest.fn(async () => "Description.");
+		const manager = createDescribingFileUploadManager({ describeImage });
+
+		const first = await manager.uploadOnce(imageFile);
+		const second = await manager.uploadOnce(imageFile);
+
+		expect(second).toBe(first);
+		expect(describeImage).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns an unsupported-type note for non-image files without calling the vision model", async () => {
+		const describeImage = jest.fn();
+		const manager = createDescribingFileUploadManager({ describeImage });
+
+		const result = await manager.uploadOnce({
+			id: "F_CSV",
+			name: "hosts.csv",
+			mimetype: "text/csv",
+		});
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("only images can be analyzed");
+		expect(describeImage).not.toHaveBeenCalled();
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it("degrades to an error note when the vision model fails", async () => {
+		const describeImage = jest.fn(async () => {
+			throw new Error("vision backend down");
+		});
+		const manager = createDescribingFileUploadManager({ describeImage });
+
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("could not be analyzed");
+	});
+
+	it("exposes the shared manager interface with empty code-interpreter state", () => {
+		const manager = createDescribingFileUploadManager({ describeImage: async () => "" });
+		expect(manager.codeFileIds.size).toBe(0);
+		expect(manager.codeContainerFiles.size).toBe(0);
+		expect(manager.uploadedFilesThisTurn).toEqual([]);
+		expect(manager.disabled).toBeUndefined();
 	});
 });
 

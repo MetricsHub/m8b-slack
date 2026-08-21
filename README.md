@@ -180,6 +180,7 @@ OLLAMA_BASE_URL=http://dev-nvidia-01:11434/v1
 OLLAMA_MODEL=qwen3.8:27b
 OLLAMA_API_KEY=ollama                  # dummy value required by the OpenAI SDK; Ollama ignores it
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_VISION_MODEL=qwen3-vl:8b-instruct-8k  # optional: describes image attachments (unset = disabled)
 OLLAMA_CONTEXT_LENGTH=32768            # must match Ollama's num_ctx (same name as Ollama's own variable)
 OLLAMA_MAX_OUTPUT_TOKENS=4000
 KNOWLEDGE_BASE_DIR=data/knowledge
@@ -194,6 +195,7 @@ On the Ollama host, pull the models:
 ```bash
 ollama pull qwen3.8:27b
 ollama pull nomic-embed-text
+ollama pull qwen3-vl:8b-instruct-8k   # optional, for screenshot analysis
 ```
 
 ### Ollama mode: conversation state
@@ -251,20 +253,38 @@ Indexing is incremental where it can be:
   the model dismisses them when they are retrieved, and keep one authoritative overview
   document per topic.
 
+### Ollama mode: screenshots and images
+
+The main chat model is text-only and Ollama's `/v1/responses` API has no image input, so
+image attachments are handled by a sidecar **vision model** (`OLLAMA_VISION_MODEL`, e.g.
+`qwen3-vl:8b-instruct-8k`) called through `/v1/chat/completions`. When a user posts a
+screenshot, the bot downloads it from Slack, asks the vision model for a factual description
+(verbatim text transcription, chart trends, anomalies) — including a short snippet of the
+conversation so the description focuses on what matters — and injects that description into
+the conversation as text. Descriptions are embedded in the per-thread conversation store, so
+each image is described once, not on every stateless turn. Non-image attachments (and vision
+failures) degrade to an explicit "cannot analyze" note. Unset `OLLAMA_VISION_MODEL` to disable
+the feature entirely.
+
+Note the vision model's own context window is separate from the chat model's and is often
+small (8k for `qwen3-vl:8b-instruct-8k`): it must hold the image tokens plus the description,
+which is why the context snippet and the output cap (`OLLAMA_VISION_MAX_OUTPUT_TOKENS`,
+default 600) are kept deliberately tight.
+
 ### Tool availability per provider
 
-| Capability            | OpenAI mode                        | Ollama mode                                                 |
-| --------------------- | ---------------------------------- | ----------------------------------------------------------- |
-| MetricsHub MCP tools  | ✅ (deferred namespaces)           | ✅ (plain function tools)                                   |
-| Prometheus PromQL     | ✅                                 | ✅                                                          |
-| Slack reaction/reply  | ✅                                 | ✅                                                          |
-| Knowledge base search | ✅ hosted `file_search`            | ✅ local `search_knowledge_base` (after `kb:index`)         |
-| Knowledge base writes | ✅ vector store upload             | ✅ local markdown + embeddings                              |
-| Web search            | ✅ hosted `web_search_preview`     | ⚙️ app-side `web_search` via SearXNG or opt-in Ollama cloud |
-| Code Interpreter      | ✅ hosted sandbox                  | ❌ unavailable (no secure local sandbox; see below)         |
-| File/image analysis   | ✅ via OpenAI Files API            | ❌ attachments surfaced as text notes                       |
-| Conversation state    | Server-side `previous_response_id` | Application-side per-thread store                           |
-| Streaming             | ✅                                 | ✅                                                          |
+| Capability            | OpenAI mode                        | Ollama mode                                                                                             |
+| --------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| MetricsHub MCP tools  | ✅ (deferred namespaces)           | ✅ (plain function tools)                                                                               |
+| Prometheus PromQL     | ✅                                 | ✅                                                                                                      |
+| Slack reaction/reply  | ✅                                 | ✅                                                                                                      |
+| Knowledge base search | ✅ hosted `file_search`            | ✅ local `search_knowledge_base` (after `kb:index`)                                                     |
+| Knowledge base writes | ✅ vector store upload             | ✅ local markdown + embeddings                                                                          |
+| Web search            | ✅ hosted `web_search_preview`     | ⚙️ app-side `web_search` via SearXNG or opt-in Ollama cloud                                             |
+| Code Interpreter      | ✅ hosted sandbox                  | ❌ unavailable (no secure local sandbox; see below)                                                     |
+| File/image analysis   | ✅ via OpenAI Files API            | ⚙️ images described by a local vision model (`OLLAMA_VISION_MODEL`); other types surfaced as text notes |
+| Conversation state    | Server-side `previous_response_id` | Application-side per-thread store                                                                       |
+| Streaming             | ✅                                 | ✅                                                                                                      |
 
 **Code Interpreter in Ollama mode:** running model-generated code requires a proper isolated
 sandbox. Passing generated commands to a shell or `eval()` on the Slackbot host would be a

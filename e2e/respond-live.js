@@ -12,6 +12,9 @@
  */
 
 import "dotenv/config";
+import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
 import { initializeMcpRegistry } from "../ai/mcp_registry.js";
 import { getProvider } from "../ai/providers/index.js";
 import { respond } from "../ai/respond.js";
@@ -62,9 +65,44 @@ function createFakeSlackClient(message) {
 }
 
 /**
+ * Serve scenario fixture files (e2e/fixtures/) over a throwaway local HTTP
+ * server so respond()'s Slack-file download path has a real URL to fetch.
+ * Returns fake Slack file objects plus a close() for the server.
+ *
+ * @param {Array<{fixture: string, name: string, mimetype: string}>} files
+ * @returns {Promise<{slackFiles: Object[], close: Function}>}
+ */
+async function serveScenarioFiles(files) {
+	const server = createServer(async (req, res) => {
+		const fixture = files.find((f) => req.url === `/${f.fixture}`);
+		if (!fixture) {
+			res.writeHead(404).end();
+			return;
+		}
+		const bytes = await readFile(
+			fileURLToPath(new URL(`./fixtures/${fixture.fixture}`, import.meta.url))
+		);
+		res.writeHead(200, { "Content-Type": fixture.mimetype });
+		res.end(bytes);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+
+	const slackFiles = files.map((f, i) => ({
+		id: `F_E2E_${i}`,
+		name: f.name,
+		mimetype: f.mimetype,
+		url_private_download: `http://127.0.0.1:${port}/${f.fixture}`,
+	}));
+
+	return { slackFiles, close: () => server.close() };
+}
+
+/**
  * Run one scenario through respond() and collect the answer + tool calls.
  * Multi-turn scenarios (prompts array) share one thread; the returned answer
- * is the reply to the last prompt.
+ * is the reply to the last prompt. Scenario `files` are attached to the first
+ * prompt's message, served from e2e/fixtures/ over a local HTTP server.
  *
  * @param {Object} scenario
  * @returns {Promise<{answer: string, toolCalls: string[]}>}
@@ -75,6 +113,8 @@ async function runScenario(scenario) {
 	const toolCalls = [];
 	let answer = "";
 
+	const served = scenario.files?.length ? await serveScenarioFiles(scenario.files) : null;
+
 	const logger = createTestLogger({
 		onEntry: (_level, msg, meta) => {
 			if (msg === "Executed function call" && meta?.name) {
@@ -83,44 +123,49 @@ async function runScenario(scenario) {
 		},
 	});
 
-	for (const [turn, prompt] of prompts.entries()) {
-		if (prompts.length > 1) console.log(`  turn ${turn + 1}: ${prompt}`);
-		const said = [];
+	try {
+		for (const [turn, prompt] of prompts.entries()) {
+			if (prompts.length > 1) console.log(`  turn ${turn + 1}: ${prompt}`);
+			const said = [];
 
-		const message = {
-			channel: FAKE_CHANNEL,
-			thread_ts: threadTs,
-			ts: turn === 0 ? threadTs : fakeSlackTs(),
-			text: prompt,
-			user: FAKE_USER_ID,
-		};
+			const message = {
+				channel: FAKE_CHANNEL,
+				thread_ts: threadTs,
+				ts: turn === 0 ? threadTs : fakeSlackTs(),
+				text: prompt,
+				user: FAKE_USER_ID,
+				...(turn === 0 && served ? { files: served.slackFiles } : {}),
+			};
 
-		const say = async (value) => {
-			const text = typeof value === "string" ? value : value?.text || value?.markdown_text || "";
-			if (text) said.push(text);
-		};
+			const say = async (value) => {
+				const text = typeof value === "string" ? value : value?.text || value?.markdown_text || "";
+				if (text) said.push(text);
+			};
 
-		await Promise.race([
-			respond({
-				client: createFakeSlackClient(message),
-				context: {
-					BOT_USER_ID: FAKE_BOT_USER_ID,
-					BOT_ID: FAKE_BOT_ID,
-					teamId: FAKE_TEAM_ID,
-					userId: FAKE_USER_ID,
-				},
-				logger,
-				message,
-				body: {},
-				payload: {},
-				say,
-				setTitle: async () => {},
-				setStatus: async () => {},
-			}),
-			timeoutAfter(scenario.timeoutMs || 180000),
-		]);
+			await Promise.race([
+				respond({
+					client: createFakeSlackClient(message),
+					context: {
+						BOT_USER_ID: FAKE_BOT_USER_ID,
+						BOT_ID: FAKE_BOT_ID,
+						teamId: FAKE_TEAM_ID,
+						userId: FAKE_USER_ID,
+					},
+					logger,
+					message,
+					body: {},
+					payload: {},
+					say,
+					setTitle: async () => {},
+					setStatus: async () => {},
+				}),
+				timeoutAfter(scenario.timeoutMs || 180000),
+			]);
 
-		answer = said.join("");
+			answer = said.join("");
+		}
+	} finally {
+		served?.close();
 	}
 
 	return { answer, toolCalls };

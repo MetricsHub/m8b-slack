@@ -52,6 +52,7 @@ When a prompt has Slack's special syntax like <@USER_ID> or <#CHANNEL_ID>, you m
  * @param {boolean} [capabilities.codeInterpreter]
  * @param {boolean} [capabilities.hostedFileSearch]
  * @param {boolean} [capabilities.providerFileUploads]
+ * @param {boolean} [capabilities.imageDescriptions] - Images arrive as vision-model text descriptions
  * @param {Object} [options]
  * @param {number} [options.contextWindow] - Hard context window in tokens (local models);
  *   adds guidance about truncated tool outputs
@@ -62,6 +63,7 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 		codeInterpreter = true,
 		hostedFileSearch = true,
 		providerFileUploads = true,
+		imageDescriptions = false,
 	} = capabilities;
 
 	let prompt = SYSTEM_PROMPT;
@@ -74,7 +76,16 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 19. Your context window is limited (${contextWindow} tokens) and large tool outputs are truncated to fit it. For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), query ONE host per call. When a tool result says it was truncated, NEVER guess, assume, or report values for hosts/items missing from the data you actually received — re-query them one at a time, or tell the user their data is missing.`;
 	}
 
-	if (!providerFileUploads) {
+	if (!providerFileUploads && imageDescriptions) {
+		prompt = prompt.replace(
+			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
+			"3. File analysis: When a user attaches an image or screenshot, its content appears in the conversation as a bracketed text description produced by a vision model — treat that description as what the user posted and use it for troubleshooting. Other file types cannot be read in this deployment; say so if a user attaches one."
+		);
+		prompt = prompt.replace(
+			"    * Visual content from any attached files or images",
+			"    * Vision-model descriptions of images attached by the user"
+		);
+	} else if (!providerFileUploads) {
 		prompt = prompt.replace(
 			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
 			"3. File analysis is not available in this deployment. If a user attaches a file, tell them you cannot read attachments right now."

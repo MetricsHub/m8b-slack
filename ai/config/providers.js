@@ -60,6 +60,7 @@ export function defaultToolOutputChars(contextWindow, maxOutputTokens) {
  * Ollama server does not check it.
  *
  * @returns {{baseUrl: string, apiKey: string, model: string, embeddingModel: string,
+ *   visionModel: string, visionMaxOutputTokens: number,
  *   contextWindow: number, maxOutputTokens: number, requestTimeoutMs: number,
  *   maxToolOutputChars: number}}
  */
@@ -81,6 +82,13 @@ export function getOllamaConfig() {
 		apiKey: process.env.OLLAMA_API_KEY || "ollama",
 		model: process.env.OLLAMA_MODEL || "qwen3.8:27b",
 		embeddingModel: process.env.OLLAMA_EMBEDDING_MODEL || "nomic-embed-text",
+		// Optional sidecar vision model used to describe image attachments as text
+		// (e.g. qwen3-vl:8b-instruct-8k). Empty = image descriptions disabled.
+		// Called through /v1/chat/completions: Ollama's /v1/responses has no image input.
+		// Vision models often enforce a small context (8k), so the description
+		// output cap must stay modest to leave room for the image tokens.
+		visionModel: (process.env.OLLAMA_VISION_MODEL || "").trim(),
+		visionMaxOutputTokens: parsePositiveInt(process.env.OLLAMA_VISION_MAX_OUTPUT_TOKENS, 600),
 		contextWindow,
 		maxOutputTokens,
 		requestTimeoutMs: parsePositiveInt(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 300000),

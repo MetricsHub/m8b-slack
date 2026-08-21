@@ -151,6 +151,38 @@ export function findLastBotMessage(messages, context, logger = null) {
 }
 
 /**
+ * Build a short conversation-context snippet for the vision model's describe
+ * prompt: the last few thread messages plus the current one. Kept small on
+ * purpose — the vision model may enforce a tight context window (e.g. 8k for
+ * qwen3-vl:8b-instruct-8k) that must also hold the image tokens.
+ *
+ * @param {Array} messages - Thread messages (Slack shape)
+ * @param {Object} currentMessage - The message being answered
+ * @param {Object} [options]
+ * @param {number} [options.maxMessages] - How many prior messages to include
+ * @param {number} [options.maxChars] - Hard cap on the snippet length
+ * @returns {string} Context snippet ("" when there is no usable text)
+ */
+export function buildVisionContext(
+	messages,
+	currentMessage,
+	{ maxMessages = 4, maxChars = 900 } = {}
+) {
+	const texts = (messages || [])
+		.filter((msg) => msg?.text && msg.ts !== currentMessage?.ts)
+		.slice(-maxMessages)
+		.map((msg) => msg.text);
+
+	if (currentMessage?.text) {
+		texts.push(currentMessage.text);
+	}
+
+	const joined = texts.join("\n").trim();
+	// Truncate from the start: the most recent messages matter most
+	return joined.length > maxChars ? `…${joined.slice(-maxChars)}` : joined;
+}
+
+/**
  * Build input items from thread messages after the last bot response.
  *
  * @param {Array} messages - Thread messages

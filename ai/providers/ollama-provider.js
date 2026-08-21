@@ -139,6 +139,7 @@ export function createOllamaProvider() {
 			codeInterpreter: false,
 			hostedWebSearch: false,
 			providerFileUploads: false,
+			imageDescriptions: Boolean(config.visionModel),
 			toolNamespaces: false,
 		},
 		buildRequest({ input, tools, tool_choice }) {
@@ -156,6 +157,62 @@ export function createOllamaProvider() {
 			}
 
 			return request;
+		},
+		/**
+		 * Describe an image attachment with the sidecar vision model, via
+		 * /v1/chat/completions (Ollama's /v1/responses does not accept images).
+		 * The vision model typically enforces a small context window (8k for
+		 * qwen3-vl:8b-instruct-8k): the prompt stays short, the conversation
+		 * context snippet is pre-trimmed by the caller, and the output is capped.
+		 *
+		 * @param {Object} params
+		 * @param {Buffer} params.buffer - Raw image bytes
+		 * @param {string} params.mimetype - Image MIME type (image/png, image/jpeg, ...)
+		 * @param {string} params.fileName - Original filename (for logging only)
+		 * @param {string} [params.contextText] - Short conversation context snippet
+		 * @returns {Promise<string>} Description text (throws on failure/empty)
+		 */
+		async describeImage({ buffer, mimetype, fileName, contextText }) {
+			if (!config.visionModel) {
+				throw new Error("No vision model configured (OLLAMA_VISION_MODEL)");
+			}
+
+			const instructions =
+				"You are the eyes of an IT support assistant that cannot see images. " +
+				"Describe the attached screenshot factually and completely: transcribe all visible text " +
+				"verbatim (error messages, dialog titles, hostnames, paths, commands, metric names and " +
+				"values, timestamps), and describe charts or graphs (what is plotted, axes, trends, " +
+				"anomalies). Do not guess at causes, do not invent text you cannot read, and do not " +
+				"address the user. Output only the description.";
+
+			const userText = contextText
+				? `Conversation context (orientation only — describe the image, do not answer the user):\n${contextText}`
+				: "Describe the attached image.";
+
+			const response = await client.chat.completions.create({
+				model: config.visionModel,
+				max_tokens: config.visionMaxOutputTokens,
+				temperature: 0.1,
+				messages: [
+					{ role: "system", content: instructions },
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: userText },
+							{
+								type: "image_url",
+								image_url: { url: `data:${mimetype};base64,${buffer.toString("base64")}` },
+							},
+						],
+					},
+				],
+			});
+
+			const description = response?.choices?.[0]?.message?.content?.trim();
+			if (!description) {
+				throw new Error(`Vision model returned no description for "${fileName}"`);
+			}
+			return description;
 		},
 		async healthCheck() {
 			try {
@@ -177,6 +234,18 @@ export function createOllamaProvider() {
 						ok: false,
 						error: `Model "${config.model}" not found on ${config.baseUrl}. Available: ${models.slice(0, 10).join(", ") || "(none)"}. Pull it with: ollama pull ${config.model}`,
 					};
+				}
+
+				// Vision model is optional: a missing one degrades screenshot
+				// handling to a text note, so warn instead of failing the check
+				let visionWarning;
+				let visionDetail = "";
+				if (config.visionModel) {
+					const visionFound = models.some((id) => matchesModel(id, config.visionModel));
+					visionDetail = `, vision model "${config.visionModel}" ${visionFound ? "available" : "MISSING"}`;
+					if (!visionFound) {
+						visionWarning = `Vision model "${config.visionModel}" (OLLAMA_VISION_MODEL) not found on ${config.baseUrl}; image attachments will not be described. Pull it with: ollama pull ${config.visionModel}`;
+					}
 				}
 
 				// Force-load the model: pre-warms it for the first user and lets
@@ -215,8 +284,8 @@ export function createOllamaProvider() {
 
 				return {
 					ok: true,
-					detail: `model "${config.model}" ${modelLoaded ? "loaded" : "available (warm-up failed)"}, ${contextDetail}`,
-					warning,
+					detail: `model "${config.model}" ${modelLoaded ? "loaded" : "available (warm-up failed)"}, ${contextDetail}${visionDetail}`,
+					warning: [warning, visionWarning].filter(Boolean).join(" ") || undefined,
 				};
 			} catch (e) {
 				return {

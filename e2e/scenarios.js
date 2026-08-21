@@ -19,6 +19,9 @@
  * - skipUnlessEnv: optional env var name; the scenario is skipped when it is not set
  * - liveOnly:      optional; run only in the respond-live harness (e.g. scenarios that
  *                  inspect or clean up local state the Slack round-trip cannot reach)
+ * - files:         optional [{fixture, name, mimetype}] attachments for the FIRST prompt;
+ *                  fixture is a filename under e2e/fixtures/, served to the bot over a
+ *                  local HTTP server (respond-live harness only)
  * - verifyLive:    optional async () => string[] of failures, run by respond-live after
  *                  the scenario (Ollama mode only) for deterministic state checks
  */
@@ -125,6 +128,22 @@ export const SCENARIOS = [
 			"corrected with the new date (March 2027). It must not claim it cannot store knowledge.",
 		timeoutMs: 300000,
 		verifyLive: verifyKbUpdate,
+	},
+	{
+		name: "screenshot-analysis",
+		liveOnly: true,
+		prompt:
+			"I just got this error popup on one of our servers — screenshot attached. What is going on?",
+		files: [{ fixture: "backup-error.png", name: "backup-error.png", mimetype: "image/png" }],
+		judge:
+			"The answer shows the assistant actually saw the screenshot content: it must mention at " +
+			"least one concrete detail from the image — the full disk (C: drive / 0 bytes free), the " +
+			"failed backup job BKP-4412, or the host SRV-WEB-01. It must NOT claim it cannot view " +
+			"images or ask the user to paste the error as text.",
+		// Requires a vision backend: OLLAMA_VISION_MODEL in Ollama mode (OpenAI mode
+		// reads images natively, but this dev harness gates on the local setup)
+		skipUnlessEnv: "OLLAMA_VISION_MODEL",
+		timeoutMs: 300000,
 	},
 	{
 		name: "honest-about-capabilities",
