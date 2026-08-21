@@ -11,7 +11,9 @@ import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
 import { estimatePayloadTokens, PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
+import { executePython } from "./code-sandbox.js";
 import { openai } from "./openai.js";
+import { uploadGeneratedFilesToSlack } from "./slack-files.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
 import { executeWebSearch } from "./web-search.js";
 
@@ -47,6 +49,12 @@ export async function processFunctionCall(functionCall, context) {
 		logger,
 		openaiClient: providerFileUploads ? openai : null,
 		fileTracking: providerFileUploads ? fileTracking : null,
+		// Without a Files API, large outputs are staged for the local Python
+		// sandbox instead (read back with run_python from /data/)
+		sandboxFiles:
+			!providerFileUploads && provider?.capabilities?.localCodeInterpreter
+				? fileTracking?.sandboxFiles
+				: null,
 	};
 
 	try {
@@ -72,6 +80,13 @@ export async function processFunctionCall(functionCall, context) {
 			// Application-side web search (Ollama mode)
 			case "web_search":
 				output = await executeWebSearch(args, logger);
+				break;
+
+			// Local Python sandbox (Ollama mode replacement for code_interpreter)
+			case "run_python":
+				output = provider?.capabilities?.localCodeInterpreter
+					? await handleRunPython(args, { client, message, fileTracking, logger })
+					: { ok: false, error: "run_python is not available for this provider" };
 				break;
 
 			// Local knowledge base retrieval (Ollama mode)
@@ -263,6 +278,69 @@ async function handleSlackReply(args, say, logger) {
 
 	logger?.debug?.("slack_add_reply called without text argument");
 	return { ok: false, error: "No text provided" };
+}
+
+/**
+ * Handle run_python: execute LLM-written Python in the local Pyodide sandbox
+ * and deliver any files it wrote to /outputs straight to the Slack thread.
+ *
+ * @param {Object} args - Tool arguments ({code})
+ * @param {Object} context - {client, message, fileTracking, logger}
+ * @returns {Promise<Object>} Model-facing execution summary
+ */
+async function handleRunPython(args, { client, message, fileTracking, logger }) {
+	const code = String(args.code || "");
+	if (!code.trim()) {
+		return { ok: false, error: "No Python code provided" };
+	}
+
+	// Files staged during this turn (large tool outputs) appear under /data/
+	const sandboxFiles =
+		fileTracking?.sandboxFiles instanceof Map ? fileTracking.sandboxFiles : new Map();
+	const inputFiles = [...sandboxFiles.entries()].map(([name, data]) => ({ name, data }));
+
+	const execution = await executePython({ code, inputFiles, logger });
+
+	logger?.info?.("[SANDBOX] run_python finished", {
+		ok: execution.ok,
+		durationMs: execution.durationMs,
+		outputFiles: execution.outputFiles.map((f) => f.name),
+		stdoutChars: execution.stdout.length,
+		stderrChars: execution.stderr.length,
+	});
+
+	const summary = { ok: execution.ok };
+	if (execution.error) summary.error = execution.error;
+	if (execution.stdout) summary.stdout = execution.stdout;
+	if (execution.stderr) summary.stderr = execution.stderr;
+	if (execution.result) summary.result = execution.result;
+	if (execution.skippedFiles?.length) {
+		summary.skippedFiles = execution.skippedFiles;
+		summary.skippedHint = "These output files exceeded the size cap and were NOT delivered.";
+	}
+	if (inputFiles.length > 0) {
+		summary.inputFilesAvailable = inputFiles.map((file) => `/data/${file.name}`);
+	}
+
+	if (execution.outputFiles.length > 0) {
+		const uploaded = await uploadGeneratedFilesToSlack(
+			execution.outputFiles,
+			client,
+			message.channel,
+			message.thread_ts,
+			logger
+		);
+		if (uploaded) {
+			summary.filesDeliveredToSlack = execution.outputFiles.map((file) => file.name);
+			summary.note =
+				"The generated files were already posted to the Slack thread. Confirm the file names to the user; NEVER mention sandbox paths (/outputs/, /data/) or download links.";
+		} else {
+			summary.ok = false;
+			summary.error = `${summary.error ? `${summary.error}; ` : ""}the generated files could not be posted to Slack`;
+		}
+	}
+
+	return summary;
 }
 
 /**

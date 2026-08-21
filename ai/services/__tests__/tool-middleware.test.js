@@ -705,6 +705,104 @@ describe("executeWithMiddleware (telemetry Markdown inline output)", () => {
 	});
 });
 
+describe("executeWithMiddleware (local Python sandbox staging)", () => {
+	beforeEach(() => {
+		clearCache();
+	});
+
+	function makeLargeOutput(count = 500) {
+		return {
+			ok: true,
+			items: Array.from({ length: count }, (_, i) => ({
+				hostname: `srv-${i}`,
+				padding: "x".repeat(100),
+			})),
+		};
+	}
+
+	it("stages large outputs for run_python and points the model at /data", async () => {
+		const sandboxFiles = new Map();
+
+		const output = await executeWithMiddleware("ListHosts", {}, async () => makeLargeOutput(), {
+			sandboxFiles,
+		});
+
+		expect(sandboxFiles.size).toBe(1);
+		const [fileName, content] = [...sandboxFiles.entries()][0];
+		expect(fileName).toMatch(/^ListHosts_\d+\.json$/);
+		expect(JSON.parse(content).items).toHaveLength(500);
+
+		expect(output._file.fileName).toBe(fileName);
+		expect(output._file.fileId).toBeUndefined();
+		expect(output._file.hint).toContain(`/data/${fileName}`);
+		expect(output._file.hint).toContain("run_python");
+		expect(output._file.hint).not.toContain("code_interpreter");
+	});
+
+	it("does not stage small outputs", async () => {
+		const sandboxFiles = new Map();
+
+		const output = await executeWithMiddleware(
+			"ListHosts",
+			{},
+			async () => ({ ok: true, hosts: [{ hostname: "ecs1-01" }] }),
+			{ sandboxFiles }
+		);
+
+		expect(sandboxFiles.size).toBe(0);
+		expect(output._file).toBeUndefined();
+	});
+
+	it("mentions the sandbox file in telemetry Markdown output", async () => {
+		const sandboxFiles = new Map();
+
+		// Grow the fixture over the staging threshold with extra file systems
+		const fixture = makeMarkdownFixture();
+		const monitors = fixture.results[0].result.hosts[0].response.telemetry.monitors;
+		monitors.file_system = Array.from({ length: 200 }, (_, i) => ({
+			attributes: { entityName: `/mnt/vol-${i}`, mountpoint: `/mnt/vol-${i}` },
+			metrics: { "system.filesystem.usage{state=used}": 1000 + i },
+		}));
+
+		const output = await executeWithMiddleware(
+			"GetMetricsFromCacheForHost",
+			{ hostname: "ecs1-01" },
+			async () => fixture,
+			{ sandboxFiles }
+		);
+
+		expect(typeof output).toBe("string");
+		expect(sandboxFiles.size).toBe(1);
+		expect(output).toContain("run_python");
+		expect(output).not.toContain("code_interpreter");
+	});
+
+	it("re-stages the file when a cached result is paginated in a later message", async () => {
+		const firstTurn = new Map();
+		const executor = jest.fn(async () => makeLargeOutput(300));
+
+		const first = await executeWithMiddleware("ListHosts", { maxResults: 50 }, executor, {
+			sandboxFiles: firstTurn,
+		});
+		expect(firstTurn.size).toBe(1);
+		const fileName = first._file.fileName;
+
+		// Next Slack message: fresh sandboxFiles map, same cacheId
+		const secondTurn = new Map();
+		const second = await executeWithMiddleware(
+			"ListHosts",
+			{ _cacheId: first._cacheId, offset: 50, maxResults: 50 },
+			executor,
+			{ sandboxFiles: secondTurn }
+		);
+
+		expect(executor).toHaveBeenCalledTimes(1); // served from cache
+		expect(secondTurn.has(fileName)).toBe(true);
+		expect(second._file.fileName).toBe(fileName);
+		expect(second._file.hint).toContain("run_python");
+	});
+});
+
 describe("telemetryToMarkdown (summary instances and value compaction)", () => {
 	/** A monitor type with 3 real instances plus MetricsHub's summary instance. */
 	function makeSummaryFixture() {

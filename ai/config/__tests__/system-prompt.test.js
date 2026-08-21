@@ -21,4 +21,43 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Vision-model descriptions of images attached by the user");
 		expect(prompt).not.toContain("File analysis is not available in this deployment");
 	});
+
+	it("points file creation at run_python when the local sandbox replaces code_interpreter", () => {
+		const prompt = buildSystemPrompt({ codeInterpreter: false, localCodeInterpreter: true });
+		expect(prompt).toContain("run_python");
+		expect(prompt).toContain("automatically posted to Slack");
+		expect(prompt).not.toContain("use code_interpreter to create them");
+		expect(prompt).not.toContain("You cannot create or generate downloadable files");
+	});
+
+	it("combines vision descriptions with run_python data-file staging", () => {
+		const prompt = buildSystemPrompt({
+			providerFileUploads: false,
+			imageDescriptions: true,
+			localCodeInterpreter: true,
+		});
+		expect(prompt).toContain("bracketed text description produced by a vision model");
+		expect(prompt).toContain("staged for the run_python tool");
+		expect(prompt).toContain("/data/");
+		expect(prompt).not.toContain("Other file types cannot be read in this deployment");
+		expect(prompt).toContain("contents of data files attached by the user");
+	});
+
+	it("offers run_python data-file staging even without a vision model", () => {
+		const prompt = buildSystemPrompt({
+			providerFileUploads: false,
+			imageDescriptions: false,
+			localCodeInterpreter: true,
+		});
+		expect(prompt).toContain("staged for the run_python tool");
+		expect(prompt).toContain("Images cannot be viewed in this deployment");
+		expect(prompt).not.toContain("File analysis is not available in this deployment");
+		expect(prompt).toContain("Contents of data files attached by the user");
+	});
+
+	it("says file creation is unavailable without any code tool", () => {
+		const prompt = buildSystemPrompt({ codeInterpreter: false, localCodeInterpreter: false });
+		expect(prompt).toContain("You cannot create or generate downloadable files");
+		expect(prompt).not.toContain("run_python");
+	});
 });

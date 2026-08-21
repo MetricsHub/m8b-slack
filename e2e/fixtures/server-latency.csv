@@ -1,0 +1,5 @@
+host,latency_ms
+srv-web-01,120
+srv-web-02,180
+srv-db-01,240
+srv-cache-01,260

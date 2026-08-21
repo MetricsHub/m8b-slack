@@ -6,6 +6,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { getCodeSandboxConfig } from "../config/providers.js";
+import { sanitizeSandboxFileName } from "./code-sandbox.js";
 import { openai } from "./openai.js";
 
 /**
@@ -211,35 +213,156 @@ export function createFileUploadManager(previousUploads, logger) {
 		codeFileIds,
 		codeContainerFiles,
 		uploadedFilesThisTurn,
+		sandboxFiles: new Map(),
 	};
 }
 
 /**
- * Create a disabled file upload manager for providers without a Files API
- * (Ollama mode). Exposes the same interface as createFileUploadManager but
- * never uploads anything; attachments are surfaced to the model as text notes
- * by the caller instead.
+ * Create a helper that downloads non-image Slack attachments and stages their
+ * bytes into the local Python sandbox staging map, making them readable with
+ * run_python at /data/<name>. Results are cached per Slack file, so staging
+ * the same attachment from the thread loop and again from the current-message
+ * path downloads it only once per turn.
+ *
+ * @param {Object} params
+ * @param {Map<string, (Buffer|string)>} params.sandboxFiles - Per-turn staging map
+ * @param {number} params.maxBytes - Per-attachment size cap
+ * @param {Object} [params.logger] - Logger instance
+ * @returns {Function} async (file) => {ok, name?, bytes?, reason?}
+ */
+function createAttachmentStager({ sandboxFiles, maxBytes, logger }) {
+	const staged = new Map(); // fileCacheKey -> result
+
+	return async function stage(file) {
+		const key = fileCacheKey(file);
+		if (staged.has(key)) {
+			return staged.get(key);
+		}
+
+		let result;
+		const declaredSize = Number(file.size) || 0;
+		if (declaredSize > maxBytes) {
+			result = { ok: false, reason: `file is too large (${declaredSize} bytes, cap ${maxBytes})` };
+		} else {
+			try {
+				const downloaded = await downloadSlackFile(file);
+				if (!downloaded) throw new Error("file has no downloadable URL");
+				if (downloaded.buffer.length > maxBytes) {
+					throw new Error(`file is too large (${downloaded.buffer.length} bytes, cap ${maxBytes})`);
+				}
+
+				// Resolve staged-name collisions between distinct attachments
+				let name = sanitizeSandboxFileName(downloaded.fileName);
+				if (sandboxFiles.has(name)) {
+					const dot = name.lastIndexOf(".");
+					const [base, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
+					let suffix = 2;
+					while (sandboxFiles.has(`${base}-${suffix}${ext}`)) suffix += 1;
+					name = `${base}-${suffix}${ext}`;
+				}
+
+				sandboxFiles.set(name, downloaded.buffer);
+				result = { ok: true, name, bytes: downloaded.buffer.length };
+				logger?.info?.("Staged Slack attachment for the Python sandbox", {
+					name,
+					bytes: downloaded.buffer.length,
+				});
+			} catch (err) {
+				logger?.warn?.("Failed to stage Slack attachment for the Python sandbox", {
+					name: file?.name,
+					err: String(err),
+				});
+				result = { ok: false, reason: String(err?.message || err) };
+			}
+		}
+
+		staged.set(key, result);
+		return result;
+	};
+}
+
+/**
+ * Text note describing a staged (or unstageable) data attachment.
+ */
+function stagedAttachmentNote(file, stagedResult) {
+	const label = `"${file.name || "unknown"}" (${file.mimetype || "unknown type"})`;
+	return stagedResult.ok
+		? `[Attached file ${label}, ${stagedResult.bytes} bytes — staged for the run_python tool; read it from /data/${stagedResult.name} with Python code.]`
+		: `[Attached file ${label} could not be staged for analysis (${stagedResult.reason}). Tell the user you could not read it.]`;
+}
+
+/**
+ * Create a file upload manager for providers without a Files API (Ollama
+ * mode without a vision model). Exposes the same interface as
+ * createFileUploadManager but never uploads anything.
+ *
+ * With stageAttachments (localCodeInterpreter providers), non-image
+ * attachments are downloaded and staged into the Python sandbox, and
+ * uploadOnce returns a text note pointing the model at /data/<name>; images
+ * degrade to a cannot-analyze note. Without it, the manager is fully disabled
+ * and the caller surfaces attachments as unsupported.
  *
  * @param {Object} [logger] - Logger instance
- * @returns {Object} Upload manager with a no-op uploadOnce method
+ * @param {Object} [options]
+ * @param {boolean} [options.stageAttachments] - Stage data files for run_python
+ * @returns {Object} Upload manager with uploadOnce (and stageAttachment) methods
  */
-export function createNoopFileUploadManager(logger) {
-	let warned = false;
+export function createNoopFileUploadManager(logger, { stageAttachments = false } = {}) {
+	const sandboxFiles = new Map();
+
+	if (!stageAttachments) {
+		let warned = false;
+		return {
+			disabled: true,
+			codeFileIds: new Set(),
+			codeContainerFiles: new Map(),
+			uploadedFilesThisTurn: [],
+			sandboxFiles,
+			async uploadOnce(file) {
+				if (!warned) {
+					warned = true;
+					logger?.info?.("File uploads are disabled for this AI provider; skipping attachments", {
+						firstFile: file?.name,
+					});
+				}
+				return null;
+			},
+		};
+	}
+
+	const cache = new Map(); // key -> { contentItem, fileId }
+	const stage = createAttachmentStager({
+		sandboxFiles,
+		maxBytes: getCodeSandboxConfig().maxInputFileBytes,
+		logger,
+	});
+
+	async function uploadOnce(file) {
+		const key = fileCacheKey(file);
+		if (cache.has(key)) {
+			return cache.get(key);
+		}
+
+		let text;
+		if (String(file.mimetype || "").startsWith("image/")) {
+			text = `[Image "${file.name || "unknown"}" attached by the user cannot be analyzed on the local AI backend (no vision model configured). Tell the user you cannot look at images.]`;
+		} else {
+			text = stagedAttachmentNote(file, await stage(file));
+		}
+
+		const result = { contentItem: { type: "input_text", text }, fileId: null };
+		cache.set(key, result);
+		return result;
+	}
 
 	return {
-		disabled: true,
+		uploadOnce,
+		stageAttachment: (file) =>
+			String(file?.mimetype || "").startsWith("image/") ? Promise.resolve(null) : stage(file),
 		codeFileIds: new Set(),
 		codeContainerFiles: new Map(),
 		uploadedFilesThisTurn: [],
-		async uploadOnce(file) {
-			if (!warned) {
-				warned = true;
-				logger?.info?.("File uploads are disabled for this AI provider; skipping attachments", {
-					firstFile: file?.name,
-				});
-			}
-			return null;
-		},
+		sandboxFiles,
 	};
 }
 
@@ -251,16 +374,33 @@ export function createNoopFileUploadManager(logger) {
  * uploading, uploadOnce returns an input_text content item carrying the vision
  * model's description of the image. Descriptions end up embedded in the stored
  * conversation input, so each image is described once per store lifetime.
- * Non-image files (and failed descriptions) degrade to a bracketed text note.
+ *
+ * Non-image files are staged into the Python sandbox when stageAttachments is
+ * set (localCodeInterpreter providers) — the note points the model at
+ * /data/<name> — and degrade to an unsupported-type note otherwise.
  *
  * @param {Object} params
  * @param {Function} params.describeImage - Provider hook: async ({buffer, mimetype, fileName, contextText}) => string
  * @param {string} [params.contextText] - Short conversation-context snippet for the vision prompt
+ * @param {boolean} [params.stageAttachments] - Stage data files for run_python
  * @param {Object} [params.logger] - Logger instance
- * @returns {Object} Upload manager with uploadOnce method and state
+ * @returns {Object} Upload manager with uploadOnce (and stageAttachment) methods
  */
-export function createDescribingFileUploadManager({ describeImage, contextText, logger }) {
+export function createDescribingFileUploadManager({
+	describeImage,
+	contextText,
+	stageAttachments = false,
+	logger,
+}) {
 	const cache = new Map(); // key -> { contentItem, fileId }
+	const sandboxFiles = new Map();
+	const stage = stageAttachments
+		? createAttachmentStager({
+				sandboxFiles,
+				maxBytes: getCodeSandboxConfig().maxInputFileBytes,
+				logger,
+			})
+		: null;
 
 	function note(text) {
 		return { contentItem: { type: "input_text", text }, fileId: null };
@@ -276,9 +416,11 @@ export function createDescribingFileUploadManager({ describeImage, contextText, 
 		let result;
 
 		if (!String(file.mimetype || "").startsWith("image/")) {
-			result = note(
-				`[Attached file "${fileName}" (${file.mimetype || "unknown type"}) — only images can be analyzed on the local AI backend.]`
-			);
+			result = stage
+				? note(stagedAttachmentNote(file, await stage(file)))
+				: note(
+						`[Attached file "${fileName}" (${file.mimetype || "unknown type"}) — only images can be analyzed on the local AI backend.]`
+					);
 		} else {
 			try {
 				const downloaded = await downloadSlackFile(file);
@@ -315,9 +457,14 @@ export function createDescribingFileUploadManager({ describeImage, contextText, 
 
 	return {
 		uploadOnce,
+		stageAttachment: stage
+			? (file) =>
+					String(file?.mimetype || "").startsWith("image/") ? Promise.resolve(null) : stage(file)
+			: undefined,
 		codeFileIds: new Set(),
 		codeContainerFiles: new Map(),
 		uploadedFilesThisTurn: [],
+		sandboxFiles,
 	};
 }
 
@@ -480,6 +627,56 @@ export async function uploadOpenAIFileToSlack(outputFile, client, channel, threa
 			error: String(e),
 		});
 		return null;
+	}
+}
+
+/**
+ * Upload locally generated files (Python sandbox output) to Slack in a single
+ * message. Unlike uploadOutputFilesToSlack, the bytes are already in memory —
+ * nothing is downloaded from OpenAI.
+ *
+ * @param {Array<{name: string, buffer: Buffer}>} files - Generated files
+ * @param {Object} client - Slack client
+ * @param {string} channel - Slack channel ID
+ * @param {string} thread_ts - Thread timestamp
+ * @param {Object} logger - Logger instance
+ * @returns {Promise<boolean>} True when the upload succeeded
+ */
+export async function uploadGeneratedFilesToSlack(files, client, channel, thread_ts, logger) {
+	if (!files || files.length === 0) {
+		return false;
+	}
+
+	try {
+		logger?.info?.("Uploading sandbox-generated files to Slack", {
+			fileCount: files.length,
+			filenames: files.map((f) => f.name),
+			channel,
+			thread_ts,
+		});
+
+		const result = await client.filesUploadV2({
+			channel_id: channel,
+			thread_ts,
+			file_uploads: files.map((f) => ({ file: f.buffer, filename: f.name })),
+			initial_comment:
+				files.length === 1
+					? "Here's the generated file:"
+					: `Here are ${files.length} generated files:`,
+		});
+
+		const uploadedIds = result?.files?.flatMap((f) => f?.files?.map((sf) => sf?.id) || []) || [];
+		logger?.info?.("Slack upload of generated files successful", {
+			fileCount: files.length,
+			slack_file_ids: uploadedIds,
+		});
+		return true;
+	} catch (e) {
+		logger?.error?.("Failed to upload generated files to Slack", {
+			fileCount: files.length,
+			error: String(e),
+		});
+		return false;
 	}
 }
 

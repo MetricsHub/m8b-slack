@@ -2,7 +2,8 @@
  * Tests for provider-aware function call processing.
  */
 
-import { describe, expect, it, jest } from "@jest/globals";
+import { afterAll, describe, expect, it, jest } from "@jest/globals";
+import { shutdownCodeSandbox } from "../code-sandbox.js";
 import { processFunctionCall } from "../function-calls.js";
 
 const ollamaProvider = {
@@ -30,6 +31,10 @@ function makeContext(overrides = {}) {
 		...overrides,
 	};
 }
+
+afterAll(async () => {
+	await shutdownCodeSandbox();
+});
 
 function parseOutput(items) {
 	expect(items).toHaveLength(1);
@@ -161,6 +166,55 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.results[0].excerpt.length).toBe(100000);
 	});
 
+	it("rejects run_python when the provider has no local code sandbox", async () => {
+		const items = await processFunctionCall(
+			{ name: "run_python", call_id: "call_1", arguments: '{"code":"1+1"}' },
+			makeContext() // ollamaProvider without localCodeInterpreter
+		);
+
+		const output = parseOutput(items);
+		expect(output.ok).toBe(false);
+		expect(output.error).toContain("not available");
+	});
+
+	it("executes run_python and posts generated files to the Slack thread", async () => {
+		const filesUploadV2 = jest.fn(async () => ({
+			files: [{ files: [{ id: "F123" }] }],
+		}));
+		const context = makeContext({
+			client: { filesUploadV2 },
+			message: { channel: "C1", ts: "1.0", thread_ts: "1.0" },
+			provider: {
+				...ollamaProvider,
+				capabilities: { ...ollamaProvider.capabilities, localCodeInterpreter: true },
+			},
+		});
+
+		const items = await processFunctionCall(
+			{
+				name: "run_python",
+				call_id: "call_1",
+				arguments: JSON.stringify({
+					code: "print('sum:', 1 + 2)\nopen('answer.txt', 'w').write('3')",
+				}),
+			},
+			context
+		);
+
+		const output = parseOutput(items);
+		expect(output.ok).toBe(true);
+		expect(output.stdout).toContain("sum: 3");
+		expect(output.filesDeliveredToSlack).toEqual(["answer.txt"]);
+		expect(output.note).toContain("already posted");
+
+		expect(filesUploadV2).toHaveBeenCalledTimes(1);
+		const upload = filesUploadV2.mock.calls[0][0];
+		expect(upload.channel_id).toBe("C1");
+		expect(upload.thread_ts).toBe("1.0");
+		expect(upload.file_uploads[0].filename).toBe("answer.txt");
+		expect(upload.file_uploads[0].file.toString("utf8")).toBe("3");
+	}, 120000);
+
 	it("still executes shared Slack tools", async () => {
 		const context = makeContext();
 		const items = await processFunctionCall(
@@ -191,7 +245,7 @@ describe("processFunctionCall (provider-aware)", () => {
 	it("returns a hint instead of a stack trace for invalid emoji shortcodes", async () => {
 		const context = makeContext();
 		const error = new Error("An API error occurred: invalid_name");
-		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		// @ts-expect-error - mimic Slack WebAPIPlatformError shape
 		error.data = { ok: false, error: "invalid_name" };
 		context.client.reactions.add.mockRejectedValueOnce(error);
 

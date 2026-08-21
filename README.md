@@ -281,17 +281,24 @@ default 600) are kept deliberately tight.
 | Knowledge base search | ✅ hosted `file_search`            | ✅ local `search_knowledge_base` (after `kb:index`)                                                     |
 | Knowledge base writes | ✅ vector store upload             | ✅ local markdown + embeddings                                                                          |
 | Web search            | ✅ hosted `web_search_preview`     | ⚙️ app-side `web_search` via SearXNG or opt-in Ollama cloud                                             |
-| Code Interpreter      | ✅ hosted sandbox                  | ❌ unavailable (no secure local sandbox; see below)                                                     |
-| File/image analysis   | ✅ via OpenAI Files API            | ⚙️ images described by a local vision model (`OLLAMA_VISION_MODEL`); other types surfaced as text notes |
+| Code Interpreter      | ✅ hosted sandbox                  | ⚙️ local Python sandbox (`run_python` via Pyodide/WebAssembly; see below)                               |
+| File/image analysis   | ✅ via OpenAI Files API            | ⚙️ images described by a local vision model (`OLLAMA_VISION_MODEL`); data files staged for `run_python` |
 | Conversation state    | Server-side `previous_response_id` | Application-side per-thread store                                                                       |
 | Streaming             | ✅                                 | ✅                                                                                                      |
 
-**Code Interpreter in Ollama mode:** running model-generated code requires a proper isolated
-sandbox. Passing generated commands to a shell or `eval()` on the Slackbot host would be a
-security hole, so the capability is cleanly marked unavailable: the tool is not offered to the
-model and the system prompt tells it to provide file contents inline instead. Adding local
-parity later would require a dedicated sandbox (e.g. a locked-down container runtime such as
-gVisor/Firecracker, no network, resource limits) exposed as a `code_interpreter` function tool.
+**Code Interpreter in Ollama mode:** the hosted `code_interpreter` is replaced by a local
+`run_python` function tool backed by [Pyodide](https://pyodide.org) (CPython compiled to
+WebAssembly, running in a worker thread). The WASM boundary is the sandbox: the generated code
+sees no host filesystem and no network — only an in-memory virtual filesystem with `/data`
+(inputs staged by the app: user-attached data files, capped by
+`CODE_SANDBOX_MAX_INPUT_FILE_BYTES`, and large tool outputs as JSON) and `/outputs` (files collected
+after the run and posted to the Slack thread). numpy, pandas, matplotlib, and openpyxl load on
+demand (downloaded once by the _host_ — from the Pyodide CDN, plus pinned PyPI wheels for
+openpyxl — then cached in `CODE_SANDBOX_PACKAGE_CACHE_DIR`). Pyodide's `js` interop module — which would expose the host
+JavaScript scope in Node — is stripped from the interpreter at startup, and every execution is
+bounded by a hard timeout (`CODE_SANDBOX_TIMEOUT_MS`, default 60s) enforced with
+`worker.terminate()`. Set `CODE_SANDBOX_ENABLED=false` to disable the tool entirely; the
+system prompt then tells the model to provide file contents inline instead.
 
 **Privacy note:** in Ollama mode, prompts, documents, and tool results never leave your
 network unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends the

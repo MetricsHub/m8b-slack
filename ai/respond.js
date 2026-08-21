@@ -223,17 +223,21 @@ export async function respond({
 		const messages = thread.messages || [];
 
 		// Set up file upload manager: real uploads (OpenAI Files API), vision
-		// descriptions (local vision model), or no-op (attachments become notes)
+		// descriptions (local vision model), or no-op (attachments become notes).
+		// With the local Python sandbox, both Ollama managers also stage data
+		// attachments so run_python can read them from /data/.
 		const previousUploads = extractPreviousUploads(messages);
+		const stageAttachments = provider.capabilities.localCodeInterpreter === true;
 		const fileManager = provider.capabilities.providerFileUploads
 			? createFileUploadManager(previousUploads, logger)
 			: provider.capabilities.imageDescriptions
 				? createDescribingFileUploadManager({
 						describeImage: (params) => provider.describeImage(params),
 						contextText: buildVisionContext(messages, message),
+						stageAttachments,
 						logger,
 					})
-				: createNoopFileUploadManager(logger);
+				: createNoopFileUploadManager(logger, { stageAttachments });
 
 		// Upload all files from thread (providers with a Files API only: uploads
 		// must exist before the tools array is built so code_interpreter sees
@@ -244,6 +248,16 @@ export async function respond({
 				const files = Array.isArray(msg.files) ? msg.files : [];
 				for (const file of files) {
 					await fileManager.uploadOnce(file);
+				}
+			}
+		} else if (fileManager.stageAttachment) {
+			// Re-stage every data attachment in the thread on every turn: the
+			// sandbox staging map only lives for this message, but the notes
+			// persisted in the conversation promise /data/<name> stays readable
+			for (const msg of messages) {
+				const files = Array.isArray(msg.files) ? msg.files : [];
+				for (const file of files) {
+					await fileManager.stageAttachment(file);
 				}
 			}
 		}
@@ -581,6 +595,7 @@ export async function respond({
 						uploadedFiles: fileManager.uploadedFilesThisTurn,
 						codeFileIds: fileManager.codeFileIds,
 						codeContainerFiles: fileManager.codeContainerFiles,
+						sandboxFiles: fileManager.sandboxFiles,
 					},
 					logger,
 				});

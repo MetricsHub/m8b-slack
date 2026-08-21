@@ -3,6 +3,7 @@
  */
 
 export * from "./citations.js";
+export * from "./code-sandbox.js";
 export * from "./context-budget.js";
 export * from "./context-manager.js";
 export * from "./conversation-store.js";

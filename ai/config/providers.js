@@ -54,6 +54,38 @@ export function defaultToolOutputChars(contextWindow, maxOutputTokens) {
 }
 
 /**
+ * Get the local Python code sandbox (Pyodide) configuration.
+ *
+ * The sandbox backs the run_python function tool on providers without a hosted
+ * code_interpreter (Ollama). Enabled by default; set CODE_SANDBOX_ENABLED=false
+ * to turn the tool off entirely.
+ *
+ * @returns {{enabled: boolean, timeoutMs: number, packageCacheDir: string,
+ *   maxOutputFileBytes: number, maxInputFileBytes: number}}
+ */
+export function getCodeSandboxConfig() {
+	return {
+		enabled: (process.env.CODE_SANDBOX_ENABLED || "true").trim().toLowerCase() !== "false",
+		// One execution's wall-clock budget. The first run that imports a package
+		// (numpy, pandas, ...) also downloads it (cached on disk afterwards), so
+		// the default leaves room for a cold package fetch.
+		timeoutMs: parsePositiveInt(process.env.CODE_SANDBOX_TIMEOUT_MS, 60000),
+		// Where Pyodide caches downloaded Python packages between runs/restarts
+		packageCacheDir: process.env.CODE_SANDBOX_PACKAGE_CACHE_DIR || "node_modules/.cache/pyodide",
+		// Total size cap for files a single execution may hand back for Slack upload
+		maxOutputFileBytes: parsePositiveInt(
+			process.env.CODE_SANDBOX_MAX_OUTPUT_FILE_BYTES,
+			20 * 1024 * 1024
+		),
+		// Size cap for a single user attachment staged into /data for run_python
+		maxInputFileBytes: parsePositiveInt(
+			process.env.CODE_SANDBOX_MAX_INPUT_FILE_BYTES,
+			5 * 1024 * 1024
+		),
+	};
+}
+
+/**
  * Get the Ollama backend configuration from environment variables.
  *
  * OLLAMA_API_KEY is a dummy value required by the OpenAI SDK; the local

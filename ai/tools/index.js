@@ -121,14 +121,41 @@ export const KNOWLEDGE_TOOL = {
 };
 
 /**
+ * Local Python sandbox tool (app-side replacement for the hosted
+ * code_interpreter on providers without one). Executed by
+ * ai/services/code-sandbox.js (Pyodide in a worker thread).
+ */
+export const RUN_PYTHON_TOOL = {
+	type: "function",
+	name: "run_python",
+	description:
+		"Execute Python code in a local sandbox (Pyodide/WebAssembly; no network access). Use it for calculations, data analysis, and to create files or charts for the user. numpy, pandas, matplotlib, and openpyxl are available — import them normally. Input data files, when tool results mention them, are in /data/. Save every file the user should receive into the working directory (which is /outputs/), e.g. open('report.csv','w') or plt.savefig('chart.png'); those files are automatically posted to Slack. Each call runs in a fresh interpreter with no variables from previous calls, so include everything (imports, data, logic) in one script. Use print() for any value you need to see.",
+	parameters: {
+		type: "object",
+		properties: {
+			code: {
+				type: "string",
+				description: "The Python source code to execute.",
+			},
+		},
+		required: ["code"],
+		additionalProperties: false,
+	},
+};
+
+/**
  * Build a flat function-only tools array for providers without hosted tools
  * (Ollama). The model sees ordinary function tools; the application executes them.
  *
  * @param {Object} options - Tool configuration options
  * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base indexed and usable
+ * @param {boolean} [options.codeSandboxAvailable] - Local Python sandbox (run_python) enabled
  * @returns {Array} Array of plain function tool definitions
  */
-export function buildFunctionToolsArray({ knowledgeBaseAvailable = false } = {}) {
+export function buildFunctionToolsArray({
+	knowledgeBaseAvailable = false,
+	codeSandboxAvailable = false,
+} = {}) {
 	const tools = [];
 
 	// MCP function tools, flat (no namespaces, no deferred loading)
@@ -169,6 +196,11 @@ export function buildFunctionToolsArray({ knowledgeBaseAvailable = false } = {})
 		tools.push(webSearchTool);
 	}
 
+	// Local Python sandbox (app-side code_interpreter replacement)
+	if (codeSandboxAvailable) {
+		tools.push(RUN_PYTHON_TOOL);
+	}
+
 	// Slack tools
 	tools.push(...SLACK_TOOLS);
 
@@ -196,7 +228,10 @@ export function buildToolsArray({
 	knowledgeBaseAvailable = false,
 }) {
 	if (provider && !provider.capabilities.toolNamespaces) {
-		return buildFunctionToolsArray({ knowledgeBaseAvailable });
+		return buildFunctionToolsArray({
+			knowledgeBaseAvailable,
+			codeSandboxAvailable: provider.capabilities.localCodeInterpreter === true,
+		});
 	}
 
 	const tools = [];
@@ -313,7 +348,15 @@ export async function logToolWarnings({
 				"No web-search backend configured (WEB_SEARCH_PROVIDER unset). web_search tool disabled."
 			);
 		}
-		logger?.info?.("Code interpreter is not available in Ollama mode.");
+		if (provider.capabilities.localCodeInterpreter) {
+			logger?.info?.(
+				"Local Python sandbox (run_python via Pyodide) replaces the hosted code_interpreter."
+			);
+		} else {
+			logger?.warn?.(
+				"Code execution is disabled (CODE_SANDBOX_ENABLED=false). The bot cannot generate files or run analyses."
+			);
+		}
 		return;
 	}
 

@@ -25,6 +25,9 @@ export const MAX_INLINE_OUTPUT_CHARS = 500000;
 /** Hard limit (1MB, well under OpenAI's 10MB limit) */
 export const HARD_MAX_OUTPUT_CHARS = 1000000;
 
+/** Minimum output size (chars) worth staging for the local Python sandbox */
+const MIN_SANDBOX_STAGE_CHARS = 20000;
+
 /** Cache TTL in milliseconds (5 minutes) */
 const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -213,16 +216,16 @@ function ensureSafeSize(output, toolName, logger) {
 
 	logger?.warn?.(`[MIDDLEWARE] Output too large (${outputStr.length} chars) for ${toolName}`);
 
-	// Preserve file reference if present - the data IS available via code_interpreter
+	// Preserve file reference if present - the full data IS available to the
+	// code tool (hosted code_interpreter or local run_python)
 	const fileRef = output?._file;
 
 	return {
 		ok: false,
 		error: `Output too large for inline (${outputStr.length} chars)`,
 		_file: fileRef,
-		hint: fileRef
-			? `Full data uploaded as "${fileRef.fileName}". Use code_interpreter to read and analyze the JSON file.`
-			: "Use smaller maxResults (e.g., 10-50) or more specific query parameters.",
+		hint:
+			fileRef?.hint || "Use smaller maxResults (e.g., 10-50) or more specific query parameters.",
 	};
 }
 
@@ -329,10 +332,50 @@ async function uploadOutputAsFile(output, toolName, openaiClient, fileTracking, 
 }
 
 /**
+ * Stage a large output as a JSON file for the local Python sandbox (run_python).
+ * The file lands in the per-message sandboxFiles map and becomes /data/<name>
+ * inside the sandbox on the next run_python call. Memory-only: nothing leaves
+ * the machine.
+ *
+ * @param {Object} output - The output to stage
+ * @param {string} toolName - Name of the tool
+ * @param {Map<string, string>} sandboxFiles - Per-message staging map (name -> JSON string)
+ * @param {Object} logger - Logger instance
+ * @returns {{fileName: string, sandbox: true}|null} File reference, or null when
+ *   the output is too small to be worth staging
+ */
+function stageOutputInSandbox(output, toolName, sandboxFiles, logger) {
+	const outputStr = JSON.stringify(output, null, 2);
+	if (outputStr.length < MIN_SANDBOX_STAGE_CHARS) {
+		return null;
+	}
+
+	const safeToolName = toolName.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const fileName = `${safeToolName}_${Date.now()}.json`;
+	sandboxFiles.set(fileName, outputStr);
+	logger?.info?.(
+		`[MIDDLEWARE] Staged ${toolName} output for the Python sandbox as /data/${fileName} (${outputStr.length} chars)`
+	);
+	return { fileName, sandbox: true };
+}
+
+/**
+ * Model-facing instruction for reading a staged/uploaded full output.
+ */
+function fileReadHint(fileRef, sizeChars) {
+	const size = sizeChars ? ` (${sizeChars} chars)` : "";
+	return fileRef.sandbox
+		? `Full JSON${size} available in the Python sandbox at /data/${fileRef.fileName}. Use run_python to read and analyze it programmatically (e.g. import json; data = json.load(open("/data/${fileRef.fileName}"))).`
+		: `Full JSON${size} uploaded as "${fileRef.fileName}". Use code_interpreter to read and analyze it programmatically.`;
+}
+
+/**
  * Execute a tool call with caching, pagination, and file upload.
  *
- * The full (non-paginated) result is always uploaded as a JSON file for code_interpreter access.
- * The inline response is paginated for efficient context usage.
+ * The full (non-paginated) result is uploaded as a JSON file for
+ * code_interpreter access (OpenAI), or staged in the local Python sandbox for
+ * run_python (providers with localCodeInterpreter). The inline response is
+ * paginated for efficient context usage.
  *
  * @param {string} name - Tool name
  * @param {Object} args - Tool arguments (may include offset, maxResults, _cacheId)
@@ -341,11 +384,13 @@ async function uploadOutputAsFile(output, toolName, openaiClient, fileTracking, 
  * @param {Object} [options.logger] - Logger instance
  * @param {Object} [options.openaiClient] - OpenAI client for file uploads
  * @param {Object} [options.fileTracking] - File tracking state for uploaded files
+ * @param {Map<string, string>} [options.sandboxFiles] - Local sandbox staging map
+ *   (used when there is no openaiClient)
  * @returns {Promise<Object|string>} Processed output with pagination and file reference;
  *   telemetry-shaped outputs return a Markdown string instead of JSON
  */
 export async function executeWithMiddleware(name, args, executor, options = {}) {
-	const { logger, openaiClient, fileTracking } = options;
+	const { logger, openaiClient, fileTracking, sandboxFiles } = options;
 
 	// Extract pagination params
 	const maxResults =
@@ -375,6 +420,14 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 				fileName: cachedData.fileName,
 				hint: `Full data available in file "${cachedData.fileName}". Use code_interpreter to analyze.`,
 			};
+		} else if (cachedData.sandbox && cachedData.fileName && sandboxFiles) {
+			// The sandbox staging map is per Slack message: a cached result hit
+			// from a later message must be re-staged before run_python can see it
+			if (!sandboxFiles.has(cachedData.fileName)) {
+				sandboxFiles.set(cachedData.fileName, JSON.stringify(cachedData.result, null, 2));
+			}
+			const fileRef = { fileName: cachedData.fileName, sandbox: true };
+			paginatedOutput._file = { fileName: fileRef.fileName, hint: fileReadHint(fileRef) };
 		}
 
 		return ensureSafeSize(paginatedOutput, name, logger);
@@ -426,10 +479,13 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 		}
 	}
 
-	// Always upload the full result as a file (if we have the client)
+	// Make the full result available to the code tool: uploaded to OpenAI for
+	// code_interpreter, or staged locally for run_python (large outputs only)
 	let uploadedFile = null;
 	if (openaiClient && fileTracking) {
 		uploadedFile = await uploadOutputAsFile(result, name, openaiClient, fileTracking, logger);
+	} else if (sandboxFiles) {
+		uploadedFile = stageOutputInSandbox(result, name, sandboxFiles, logger);
 	}
 
 	// Inline representation: MetricsHub telemetry renders as Markdown tables
@@ -454,7 +510,7 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 			inline += `\n\n> Output filtered to monitor types: ${monitorTypeFilter.matchedTypes.join(", ")}. Other types available on these host(s): ${otherTypes.join(", ") || "(none)"}.`;
 		}
 		if (uploadedFile) {
-			inline += `\n\n> Full JSON (${jsonSize} chars) uploaded as "${uploadedFile.fileName}". Use code_interpreter to read and analyze it programmatically.`;
+			inline += `\n\n> ${fileReadHint(uploadedFile, jsonSize)}`;
 		}
 
 		if (inline.length <= HARD_MAX_OUTPUT_CHARS) {
@@ -481,6 +537,7 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 				result,
 				fileId: uploadedFile?.fileId,
 				fileName: uploadedFile?.fileName,
+				sandbox: uploadedFile?.sandbox === true,
 			},
 			logger
 		);
@@ -502,9 +559,9 @@ export async function executeWithMiddleware(name, args, executor, options = {}) 
 	// Add file reference to inline output
 	if (uploadedFile) {
 		paginatedOutput._file = {
-			fileId: uploadedFile.fileId,
+			...(uploadedFile.fileId ? { fileId: uploadedFile.fileId } : {}),
 			fileName: uploadedFile.fileName,
-			hint: `Full data (${JSON.stringify(result).length} chars) uploaded as "${uploadedFile.fileName}". Use code_interpreter to read and analyze.`,
+			hint: fileReadHint(uploadedFile, JSON.stringify(result).length),
 		};
 	}
 

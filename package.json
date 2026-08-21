@@ -48,6 +48,7 @@
 		"dotenv": "~17.2.3",
 		"mcp-client": "^1.13.1",
 		"openai": "^6.48.0",
+		"pyodide": "^314.0.5",
 		"undici": "^7.20.0"
 	},
 	"devDependencies": {

@@ -64,7 +64,7 @@ describe("buildToolsArray", () => {
 
 	const ollamaProvider = {
 		name: "ollama",
-		capabilities: { toolNamespaces: false },
+		capabilities: { toolNamespaces: false, localCodeInterpreter: true },
 	};
 
 	const savedEnv = {};
@@ -117,6 +117,15 @@ describe("buildToolsArray", () => {
 		expect(names).toContain("slack_add_reaction");
 		expect(names).toContain("slack_add_reply");
 		expect(names).toContain("ListHosts");
+		expect(names).toContain("run_python");
+	});
+
+	it("omits run_python when the local code sandbox is disabled", () => {
+		const tools = buildToolsArray({
+			provider: { name: "ollama", capabilities: { toolNamespaces: false } },
+		});
+
+		expect(tools.map((t) => t.name)).not.toContain("run_python");
 	});
 
 	it("adapts update_knowledge to the local KB update flow for Ollama", () => {

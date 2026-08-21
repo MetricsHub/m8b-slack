@@ -12,7 +12,11 @@
  */
 
 import { OpenAI } from "openai";
-import { defaultToolOutputChars, getOllamaConfig } from "../config/providers.js";
+import {
+	defaultToolOutputChars,
+	getCodeSandboxConfig,
+	getOllamaConfig,
+} from "../config/providers.js";
 
 function isContextLengthExplicit() {
 	return Boolean(process.env.OLLAMA_CONTEXT_LENGTH || process.env.OLLAMA_CONTEXT_WINDOW);
@@ -137,6 +141,7 @@ export function createOllamaProvider() {
 			serverSideState: false,
 			hostedFileSearch: false,
 			codeInterpreter: false,
+			localCodeInterpreter: getCodeSandboxConfig().enabled,
 			hostedWebSearch: false,
 			providerFileUploads: false,
 			imageDescriptions: Boolean(config.visionModel),

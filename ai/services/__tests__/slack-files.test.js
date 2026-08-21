@@ -6,6 +6,7 @@ import { jest } from "@jest/globals";
 import {
 	buildOpenAIFileContentItem,
 	createDescribingFileUploadManager,
+	createNoopFileUploadManager,
 	extractPreviousUploads,
 } from "../slack-files.js";
 
@@ -138,6 +139,129 @@ describe("createDescribingFileUploadManager", () => {
 		expect(manager.codeContainerFiles.size).toBe(0);
 		expect(manager.uploadedFilesThisTurn).toEqual([]);
 		expect(manager.disabled).toBeUndefined();
+		expect(manager.stageAttachment).toBeUndefined();
+	});
+});
+
+describe("sandbox attachment staging (Ollama mode with run_python)", () => {
+	const savedFetch = global.fetch;
+
+	const csvFile = {
+		id: "F_CSV",
+		name: "hosts.csv",
+		mimetype: "text/csv",
+		size: 24,
+		url_private_download: "https://files.slack.com/hosts.csv",
+	};
+
+	beforeEach(() => {
+		global.fetch = jest.fn(async () => ({
+			ok: true,
+			status: 200,
+			headers: { get: (name) => (name === "content-type" ? "text/csv" : null) },
+			// TextEncoder allocates a standalone ArrayBuffer; Buffer.from(str).buffer
+			// would expose Node's shared buffer pool instead of just these bytes
+			arrayBuffer: async () => new TextEncoder().encode("hostname,cpu\nsrv-01,42\n").buffer,
+		}));
+	});
+
+	afterEach(() => {
+		global.fetch = savedFetch;
+	});
+
+	describe("createDescribingFileUploadManager with stageAttachments", () => {
+		function makeManager() {
+			return createDescribingFileUploadManager({
+				describeImage: jest.fn(async () => "unused"),
+				stageAttachments: true,
+			});
+		}
+
+		it("stages a CSV attachment and points the note at /data", async () => {
+			const manager = makeManager();
+			const result = await manager.uploadOnce(csvFile);
+
+			expect(result.contentItem.type).toBe("input_text");
+			expect(result.contentItem.text).toContain("run_python");
+			expect(result.contentItem.text).toContain("/data/hosts.csv");
+			expect(result.contentItem.text).not.toContain("only images can be analyzed");
+
+			expect(manager.sandboxFiles.get("hosts.csv").toString("utf8")).toBe(
+				"hostname,cpu\nsrv-01,42\n"
+			);
+		});
+
+		it("downloads each attachment only once across stageAttachment and uploadOnce", async () => {
+			const manager = makeManager();
+			await manager.stageAttachment(csvFile);
+			await manager.uploadOnce(csvFile);
+
+			expect(global.fetch).toHaveBeenCalledTimes(1);
+			expect(manager.sandboxFiles.size).toBe(1);
+		});
+
+		it("refuses attachments above the size cap without downloading", async () => {
+			const manager = makeManager();
+			const result = await manager.uploadOnce({ ...csvFile, size: 6 * 1024 * 1024 });
+
+			expect(result.contentItem.text).toContain("could not be staged");
+			expect(result.contentItem.text).toContain("too large");
+			expect(manager.sandboxFiles.size).toBe(0);
+			expect(global.fetch).not.toHaveBeenCalled();
+		});
+
+		it("resolves staged-name collisions between distinct attachments", async () => {
+			const manager = makeManager();
+			await manager.stageAttachment(csvFile);
+			const second = await manager.stageAttachment({ ...csvFile, id: "F_CSV_2" });
+
+			expect(second.name).toBe("hosts-2.csv");
+			expect([...manager.sandboxFiles.keys()].sort()).toEqual(["hosts-2.csv", "hosts.csv"]);
+		});
+
+		it("never stages images (they go through the vision model instead)", async () => {
+			const manager = makeManager();
+			const result = await manager.stageAttachment({
+				id: "F_IMG",
+				name: "shot.png",
+				mimetype: "image/png",
+			});
+
+			expect(result).toBeNull();
+			expect(manager.sandboxFiles.size).toBe(0);
+		});
+	});
+
+	describe("createNoopFileUploadManager", () => {
+		it("stays fully disabled without stageAttachments", async () => {
+			const manager = createNoopFileUploadManager();
+			expect(manager.disabled).toBe(true);
+			expect(manager.stageAttachment).toBeUndefined();
+			expect(await manager.uploadOnce(csvFile)).toBeNull();
+		});
+
+		it("stages data attachments and returns /data notes with stageAttachments", async () => {
+			const manager = createNoopFileUploadManager(undefined, { stageAttachments: true });
+			expect(manager.disabled).toBeUndefined();
+
+			const result = await manager.uploadOnce(csvFile);
+			expect(result.contentItem.text).toContain("/data/hosts.csv");
+			expect(result.contentItem.text).toContain("run_python");
+			expect(manager.sandboxFiles.has("hosts.csv")).toBe(true);
+		});
+
+		it("returns a cannot-analyze note for images and does not stage them", async () => {
+			const manager = createNoopFileUploadManager(undefined, { stageAttachments: true });
+			const result = await manager.uploadOnce({
+				id: "F_IMG",
+				name: "shot.png",
+				mimetype: "image/png",
+			});
+
+			expect(result.contentItem.text).toContain("cannot be analyzed");
+			expect(manager.sandboxFiles.size).toBe(0);
+			expect(global.fetch).not.toHaveBeenCalled();
+		});
 	});
 });
 

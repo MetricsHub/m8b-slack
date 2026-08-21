@@ -40,8 +40,9 @@ const FAKE_BOT_ID = "B_E2E_BOT";
  * back to say(), which we capture.
  *
  * @param {Object} message - The fake incoming Slack message
+ * @param {Array} uploads - Collector for filesUploadV2 calls (generated files)
  */
-function createFakeSlackClient(message) {
+function createFakeSlackClient(message, uploads) {
 	return {
 		conversations: {
 			replies: async () => ({ messages: [message] }),
@@ -54,6 +55,10 @@ function createFakeSlackClient(message) {
 		},
 		reactions: {
 			add: async () => ({ ok: true }),
+		},
+		filesUploadV2: async (params) => {
+			uploads.push(params);
+			return { files: [{ files: [{ id: `F_E2E_UP_${uploads.length}` }] }] };
 		},
 		assistant: {
 			threads: {
@@ -111,6 +116,7 @@ async function runScenario(scenario) {
 	const prompts = scenario.prompts || [scenario.prompt];
 	const threadTs = fakeSlackTs();
 	const toolCalls = [];
+	const uploads = [];
 	let answer = "";
 
 	const served = scenario.files?.length ? await serveScenarioFiles(scenario.files) : null;
@@ -144,7 +150,7 @@ async function runScenario(scenario) {
 
 			await Promise.race([
 				respond({
-					client: createFakeSlackClient(message),
+					client: createFakeSlackClient(message, uploads),
 					context: {
 						BOT_USER_ID: FAKE_BOT_USER_ID,
 						BOT_ID: FAKE_BOT_ID,
@@ -168,7 +174,7 @@ async function runScenario(scenario) {
 		served?.close();
 	}
 
-	return { answer, toolCalls };
+	return { answer, toolCalls, uploads };
 }
 
 async function main() {
@@ -191,20 +197,25 @@ async function main() {
 
 	const results = [];
 	for (const scenario of selectScenarios(SCENARIOS)) {
+		if (scenario.onlyProvider && scenario.onlyProvider !== provider.name) {
+			console.log(`Skipping ${scenario.name} (provider is ${provider.name})`);
+			continue;
+		}
 		console.log(`\n--- ${scenario.name}: ${(scenario.prompts || [scenario.prompt])[0]}`);
 		const started = Date.now();
 		let answer = "";
 		let toolCalls = [];
+		let uploads = [];
 		let failures = [];
 		let verdict = null;
 		try {
-			({ answer, toolCalls } = await runScenario(scenario));
+			({ answer, toolCalls, uploads } = await runScenario(scenario));
 			({ failures, verdict } = await evaluateScenario({ scenario, answer, toolCalls }));
 
 			// Deterministic state checks (local-KB providers only; hosted state
 			// like OpenAI vector stores is not inspectable from here)
 			if (scenario.verifyLive && !provider.capabilities.hostedFileSearch) {
-				failures.push(...(await scenario.verifyLive()));
+				failures.push(...(await scenario.verifyLive({ uploads })));
 			}
 		} catch (e) {
 			failures = [`harness error: ${e?.message || e}`];

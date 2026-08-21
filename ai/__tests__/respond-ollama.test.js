@@ -364,7 +364,7 @@ describe("respond in Ollama mode", () => {
 
 		const harness = makeHarness();
 		const error = new Error("An API error occurred: invalid_name");
-		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		// @ts-expect-error - mimic Slack WebAPIPlatformError shape
 		error.data = { ok: false, error: "invalid_name" };
 		harness.client.reactions.add.mockRejectedValueOnce(error);
 
@@ -470,9 +470,9 @@ describe("respond in Ollama mode", () => {
 
 		const harness = makeHarness({ text: "Is the server up?" });
 		const slackError = new Error("An API error occurred: fatal_error");
-		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		// @ts-expect-error - mimic Slack WebAPIPlatformError shape
 		slackError.code = "slack_webapi_platform_error";
-		// @ts-ignore
+		// @ts-expect-error
 		slackError.data = { ok: false, error: "fatal_error" };
 		harness.setTitle.mockRejectedValueOnce(slackError);
 
@@ -491,9 +491,9 @@ describe("respond in Ollama mode", () => {
 
 		const harness = makeHarness({ text: "Is the server up?" });
 		const slackError = new Error("An API error occurred: fatal_error");
-		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		// @ts-expect-error - mimic Slack WebAPIPlatformError shape
 		slackError.code = "slack_webapi_platform_error";
-		// @ts-ignore
+		// @ts-expect-error
 		slackError.data = { ok: false, error: "fatal_error" };
 		harness.client.conversations.replies.mockRejectedValueOnce(slackError);
 
@@ -510,9 +510,9 @@ describe("respond in Ollama mode", () => {
 	it("reports a persistent Slack API failure as a Slack problem, not an AI problem", async () => {
 		const harness = makeHarness({ text: "Is the server up?" });
 		const slackError = new Error("An API error occurred: fatal_error");
-		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		// @ts-expect-error - mimic Slack WebAPIPlatformError shape
 		slackError.code = "slack_webapi_platform_error";
-		// @ts-ignore
+		// @ts-expect-error
 		slackError.data = { ok: false, error: "fatal_error" };
 		harness.client.conversations.replies.mockRejectedValue(slackError);
 

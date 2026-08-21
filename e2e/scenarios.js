@@ -22,8 +22,11 @@
  * - files:         optional [{fixture, name, mimetype}] attachments for the FIRST prompt;
  *                  fixture is a filename under e2e/fixtures/, served to the bot over a
  *                  local HTTP server (respond-live harness only)
- * - verifyLive:    optional async () => string[] of failures, run by respond-live after
- *                  the scenario (Ollama mode only) for deterministic state checks
+ * - verifyLive:    optional async (context) => string[] of failures, run by respond-live
+ *                  after the scenario (Ollama mode only) for deterministic state checks;
+ *                  context carries {uploads}: every client.filesUploadV2 call captured
+ * - onlyProvider:  optional provider name ("openai"/"ollama"); the respond-live harness
+ *                  skips the scenario on any other provider
  */
 
 /**
@@ -86,6 +89,41 @@ async function verifyKbUpdate() {
 	return failures;
 }
 
+/**
+ * Deterministic post-check for the file-generation scenario: exactly one
+ * Slack upload batch must have happened, carrying a CSV whose content actually
+ * holds the requested squares table.
+ *
+ * @param {{uploads: Array}} context - filesUploadV2 calls captured by the harness
+ * @returns {Promise<string[]>} failures (empty when everything checks out)
+ */
+async function verifyGeneratedCsv({ uploads } = {}) {
+	const failures = [];
+	const files = (uploads || []).flatMap((u) => u.file_uploads || []);
+
+	const csv = files.find((f) => /\.csv$/i.test(f.filename || ""));
+	if (!csv) {
+		failures.push(
+			`no CSV file was uploaded to Slack (uploads: ${files.map((f) => f.filename).join(", ") || "none"})`
+		);
+		return failures;
+	}
+
+	const content = Buffer.isBuffer(csv.file) ? csv.file.toString("utf8") : String(csv.file);
+	const dataRows = content
+		.trim()
+		.split(/\r?\n/)
+		.filter((line) => /^\s*\d+\s*[,;]\s*\d+\s*$/.test(line));
+	if (dataRows.length !== 10) {
+		failures.push(`expected 10 data rows in ${csv.filename}, found ${dataRows.length}`);
+	}
+	if (!dataRows.some((line) => /^\s*7\s*[,;]\s*49\s*$/.test(line))) {
+		failures.push(`${csv.filename} does not contain the row 7,49 — wrong or fabricated content`);
+	}
+
+	return failures;
+}
+
 export const SCENARIOS = [
 	{
 		name: "arithmetic-sanity",
@@ -143,6 +181,39 @@ export const SCENARIOS = [
 		// Requires a vision backend: OLLAMA_VISION_MODEL in Ollama mode (OpenAI mode
 		// reads images natively, but this dev harness gates on the local setup)
 		skipUnlessEnv: "OLLAMA_VISION_MODEL",
+		timeoutMs: 300000,
+	},
+	{
+		name: "file-generation",
+		liveOnly: true,
+		onlyProvider: "ollama",
+		prompt:
+			'Generate a CSV file named "squares.csv" with two columns, n and n_squared, for n from 1 to 10, and send it to me here.',
+		expectToolCall: /run_python/,
+		judge:
+			"The reply confirms that a CSV file was created and/or delivered to the user. It must NOT " +
+			"claim that file creation is impossible, must NOT contain sandbox paths (like /outputs/, " +
+			"/data/ or /mnt/data/) or fake download links, and must NOT paste the full CSV content " +
+			"inline as the only delivery.",
+		timeoutMs: 300000,
+		verifyLive: verifyGeneratedCsv,
+	},
+	{
+		name: "csv-analysis",
+		liveOnly: true,
+		onlyProvider: "ollama",
+		prompt:
+			"I've attached a CSV with response-time measurements from our web tier. What is the average latency_ms across all rows?",
+		files: [{ fixture: "server-latency.csv", name: "server-latency.csv", mimetype: "text/csv" }],
+		expectToolCall: /run_python/,
+		// avg(120, 180, 240, 260) = 200 — deliberately not equal to any row value,
+		// and the attachment note carries no data, so only actually reading the
+		// staged file with run_python can produce it
+		mustMatch: /\b200(\.0+)?\b/,
+		judge:
+			"The answer states that the average latency is 200 ms (200.0 is fine), based on the " +
+			"attached CSV. It must NOT claim it cannot read attachments, must NOT ask the user to " +
+			"paste the data, and must NOT invent a different average.",
 		timeoutMs: 300000,
 	},
 	{

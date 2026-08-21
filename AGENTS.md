@@ -219,6 +219,7 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 | `ai/config/providers.js`            | Provider env configuration                                  |
 | `ai/services/conversation-store.js` | App-side thread state (Ollama)                              |
 | `ai/services/knowledge-base.js`     | Local RAG knowledge base (Ollama)                           |
+| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (Ollama, Pyodide)       |
 | `ai/services/web-search.js`         | App-side web search backends                                |
 
 ## Error Handling

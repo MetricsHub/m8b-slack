@@ -24,6 +24,7 @@ export function createOpenAiProvider() {
 			serverSideState: true,
 			hostedFileSearch: true,
 			codeInterpreter: true,
+			localCodeInterpreter: false,
 			hostedWebSearch: true,
 			providerFileUploads: true,
 			imageDescriptions: false,

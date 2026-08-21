@@ -16,6 +16,7 @@ const ENV_KEYS = [
 	"OLLAMA_MAX_OUTPUT_TOKENS",
 	"OLLAMA_VISION_MODEL",
 	"OLLAMA_VISION_MAX_OUTPUT_TOKENS",
+	"CODE_SANDBOX_ENABLED",
 ];
 
 describe("provider selection", () => {
@@ -66,11 +67,24 @@ describe("provider selection", () => {
 			serverSideState: false,
 			hostedFileSearch: false,
 			codeInterpreter: false,
+			localCodeInterpreter: true,
 			hostedWebSearch: false,
 			providerFileUploads: false,
 			imageDescriptions: false,
 			toolNamespaces: false,
 		});
+	});
+
+	it("disables the local code sandbox with CODE_SANDBOX_ENABLED=false", () => {
+		process.env.AI_PROVIDER = "ollama";
+		process.env.CODE_SANDBOX_ENABLED = "false";
+		resetProviderCache();
+
+		expect(getProvider().capabilities.localCodeInterpreter).toBe(false);
+	});
+
+	it("never enables the local sandbox on the hosted OpenAI provider", () => {
+		expect(getProvider().capabilities.localCodeInterpreter).toBe(false);
 	});
 
 	it("enables image descriptions when a vision model is configured", () => {

@@ -16,6 +16,7 @@
  * @property {boolean} capabilities.serverSideState - previous_response_id support
  * @property {boolean} capabilities.hostedFileSearch - Hosted file_search/vector stores
  * @property {boolean} capabilities.codeInterpreter - Hosted code_interpreter
+ * @property {boolean} capabilities.localCodeInterpreter - App-side Python sandbox (run_python via Pyodide)
  * @property {boolean} capabilities.hostedWebSearch - Hosted web_search tool
  * @property {boolean} capabilities.providerFileUploads - Files API for Slack attachments
  * @property {boolean} capabilities.imageDescriptions - Sidecar vision model describes image attachments as text

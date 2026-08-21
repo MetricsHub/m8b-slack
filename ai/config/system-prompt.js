@@ -50,6 +50,7 @@ When a prompt has Slack's special syntax like <@USER_ID> or <#CHANNEL_ID>, you m
  *
  * @param {Object} [capabilities] - Provider capability flags
  * @param {boolean} [capabilities.codeInterpreter]
+ * @param {boolean} [capabilities.localCodeInterpreter] - App-side Python sandbox (run_python)
  * @param {boolean} [capabilities.hostedFileSearch]
  * @param {boolean} [capabilities.providerFileUploads]
  * @param {boolean} [capabilities.imageDescriptions] - Images arrive as vision-model text descriptions
@@ -61,6 +62,7 @@ When a prompt has Slack's special syntax like <@USER_ID> or <#CHANNEL_ID>, you m
 export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 	const {
 		codeInterpreter = true,
+		localCodeInterpreter = false,
 		hostedFileSearch = true,
 		providerFileUploads = true,
 		imageDescriptions = false,
@@ -76,21 +78,39 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 19. Your context window is limited (${contextWindow} tokens) and large tool outputs are truncated to fit it. For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), query ONE host per call. When a tool result says it was truncated, NEVER guess, assume, or report values for hosts/items missing from the data you actually received — re-query them one at a time, or tell the user their data is missing.`;
 	}
 
+	const stagedDataFilesSentence =
+		"Attached data files (CSV, JSON, TXT, logs, ...) are staged for the run_python tool — the attachment note in the conversation gives each file's /data/ path; read and analyze them with Python code.";
+
 	if (!providerFileUploads && imageDescriptions) {
 		prompt = prompt.replace(
 			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
-			"3. File analysis: When a user attaches an image or screenshot, its content appears in the conversation as a bracketed text description produced by a vision model — treat that description as what the user posted and use it for troubleshooting. Other file types cannot be read in this deployment; say so if a user attaches one."
+			`3. File analysis: When a user attaches an image or screenshot, its content appears in the conversation as a bracketed text description produced by a vision model — treat that description as what the user posted and use it for troubleshooting. ${
+				localCodeInterpreter
+					? stagedDataFilesSentence
+					: "Other file types cannot be read in this deployment; say so if a user attaches one."
+			}`
 		);
 		prompt = prompt.replace(
 			"    * Visual content from any attached files or images",
-			"    * Vision-model descriptions of images attached by the user"
+			localCodeInterpreter
+				? "    * Vision-model descriptions of images, and contents of data files attached by the user (read via run_python)"
+				: "    * Vision-model descriptions of images attached by the user"
 		);
 	} else if (!providerFileUploads) {
 		prompt = prompt.replace(
 			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
-			"3. File analysis is not available in this deployment. If a user attaches a file, tell them you cannot read attachments right now."
+			localCodeInterpreter
+				? `3. File analysis: ${stagedDataFilesSentence} Images cannot be viewed in this deployment; say so if a user attaches one.`
+				: "3. File analysis is not available in this deployment. If a user attaches a file, tell them you cannot read attachments right now."
 		);
-		prompt = prompt.replace("    * Visual content from any attached files or images\n", "");
+		if (localCodeInterpreter) {
+			prompt = prompt.replace(
+				"    * Visual content from any attached files or images",
+				"    * Contents of data files attached by the user (read via run_python)"
+			);
+		} else {
+			prompt = prompt.replace("    * Visual content from any attached files or images\n", "");
+		}
 	}
 
 	if (!hostedFileSearch) {
@@ -107,7 +127,9 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 	if (!codeInterpreter) {
 		prompt = prompt.replace(
 			"7. When users ask for files (CSV, TXT, Excel, PDF, etc.), use code_interpreter to create them. Simply write the file and confirm it was created (e.g., \"I've created hosts.csv for you\"). The file will be automatically uploaded to Slack. NEVER include sandbox paths, /mnt/data/ paths, or download links in your response — these don't work for users.",
-			"7. You cannot create or generate downloadable files in this deployment. If a user asks for a file (CSV, TXT, etc.), provide the content inline in a Slack code block instead, or say it is not possible."
+			localCodeInterpreter
+				? "7. When users ask for files (CSV, TXT, Excel, etc.) or charts, use the run_python tool to create them: write the files in the working directory and they are automatically posted to Slack. Confirm the creation with the file name only (e.g., \"I've created hosts.csv for you\"). NEVER include sandbox paths (/outputs/, /data/, /mnt/data/) or download links in your response — these don't work for users."
+				: "7. You cannot create or generate downloadable files in this deployment. If a user asks for a file (CSV, TXT, etc.), provide the content inline in a Slack code block instead, or say it is not possible."
 		);
 	}
 
