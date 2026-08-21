@@ -62,10 +62,12 @@ Append to `SCENARIOS` in [`scenarios.js`](scenarios.js):
 ```js
 {
 	name: "my-scenario",
-	prompt: "The message to send",
-	mustMatch: /expected/i,        // optional hard assertion
-	expectToolCall: true,           // optional, test:live only
+	prompt: "The message to send",  // or prompts: ["turn 1", "turn 2"] in one thread
+	mustMatch: /expected/i,         // optional hard assertion on the (last) answer
+	expectToolCall: true,           // or a RegExp on tool names; test:live only
 	judge: "What a correct answer must do", // optional soft assertion (LLM judge)
-	timeoutMs: 180000,
+	timeoutMs: 180000,              // per turn
+	liveOnly: true,                 // optional: skip in the Slack round-trip
+	verifyLive: async () => [],     // optional: deterministic post-checks (test:live, local KB only)
 }
 ```

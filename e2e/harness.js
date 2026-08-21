@@ -65,8 +65,18 @@ export async function evaluateScenario({ scenario, answer, toolCalls }) {
 	if (scenario.mustMatch && !scenario.mustMatch.test(answer || "")) {
 		failures.push(`answer does not match ${scenario.mustMatch}`);
 	}
-	if (scenario.expectToolCall && Array.isArray(toolCalls) && toolCalls.length === 0) {
-		failures.push("expected at least one tool call, saw none");
+	if (scenario.expectToolCall && Array.isArray(toolCalls)) {
+		const matched =
+			scenario.expectToolCall instanceof RegExp
+				? toolCalls.some((name) => scenario.expectToolCall.test(name))
+				: toolCalls.length > 0;
+		if (!matched) {
+			failures.push(
+				scenario.expectToolCall instanceof RegExp
+					? `expected a tool call matching ${scenario.expectToolCall}, saw: ${toolCalls.join(", ") || "none"}`
+					: "expected at least one tool call, saw none"
+			);
+		}
 	}
 
 	let verdict = null;

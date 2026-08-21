@@ -82,12 +82,14 @@ function startBot() {
  *
  * @param {WebClient} botClient - Client used for reading (bot token)
  * @param {string} channel - DM channel ID
- * @param {string} rootTs - ts of the message we sent (thread root)
+ * @param {string} rootTs - ts of the thread root message
  * @param {string} botUserId
  * @param {number} timeoutMs
+ * @param {string} [sinceTs] - Only consider bot messages newer than this ts
+ *   (for multi-turn scenarios: the ts of the latest prompt)
  * @returns {Promise<string>} concatenated bot reply text
  */
-async function waitForBotReply(botClient, channel, rootTs, botUserId, timeoutMs) {
+async function waitForBotReply(botClient, channel, rootTs, botUserId, timeoutMs, sinceTs = rootTs) {
 	const deadline = Date.now() + timeoutMs;
 	let lastText = "";
 	let stableCount = 0;
@@ -96,7 +98,8 @@ async function waitForBotReply(botClient, channel, rootTs, botUserId, timeoutMs)
 		await sleep(POLL_INTERVAL_MS);
 		const res = await botClient.conversations.replies({ channel, ts: rootTs, limit: 50 });
 		const botMessages = (res.messages || []).filter(
-			(m) => m.ts !== rootTs && (m.user === botUserId || m.bot_id)
+			(m) =>
+				Number.parseFloat(m.ts) > Number.parseFloat(sinceTs) && (m.user === botUserId || m.bot_id)
 		);
 		const text = botMessages
 			.map((m) => m.text || "")
@@ -164,23 +167,35 @@ async function main() {
 	const results = [];
 	try {
 		for (const scenario of selectScenarios(SCENARIOS)) {
-			console.log(`\n--- ${scenario.name}: ${scenario.prompt}`);
+			if (scenario.liveOnly) {
+				console.log(`Skipping ${scenario.name} (live-only scenario, run it with test:live)`);
+				continue;
+			}
+			const prompts = scenario.prompts || [scenario.prompt];
+			console.log(`\n--- ${scenario.name}: ${prompts[0]}`);
 			const started = Date.now();
 			let answer = "";
 			let failures = [];
 			let verdict = null;
 			try {
-				const posted = await userClient.chat.postMessage({
-					channel: dmChannel,
-					text: scenario.prompt,
-				});
-				answer = await waitForBotReply(
-					botClient,
-					dmChannel,
-					String(posted.ts),
-					botUserId,
-					scenario.timeoutMs || 180000
-				);
+				let rootTs = null;
+				for (const [turn, prompt] of prompts.entries()) {
+					if (turn > 0) console.log(`  turn ${turn + 1}: ${prompt}`);
+					const posted = await userClient.chat.postMessage({
+						channel: dmChannel,
+						text: prompt,
+						...(rootTs ? { thread_ts: rootTs } : {}),
+					});
+					rootTs = rootTs || String(posted.ts);
+					answer = await waitForBotReply(
+						botClient,
+						dmChannel,
+						rootTs,
+						botUserId,
+						scenario.timeoutMs || 180000,
+						String(posted.ts)
+					);
+				}
 				// expectToolCall is only observable at the respond() seam; skip it here
 				({ failures, verdict } = await evaluateScenario({ scenario, answer }));
 			} catch (e) {

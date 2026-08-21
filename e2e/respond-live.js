@@ -63,14 +63,17 @@ function createFakeSlackClient(message) {
 
 /**
  * Run one scenario through respond() and collect the answer + tool calls.
+ * Multi-turn scenarios (prompts array) share one thread; the returned answer
+ * is the reply to the last prompt.
  *
  * @param {Object} scenario
  * @returns {Promise<{answer: string, toolCalls: string[]}>}
  */
 async function runScenario(scenario) {
-	const ts = fakeSlackTs();
+	const prompts = scenario.prompts || [scenario.prompt];
+	const threadTs = fakeSlackTs();
 	const toolCalls = [];
-	const said = [];
+	let answer = "";
 
 	const logger = createTestLogger({
 		onEntry: (_level, msg, meta) => {
@@ -80,40 +83,47 @@ async function runScenario(scenario) {
 		},
 	});
 
-	const message = {
-		channel: FAKE_CHANNEL,
-		thread_ts: ts,
-		ts,
-		text: scenario.prompt,
-		user: FAKE_USER_ID,
-	};
+	for (const [turn, prompt] of prompts.entries()) {
+		if (prompts.length > 1) console.log(`  turn ${turn + 1}: ${prompt}`);
+		const said = [];
 
-	const say = async (value) => {
-		const text = typeof value === "string" ? value : value?.text || value?.markdown_text || "";
-		if (text) said.push(text);
-	};
+		const message = {
+			channel: FAKE_CHANNEL,
+			thread_ts: threadTs,
+			ts: turn === 0 ? threadTs : fakeSlackTs(),
+			text: prompt,
+			user: FAKE_USER_ID,
+		};
 
-	await Promise.race([
-		respond({
-			client: createFakeSlackClient(message),
-			context: {
-				BOT_USER_ID: FAKE_BOT_USER_ID,
-				BOT_ID: FAKE_BOT_ID,
-				teamId: FAKE_TEAM_ID,
-				userId: FAKE_USER_ID,
-			},
-			logger,
-			message,
-			body: {},
-			payload: {},
-			say,
-			setTitle: async () => {},
-			setStatus: async () => {},
-		}),
-		timeoutAfter(scenario.timeoutMs || 180000),
-	]);
+		const say = async (value) => {
+			const text = typeof value === "string" ? value : value?.text || value?.markdown_text || "";
+			if (text) said.push(text);
+		};
 
-	return { answer: said.join(""), toolCalls };
+		await Promise.race([
+			respond({
+				client: createFakeSlackClient(message),
+				context: {
+					BOT_USER_ID: FAKE_BOT_USER_ID,
+					BOT_ID: FAKE_BOT_ID,
+					teamId: FAKE_TEAM_ID,
+					userId: FAKE_USER_ID,
+				},
+				logger,
+				message,
+				body: {},
+				payload: {},
+				say,
+				setTitle: async () => {},
+				setStatus: async () => {},
+			}),
+			timeoutAfter(scenario.timeoutMs || 180000),
+		]);
+
+		answer = said.join("");
+	}
+
+	return { answer, toolCalls };
 }
 
 async function main() {
@@ -136,7 +146,7 @@ async function main() {
 
 	const results = [];
 	for (const scenario of selectScenarios(SCENARIOS)) {
-		console.log(`\n--- ${scenario.name}: ${scenario.prompt}`);
+		console.log(`\n--- ${scenario.name}: ${(scenario.prompts || [scenario.prompt])[0]}`);
 		const started = Date.now();
 		let answer = "";
 		let toolCalls = [];
@@ -145,6 +155,12 @@ async function main() {
 		try {
 			({ answer, toolCalls } = await runScenario(scenario));
 			({ failures, verdict } = await evaluateScenario({ scenario, answer, toolCalls }));
+
+			// Deterministic state checks (local-KB providers only; hosted state
+			// like OpenAI vector stores is not inspectable from here)
+			if (scenario.verifyLive && !provider.capabilities.hostedFileSearch) {
+				failures.push(...(await scenario.verifyLive()));
+			}
 		} catch (e) {
 			failures = [`harness error: ${e?.message || e}`];
 		}
