@@ -109,6 +109,15 @@ function buildFunctionCallItem(fc) {
 }
 
 /**
+ * True when an error came from the Slack Web API (@slack/web-api sets
+ * `code` to "slack_webapi_*"), as opposed to the AI provider. Slack platform
+ * errors like "fatal_error" must not be reported as AI backend failures.
+ */
+function isSlackApiError(error) {
+	return typeof error?.code === "string" && error.code.startsWith("slack_webapi");
+}
+
+/**
  * Main response handler for Slack messages.
  *
  * @param {Object} params - Handler parameters from Slack Bolt
@@ -178,20 +187,39 @@ export async function respond({
 			: createLocalKnowledgeBase({ logger });
 		const knowledgeBaseAvailable = knowledgeBase ? await knowledgeBase.isAvailable() : false;
 
-		// Set initial status
-		await setTitle(message.text);
-		await setStatus({
-			status: "thinking...",
-			loading_messages: LOADING_MESSAGES,
-		});
+		// Set initial status (cosmetic: a transient Slack error here must not
+		// abort the whole turn)
+		try {
+			await setTitle(message.text);
+			await setStatus({
+				status: "thinking...",
+				loading_messages: LOADING_MESSAGES,
+			});
+		} catch (e) {
+			logger.warn("Failed to set assistant title/status; continuing", {
+				message: e?.message,
+			});
+		}
 
-		// Fetch thread history
-		const thread = await client.conversations.replies({
+		// Fetch thread history (retried once: Slack occasionally returns
+		// transient platform errors such as "fatal_error")
+		const repliesArgs = {
 			channel,
 			ts: thread_ts,
 			include_all_metadata: true,
 			limit: 15,
-		});
+		};
+		let thread;
+		try {
+			thread = await client.conversations.replies(repliesArgs);
+		} catch (e) {
+			if (!isSlackApiError(e)) {
+				throw e;
+			}
+			logger.warn("conversations.replies failed; retrying once", { message: e?.message });
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			thread = await client.conversations.replies(repliesArgs);
+		}
 		const messages = thread.messages || [];
 
 		// Set up file upload manager: real uploads (OpenAI Files API), vision
@@ -686,6 +714,22 @@ export async function respond({
 			logger.warn("No response ID was received from OpenAI");
 		}
 	} catch (e) {
+		// Slack Web API failure (e.g. transient "fatal_error"): the AI provider
+		// was not involved — log and report it as what it is
+		if (isSlackApiError(e)) {
+			logger.error("Slack API error during response handling", {
+				code: e?.code,
+				slackError: e?.data?.error,
+				message: e?.message,
+			});
+			try {
+				await say({ text: "Slack hiccuped mid-request. Not my fault, for once. Try again. 🤷" });
+			} catch {
+				/* Slack is having a bad day; nothing more to do */
+			}
+			return;
+		}
+
 		logger.error("AI stream error", {
 			provider: provider.name,
 			message: e?.message,

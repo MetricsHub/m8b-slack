@@ -465,6 +465,77 @@ describe("respond in Ollama mode", () => {
 		expect(allText(getConversation(key))).not.toContain("Tool-call limit reached");
 	});
 
+	it("still answers when setting the assistant title/status fails", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Answered anyway."));
+
+		const harness = makeHarness({ text: "Is the server up?" });
+		const slackError = new Error("An API error occurred: fatal_error");
+		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		slackError.code = "slack_webapi_platform_error";
+		// @ts-ignore
+		slackError.data = { ok: false, error: "fatal_error" };
+		harness.setTitle.mockRejectedValueOnce(slackError);
+
+		await runRespond(harness);
+
+		// The cosmetic failure was logged and the turn completed normally
+		expect(harness.logger.warn).toHaveBeenCalledWith(
+			"Failed to set assistant title/status; continuing",
+			expect.objectContaining({ message: expect.stringContaining("fatal_error") })
+		);
+		expect(streamOnceMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries conversations.replies once on a transient Slack platform error", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Answered after retry."));
+
+		const harness = makeHarness({ text: "Is the server up?" });
+		const slackError = new Error("An API error occurred: fatal_error");
+		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		slackError.code = "slack_webapi_platform_error";
+		// @ts-ignore
+		slackError.data = { ok: false, error: "fatal_error" };
+		harness.client.conversations.replies.mockRejectedValueOnce(slackError);
+
+		await runRespond(harness);
+
+		expect(harness.client.conversations.replies).toHaveBeenCalledTimes(2);
+		expect(streamOnceMock).toHaveBeenCalledTimes(1);
+		// No error message reached the user
+		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
+		expect(saidTexts.join("\n")).not.toContain("Slack hiccuped");
+		expect(saidTexts.join("\n")).not.toContain("Friendly local AI error.");
+	});
+
+	it("reports a persistent Slack API failure as a Slack problem, not an AI problem", async () => {
+		const harness = makeHarness({ text: "Is the server up?" });
+		const slackError = new Error("An API error occurred: fatal_error");
+		// @ts-ignore - mimic Slack WebAPIPlatformError shape
+		slackError.code = "slack_webapi_platform_error";
+		// @ts-ignore
+		slackError.data = { ok: false, error: "fatal_error" };
+		harness.client.conversations.replies.mockRejectedValue(slackError);
+
+		await runRespond(harness);
+
+		// The AI provider was never called
+		expect(streamOnceMock).not.toHaveBeenCalled();
+		// Logged as a Slack error with the platform error code
+		expect(harness.logger.error).toHaveBeenCalledWith(
+			"Slack API error during response handling",
+			expect.objectContaining({
+				code: "slack_webapi_platform_error",
+				slackError: "fatal_error",
+			})
+		);
+		// The user message blames Slack, not the local AI backend
+		expect(harness.say).toHaveBeenCalledWith(
+			expect.objectContaining({ text: expect.stringContaining("Slack hiccuped") })
+		);
+		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
+		expect(saidTexts.join("\n")).not.toContain("Friendly local AI error.");
+	});
+
 	it("reports errors with a short friendly message", async () => {
 		streamOnceMock.mockRejectedValueOnce(new Error("connect ECONNREFUSED 10.0.0.5:11434"));
 
