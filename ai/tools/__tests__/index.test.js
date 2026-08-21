@@ -3,7 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
-import { buildFunctionNamespaces, buildToolsArray } from "../index.js";
+import { buildFunctionNamespaces, buildToolsArray, KNOWLEDGE_TOOL } from "../index.js";
 
 function makeTool(name) {
 	return {
@@ -117,6 +117,22 @@ describe("buildToolsArray", () => {
 		expect(names).toContain("slack_add_reaction");
 		expect(names).toContain("slack_add_reply");
 		expect(names).toContain("ListHosts");
+	});
+
+	it("adapts update_knowledge to the local KB update flow for Ollama", () => {
+		const tools = buildToolsArray({
+			provider: ollamaProvider,
+			knowledgeBaseAvailable: true,
+		});
+
+		const updateKnowledge = tools.find((t) => t.name === "update_knowledge");
+		expect(updateKnowledge.description).toContain("search_knowledge_base");
+		expect(updateKnowledge.description).not.toContain("file_search");
+		expect(updateKnowledge.parameters.properties.fileId.description).toContain("docId");
+
+		// The hosted (OpenAI) definition keeps its file_search wording
+		expect(KNOWLEDGE_TOOL.description).toContain("file_search");
+		expect(KNOWLEDGE_TOOL.parameters.properties.fileId.description).toContain("file_search");
 	});
 
 	it("omits knowledge search when the local knowledge base is unavailable", () => {

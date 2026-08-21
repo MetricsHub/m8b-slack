@@ -95,7 +95,7 @@ export const KNOWLEDGE_TOOL = {
 	type: "function",
 	name: "update_knowledge",
 	description:
-		"Update or add knowledge to the Vector Store which stores all past learnings, solutions, and troubleshooting knowledge. Use this tool when you discover something new that would be valuable for future reference, such as: how to fix a problem, the root cause of an issue, how to accomplish a specific task, or any insight that could save time in similar future situations. The knowledge will be stored and retrievable via file_search in future conversations.",
+		"Update or add knowledge to the Vector Store which stores all past learnings, solutions, and troubleshooting knowledge. Use this tool when you discover something new that would be valuable for future reference, such as: how to fix a problem, the root cause of an issue, how to accomplish a specific task, or any insight that could save time in similar future situations. The knowledge will be stored and retrievable via file_search in future conversations. To correct or extend an existing entry, pass its fileId so the entry is replaced instead of duplicated.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -150,6 +150,17 @@ export function buildFunctionToolsArray({ knowledgeBaseAvailable = false } = {})
 			"retrievable via file_search",
 			"retrievable via search_knowledge_base"
 		),
+		parameters: {
+			...KNOWLEDGE_TOOL.parameters,
+			properties: {
+				...KNOWLEDGE_TOOL.parameters.properties,
+				fileId: {
+					type: "string",
+					description:
+						"Optional. The docId of an existing knowledge article to replace (as returned in search_knowledge_base results). If not provided, a new knowledge entry will be created.",
+				},
+			},
+		},
 	});
 
 	// Application-side web search (only when a search backend is configured)

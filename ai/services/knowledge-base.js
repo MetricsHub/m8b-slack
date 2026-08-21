@@ -37,7 +37,7 @@ export const SEARCH_KNOWLEDGE_TOOL = {
 	type: "function",
 	name: "search_knowledge_base",
 	description:
-		"Search the IT knowledge base of past learnings, solutions, and how-to articles. Returns the most relevant excerpts with their source document so you can cite them. Use it before answering questions about known procedures, past incidents, or documented configurations.",
+		"Search the IT knowledge base of past learnings, solutions, and how-to articles. Returns the most relevant excerpts with their source document so you can cite them. Use it before answering questions about known procedures, past incidents, or documented configurations. Each result carries a docId: to revise an existing article, pass that docId as fileId to update_knowledge instead of creating a duplicate entry.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -345,6 +345,7 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 			ok: true,
 			query: cleanQuery,
 			results: scored.map(({ chunk, score }) => ({
+				docId: chunk.docId,
 				title: chunk.title,
 				source: chunk.source,
 				section: chunk.section || null,
@@ -411,7 +412,21 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 		await fsp.writeFile(path.join(docsDir, fileName), fullContent, "utf8");
 
 		if (replaceDocId) {
+			const replacedChunk = index.chunks.find((chunk) => chunk.docId === replaceDocId);
 			index.chunks = index.chunks.filter((chunk) => chunk.docId !== replaceDocId);
+
+			// Remove the superseded markdown source too; otherwise a reindex from
+			// docs/ would resurrect the replaced article next to its replacement
+			const oldFileName = replacedChunk?.source ? path.basename(replacedChunk.source) : null;
+			if (oldFileName && oldFileName !== fileName) {
+				try {
+					await fsp.unlink(path.join(docsDir, oldFileName));
+				} catch (e) {
+					logger?.warn?.(
+						`[KB] Could not remove replaced document ${oldFileName}: ${e?.message || e}`
+					);
+				}
+			}
 		}
 
 		for (let i = 0; i < pieces.length; i++) {

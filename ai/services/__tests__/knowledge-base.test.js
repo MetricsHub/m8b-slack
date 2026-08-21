@@ -172,6 +172,49 @@ describe("local knowledge base", () => {
 		expect(result.results[0].score).toBeGreaterThan(0.9);
 	});
 
+	it("returns the docId needed to update an article", async () => {
+		const kb = createLocalKnowledgeBase({ dir });
+		const added = await kb.addDocument({ title: "Docker tip", content: "docker things" });
+
+		const result = await kb.search("docker", 1);
+		expect(result.ok).toBe(true);
+		expect(result.results[0].docId).toBe(added.docId);
+	});
+
+	it("replaces an article without duplicates, orphaned files, or reindex resurrection", async () => {
+		const kb = createLocalKnowledgeBase({ dir });
+		const original = await kb.addDocument({
+			title: "Docker fix",
+			content: "docker daemon restart, old advice",
+		});
+
+		const updated = await kb.addDocument({
+			title: "Docker fix (revised)",
+			content: "docker daemon restart, new advice",
+			replaceDocId: original.docId,
+		});
+		expect(updated.ok).toBe(true);
+
+		// Only the new version is retrievable
+		const result = await kb.search("docker", 5);
+		const dockerTitles = result.results.map((r) => r.title);
+		expect(dockerTitles).toContain("Docker fix (revised)");
+		expect(dockerTitles).not.toContain("Docker fix");
+
+		// The superseded markdown file is gone from docs/
+		const files = await fsp.readdir(path.join(dir, "docs"));
+		expect(files).toHaveLength(1);
+		expect(files[0]).toBe(updated.file);
+
+		// A full reindex from docs/ must not resurrect the replaced article
+		const freshKb = createLocalKnowledgeBase({ dir });
+		const rebuilt = await freshKb.reindex();
+		expect(rebuilt.ok).toBe(true);
+		expect(rebuilt.documents).toBe(1);
+		const after = await freshKb.search("docker", 5);
+		expect(after.results.map((r) => r.title)).not.toContain("Docker fix");
+	});
+
 	it("persists documents as markdown files and rebuilds via reindex", async () => {
 		const kb = createLocalKnowledgeBase({ dir });
 		await kb.addDocument({ title: "Docker note", content: "docker things" });
