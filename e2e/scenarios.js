@@ -124,6 +124,26 @@ async function verifyGeneratedCsv({ uploads } = {}) {
 	return failures;
 }
 
+/**
+ * Deterministic post-check for the cpu-graph scenario: a PNG chart must have
+ * been uploaded to Slack (matplotlib output starts with the PNG signature).
+ *
+ * @param {{uploads: Array}} context - filesUploadV2 calls captured by the harness
+ * @returns {Promise<string[]>} failures (empty when everything checks out)
+ */
+async function verifyGeneratedChart({ uploads } = {}) {
+	const files = (uploads || []).flatMap((u) => u.file_uploads || []);
+	const png = files.find(
+		(f) => Buffer.isBuffer(f.file) && f.file.subarray(1, 4).toString() === "PNG"
+	);
+	if (!png) {
+		return [
+			`no PNG chart was uploaded to Slack (uploads: ${files.map((f) => f.filename).join(", ") || "none"})`,
+		];
+	}
+	return [];
+}
+
 export const SCENARIOS = [
 	{
 		name: "arithmetic-sanity",
@@ -215,6 +235,23 @@ export const SCENARIOS = [
 			"attached CSV. It must NOT claim it cannot read attachments, must NOT ask the user to " +
 			"paste the data, and must NOT invent a different average.",
 		timeoutMs: 300000,
+	},
+	{
+		name: "cpu-graph",
+		liveOnly: true,
+		onlyProvider: "ollama",
+		// Regression: the model's first turn on this prompt was ONLY a
+		// "working on it" slack_add_reply, and the agent loop used to treat
+		// that as the delivered answer and stop without doing the work
+		prompt: "Show me the graph of the average cpu utilization of all servers monitored here",
+		expectToolCall: /run_python/,
+		judge:
+			"The answer presents or announces a chart/graph of CPU utilization based on real " +
+			"monitoring data. It must NOT consist solely of a promise to work on it (like 'give me " +
+			"a sec') with no result, must NOT claim charts are impossible, and must NOT include " +
+			"sandbox paths or download links.",
+		timeoutMs: 480000,
+		verifyLive: verifyGeneratedChart,
 	},
 	{
 		name: "honest-about-capabilities",

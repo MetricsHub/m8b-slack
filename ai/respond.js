@@ -96,6 +96,23 @@ const NO_REPEAT_NUDGE = {
 };
 
 /**
+ * One-shot nudge for stateless continuation turns whose only user-visible
+ * output so far was a slack_add_reply. That reply is ambiguous: often an
+ * interim "working on it" note (system-prompt rule 13) — the task must keep
+ * going — but sometimes the complete answer, in which case the model must
+ * stay silent instead of rephrasing it as a duplicate message.
+ */
+const CONTINUE_AFTER_REPLY_NUDGE = {
+	role: "system",
+	content: [
+		{
+			type: "input_text",
+			text: "Your slack_add_reply message was already posted to the user in Slack. Do NOT repeat or rephrase it, and do not post another status note. If the task is not finished, continue it now: call the tools you need, then give the final answer. If that reply already fully answered the user, produce no further output at all.",
+		},
+	],
+};
+
+/**
  * Build a resendable function_call input item from a streamed function call.
  * Used in stateless mode where tool calls must be replayed in `input`.
  */
@@ -630,13 +647,14 @@ export async function respond({
 
 			// Decide whether another model turn is needed (stateless providers)
 			if (stateless && functionCalls.length > 0) {
-				const answerDelivered = hadText || repliedViaTool;
 				const onlySideEffects = functionCalls.every((fc) => SIDE_EFFECT_TOOLS.has(fc?.name));
-				if (answerDelivered && onlySideEffects) {
-					// The visible answer was already streamed (or posted via
-					// slack_add_reply) and the remaining tool results carry no
-					// information — an extra turn would only make the model repeat
-					// itself or narrate its tool calls in Slack. Stop here.
+				if (hadText && onlySideEffects) {
+					// The visible answer was already streamed and the remaining tool
+					// results carry no information — an extra turn would only make the
+					// model repeat itself or narrate its tool calls in Slack. Stop here.
+					// A slack_add_reply WITHOUT streamed text must not stop the loop:
+					// it is usually an interim "working on it" note (rule 13), and
+					// stopping would silently drop the actual task.
 					logger.info?.(
 						"Answer already delivered; skipping extra model turn for side-effect tool results",
 						{ iteration: loopIteration, tools: functionCalls.map((fc) => fc?.name) }
@@ -644,10 +662,14 @@ export async function respond({
 					continueLoop = false;
 				} else {
 					continueLoop = true;
-					if (answerDelivered) {
-						// The turn delivered an answer AND fetched data: continue, but tell
-						// the model its previous message is already posted so it doesn't repeat it
+					if (hadText) {
+						// The turn delivered the streamed answer AND fetched data: continue,
+						// but tell the model its message is already posted so it doesn't repeat it
 						transientItems = [NO_REPEAT_NUDGE];
+					} else if (repliedViaTool) {
+						// Only a slack_add_reply went out so far: keep working (or, if that
+						// reply was the whole answer, end the next turn with no output)
+						transientItems = [CONTINUE_AFTER_REPLY_NUDGE];
 					}
 				}
 			}

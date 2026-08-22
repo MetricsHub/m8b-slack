@@ -317,33 +317,93 @@ describe("respond in Ollama mode", () => {
 		expect(answers).toHaveLength(1);
 	});
 
-	it("treats a successful slack_add_reply as the delivered answer (no extra model turn)", async () => {
-		// Regression: the model answered via slack_add_reply (no assistant text);
-		// the loop used to run one more turn that streamed meta-commentary about
-		// its own tool calls into the thread
-		streamOnceMock.mockResolvedValueOnce(
-			functionCallResult([
-				{
-					type: "function_call",
-					call_id: "call_1",
-					name: "slack_add_reply",
-					arguments: '{"text":"I have no idea. Ask the platform team."}',
-				},
-			])
-		);
+	it("continues after a reply-only turn and stays silent when the reply was the answer", async () => {
+		// A slack_add_reply with no streamed text is ambiguous (interim note or
+		// full answer), so the loop runs one more nudged turn; a model whose
+		// reply WAS the answer then produces nothing, and no fallback is posted
+		streamOnceMock
+			.mockResolvedValueOnce(
+				functionCallResult([
+					{
+						type: "function_call",
+						call_id: "call_1",
+						name: "slack_add_reply",
+						arguments: '{"text":"I have no idea. Ask the platform team."}',
+					},
+				])
+			)
+			.mockResolvedValueOnce(functionCallResult([], "resp_silent"));
 
 		const harness = makeHarness({ text: "Which LLM model are you running on?" });
 		await runRespond(harness);
 
-		// The reply went out through say(), and no extra model turn ran
+		// The reply went out through say()
 		expect(harness.say).toHaveBeenCalledWith({
 			markdown_text: "I have no idea. Ask the platform team.",
 		});
-		expect(streamOnceMock).toHaveBeenCalledTimes(1);
 
-		// No "I've got nothing" fallback: the reply WAS the answer
+		// One nudged follow-up turn ran, telling the model not to repeat itself
+		expect(streamOnceMock).toHaveBeenCalledTimes(2);
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		expect(allText(secondParams.input)).toContain("Do NOT repeat or rephrase");
+
+		// The model stayed silent: no "I've got nothing" fallback, and the
+		// reply is the only thread message (say is also used for the MCP
+		// config warning, so count reply-shaped calls only)
 		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
 		expect(saidTexts.join("\n")).not.toContain("I've got nothing");
+		expect(harness.say.mock.calls.filter(([arg]) => arg?.markdown_text)).toHaveLength(1);
+	});
+
+	it("keeps working after an interim slack_add_reply progress note", async () => {
+		// Regression: "Show me the graph of the average cpu utilization" — the
+		// model's first turn was ONLY a "working on it" slack_add_reply (rule 13),
+		// and the loop treated it as the delivered answer and stopped, dropping
+		// the actual task (no data fetched, no chart produced)
+		streamOnceMock
+			.mockResolvedValueOnce(
+				functionCallResult([
+					{
+						type: "function_call",
+						call_id: "call_1",
+						name: "slack_add_reply",
+						arguments: '{"text":"On it. Grabbing the hosts and their CPU numbers."}',
+					},
+				])
+			)
+			.mockResolvedValueOnce(
+				functionCallResult(
+					[
+						{
+							type: "function_call",
+							call_id: "call_2",
+							name: "search_knowledge_base",
+							arguments: '{"query":"cpu"}',
+						},
+					],
+					"resp_work"
+				)
+			)
+			.mockResolvedValueOnce(textResult("Here is your chart. Average CPU: 42%."));
+
+		const harness = makeHarness({ text: "Show me the graph of the average cpu utilization" });
+		await runRespond(harness);
+
+		// The progress note went out, then the loop kept going: nudge, data
+		// call, and the final answer — three model turns in total
+		expect(harness.say).toHaveBeenCalledWith({
+			markdown_text: "On it. Grabbing the hosts and their CPU numbers.",
+		});
+		expect(streamOnceMock).toHaveBeenCalledTimes(3);
+
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		expect(allText(secondParams.input)).toContain("continue it now");
+
+		// The nudge is transient: not persisted in the conversation store,
+		// which does carry the final answer
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		expect(allText(getConversation(key))).not.toContain("continue it now");
+		expect(allText(getConversation(key))).toContain("Here is your chart. Average CPU: 42%.");
 	});
 
 	it("continues the loop after a failed reaction without treating it as an answer", async () => {
