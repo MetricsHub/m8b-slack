@@ -142,10 +142,23 @@ export const configDecisionCallback = async ({ ack, body, action, client, logger
 		return;
 	}
 
-	// Replace the buttons with the decision so the message cannot be re-used
+	// Replace the buttons with the decision so the message cannot be re-used.
+	// The buttons live in the last attachment (below the colored diff hunks):
+	// keep the diff, strip every actions block, and append the decision.
 	try {
 		const originalBlocks = Array.isArray(body.message?.blocks) ? body.message.blocks : [];
 		const keptBlocks = originalBlocks.filter((block) => block.type !== "actions");
+		const keptAttachments = (
+			Array.isArray(body.message?.attachments) ? body.message.attachments : []
+		)
+			.map((attachment) => ({
+				...(attachment.color ? { color: attachment.color } : {}),
+				fallback: attachment.fallback || "Configuration diff",
+				blocks: (Array.isArray(attachment.blocks) ? attachment.blocks : []).filter(
+					(block) => block.type !== "actions"
+				),
+			}))
+			.filter((attachment) => attachment.blocks.length > 0);
 		const decision = approved
 			? `:white_check_mark: Approved by <@${body.user.id}>`
 			: `:x: Rejected by <@${body.user.id}> — the file was NOT changed`;
@@ -154,6 +167,7 @@ export const configDecisionCallback = async ({ ack, body, action, client, logger
 			ts: body.message.ts,
 			text: decision,
 			blocks: [...keptBlocks, { type: "context", elements: [{ type: "mrkdwn", text: decision }] }],
+			attachments: keptAttachments,
 		});
 	} catch (e) {
 		logger?.debug?.("Failed to update the approval message", { error: String(e) });
