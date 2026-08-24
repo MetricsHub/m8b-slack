@@ -206,21 +206,26 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 
 ## Key Files Reference
 
-| File                                | Purpose                                                     |
-| ----------------------------------- | ----------------------------------------------------------- |
-| `ai/respond.js`                     | Main AI response orchestrator                               |
-| `ai/config/system-prompt.js`        | AI personality and configuration                            |
-| `ai/services/streaming.js`          | OpenAI streaming response handling                          |
-| `ai/services/function-calls.js`     | Tool/function call processing                               |
-| `ai/services/tool-middleware.js`    | Tool output caching, compression, telemetry Markdown tables |
-| `ai/tools/index.js`                 | OpenAI tool definitions                                     |
-| `ai/mcp_registry.js`                | MCP server discovery and management                         |
-| `ai/providers/index.js`             | AI provider abstraction                                     |
-| `ai/config/providers.js`            | Provider env configuration                                  |
-| `ai/services/conversation-store.js` | App-side thread state (Ollama)                              |
-| `ai/services/knowledge-base.js`     | Local RAG knowledge base (Ollama)                           |
-| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (Ollama, Pyodide)       |
-| `ai/services/web-search.js`         | App-side web search backends                                |
+| File                                | Purpose                                                      |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `ai/respond.js`                     | Main AI response orchestrator                                |
+| `ai/config/system-prompt.js`        | AI personality and configuration                             |
+| `ai/services/streaming.js`          | OpenAI streaming response handling                           |
+| `ai/services/function-calls.js`     | Tool/function call processing                                |
+| `ai/services/tool-middleware.js`    | Tool output caching, compression, telemetry Markdown tables  |
+| `ai/tools/index.js`                 | OpenAI tool definitions                                      |
+| `ai/mcp_registry.js`                | MCP server discovery and management                          |
+| `ai/providers/index.js`             | AI provider abstraction                                      |
+| `ai/config/providers.js`            | Provider env configuration                                   |
+| `ai/services/conversation-store.js` | App-side thread state (Ollama)                               |
+| `ai/services/knowledge-base.js`     | Local RAG knowledge base (Ollama)                            |
+| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (Ollama, Pyodide)        |
+| `ai/services/web-search.js`         | App-side web search backends                                 |
+| `ai/services/metricshub-api.js`     | MetricsHub Agent REST API client (config files, encryption)  |
+| `ai/services/config-editor.js`      | Config-editing tool handlers (auth, validate, approve, save) |
+| `ai/services/config-credentials.js` | Thread-scoped {{CRED:...}} placeholders for secrets          |
+| `ai/services/yaml-resources.js`     | Locate/splice resource entries in MetricsHub config YAML     |
+| `ai/services/slack-interactions.js` | Pending human interactions (modals, approval buttons)        |
 
 ## Error Handling
 

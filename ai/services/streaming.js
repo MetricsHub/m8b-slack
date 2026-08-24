@@ -625,6 +625,16 @@ export async function streamOnce(
 	const hadText = evtCounters.output_text_delta > 0;
 	const validFunctionCalls = functionCalls.filter(Boolean);
 	const validFiles = outputFiles.filter((f) => f?.file_id);
+	const mappedUsage = responseUsage
+		? {
+				inputTokens: responseUsage.input_tokens,
+				cachedTokens: responseUsage.input_tokens_details?.cached_tokens,
+				cacheWriteTokens: responseUsage.input_tokens_details?.cache_write_tokens,
+				outputTokens: responseUsage.output_tokens,
+				reasoningTokens: responseUsage.output_tokens_details?.reasoning_tokens,
+				totalTokens: responseUsage.total_tokens,
+			}
+		: undefined;
 
 	if (fullResponseText) {
 		logger?.info?.(
@@ -657,16 +667,7 @@ export async function streamOnce(
 			: incompleteReason
 				? `incomplete: ${incompleteReason}`
 				: "unknown",
-		usage: responseUsage
-			? {
-					inputTokens: responseUsage.input_tokens,
-					cachedTokens: responseUsage.input_tokens_details?.cached_tokens,
-					cacheWriteTokens: responseUsage.input_tokens_details?.cache_write_tokens,
-					outputTokens: responseUsage.output_tokens,
-					reasoningTokens: responseUsage.output_tokens_details?.reasoning_tokens,
-					totalTokens: responseUsage.total_tokens,
-				}
-			: undefined,
+		usage: mappedUsage,
 	});
 
 	// Only log detailed summary if there's something notable
@@ -712,6 +713,7 @@ export async function streamOnce(
 		incompleteReason,
 		sawCompleted,
 		fullResponseText,
+		usage: mappedUsage,
 		streamController,
 		debug: {
 			startedWriting,

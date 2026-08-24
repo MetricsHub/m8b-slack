@@ -12,6 +12,15 @@ import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
 import { estimatePayloadTokens, PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
 import { executePython } from "./code-sandbox.js";
+import {
+	handleDeleteResourceConfig,
+	handleGetConfigFile,
+	handleGetResourceConfig,
+	handleListConfigFiles,
+	handleModifyResourceConfig,
+	handleRequestCredentials,
+	handleSaveConfigFile,
+} from "./config-editor.js";
 import { openai } from "./openai.js";
 import { uploadGeneratedFilesToSlack } from "./slack-files.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
@@ -24,6 +33,8 @@ import { executeWebSearch } from "./web-search.js";
  * @param {Object} context - Processing context
  * @param {Object} context.client - Slack client
  * @param {Object} context.message - Original Slack message
+ * @param {string} [context.userId] - Slack user ID of the requesting user
+ * @param {Set<string>} [context.threadAuthorIds] - Human authors seen in this Slack thread
  * @param {Function} context.say - Say function for replies
  * @param {Array} context.vectorStoreIds - Vector store IDs
  * @param {Object} context.fileTracking - File tracking state
@@ -34,8 +45,18 @@ import { executeWebSearch } from "./web-search.js";
  */
 export async function processFunctionCall(functionCall, context) {
 	const { name, call_id, arguments: argsStr } = functionCall;
-	const { client, message, say, vectorStoreIds, fileTracking, provider, knowledgeBase, logger } =
-		context;
+	const {
+		client,
+		message,
+		userId,
+		threadAuthorIds,
+		say,
+		vectorStoreIds,
+		fileTracking,
+		provider,
+		knowledgeBase,
+		logger,
+	} = context;
 
 	logger?.info?.(`[FUNCTION] ${name}`, { call_id: call_id?.slice(-12) });
 
@@ -75,6 +96,57 @@ export async function processFunctionCall(functionCall, context) {
 				output = knowledgeBase
 					? await handleLocalUpdateKnowledge(args, knowledgeBase, say, logger)
 					: await handleUpdateKnowledge(args, vectorStoreIds, say, logger);
+				break;
+
+			// MetricsHub configuration editing (REST API; human-in-the-loop for
+			// credentials and change approval — no caching, no middleware)
+			case "list_config_files":
+				output = await handleListConfigFiles(args, { userId, logger });
+				break;
+
+			case "get_config_file":
+				output = await handleGetConfigFile(args, { userId, logger });
+				break;
+
+			case "get_resource_config":
+				output = await handleGetResourceConfig(args, { userId, logger });
+				break;
+
+			case "modify_resource_config":
+				output = await handleModifyResourceConfig(args, {
+					client,
+					message,
+					say,
+					userId,
+					threadAuthorIds,
+					logger,
+				});
+				break;
+
+			case "delete_resource_config":
+				output = await handleDeleteResourceConfig(args, {
+					client,
+					message,
+					say,
+					userId,
+					threadAuthorIds,
+					logger,
+				});
+				break;
+
+			case "request_credentials":
+				output = await handleRequestCredentials(args, { client, message, say, userId, logger });
+				break;
+
+			case "save_config_file":
+				output = await handleSaveConfigFile(args, {
+					client,
+					message,
+					say,
+					userId,
+					threadAuthorIds,
+					logger,
+				});
 				break;
 
 			// Application-side web search (Ollama mode)

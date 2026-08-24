@@ -269,10 +269,143 @@ export async function initializeMcpRegistry(logger) {
 	}
 
 	_log(logger, "info", "MCP registry initialized");
+
+	// Keep the consolidated host map from drifting: config changes happen
+	// outside the bot too (UI, direct file edits), so refresh periodically
+	startHostsRefreshScheduler(logger);
+}
+
+/** Remove every host-map entry (including aliases) owned by one server. */
+function _removeHostsForServer(serverLabel) {
+	for (const [key, entry] of state.hosts.entries()) {
+		if (entry.server_label === serverLabel) state.hosts.delete(key);
+	}
+}
+
+/**
+ * Re-fetch the host list of one agent (ListHosts) and rebuild its share of
+ * the consolidated host map, dropping hosts that no longer exist. Called
+ * after a configuration change and by the periodic scheduler.
+ *
+ * @param {string} serverLabel - Agent label (e.g. "m8b-agent-01")
+ * @param {Object} [logger] - Logger instance
+ * @returns {Promise<{ok: boolean, hostCount?: number, error?: string}>}
+ */
+export async function refreshHostsForServer(serverLabel, logger) {
+	const server = state.servers.find((s) => s.server_label === serverLabel);
+	if (!server) {
+		return { ok: false, error: `Unknown MCP server "${serverLabel}"` };
+	}
+	if (server.tools.size > 0 && !server.tools.has("ListHosts")) {
+		return { ok: false, error: `Server "${serverLabel}" has no ListHosts tool` };
+	}
+
+	const connected = await _ensureConnected(server);
+	if (!connected) {
+		return { ok: false, error: `Could not connect to "${serverLabel}"` };
+	}
+
+	try {
+		const res = await server.client.callTool({ name: "ListHosts", arguments: {} }, undefined, {
+			timeout: 60000,
+		});
+		const hostsData = _parseToolResult(res);
+		_removeHostsForServer(serverLabel);
+		_indexHostsFromList(server, hostsData);
+		const hostCount = [...state.hosts.values()].filter(
+			(entry) => entry.server_label === serverLabel
+		).length;
+		_log(logger, "info", "Host map refreshed", { server: serverLabel, hostCount });
+		return { ok: true, hostCount };
+	} catch (e) {
+		_log(logger, "warn", "Host map refresh failed", { server: serverLabel, e: String(e) });
+		return { ok: false, error: String(e) };
+	}
+}
+
+/**
+ * Refresh the host map of every registered agent.
+ *
+ * @param {Object} [logger] - Logger instance
+ * @returns {Promise<{ok: boolean, refreshed: number, failed: number}>}
+ */
+export async function refreshAllHosts(logger) {
+	let refreshed = 0;
+	let failed = 0;
+	for (const server of state.servers) {
+		const result = await refreshHostsForServer(server.server_label, logger);
+		if (result.ok) refreshed += 1;
+		else failed += 1;
+	}
+	return { ok: failed === 0, refreshed, failed };
+}
+
+let hostsRefreshTimer = null;
+
+/**
+ * Start (or restart) the periodic host-map refresh. Interval comes from
+ * MCP_HOSTS_REFRESH_INTERVAL_MS (default 1 hour; 0 disables). The timer is
+ * unref'd so it never keeps the process alive.
+ *
+ * @param {Object} [logger] - Logger instance
+ */
+export function startHostsRefreshScheduler(logger) {
+	stopHostsRefreshScheduler();
+
+	const fromEnv = Number.parseInt(process.env.MCP_HOSTS_REFRESH_INTERVAL_MS || "", 10);
+	const intervalMs = Number.isFinite(fromEnv) ? fromEnv : 60 * 60 * 1000;
+	if (intervalMs <= 0) {
+		_log(logger, "info", "Periodic host-map refresh disabled (MCP_HOSTS_REFRESH_INTERVAL_MS<=0)");
+		return;
+	}
+
+	hostsRefreshTimer = setInterval(() => {
+		refreshAllHosts(logger).catch((e) => {
+			_log(logger, "warn", "Periodic host-map refresh failed", { e: String(e) });
+		});
+	}, intervalMs);
+	hostsRefreshTimer.unref?.();
+	_log(logger, "info", "Periodic host-map refresh scheduled", { intervalMs });
+}
+
+/** Stop the periodic host-map refresh (idempotent). */
+export function stopHostsRefreshScheduler() {
+	if (hostsRefreshTimer) {
+		clearInterval(hostsRefreshTimer);
+		hostsRefreshTimer = null;
+	}
+}
+
+/**
+ * Replace the registry's servers (tests only). Clears the host map and stops
+ * the refresh scheduler.
+ *
+ * @param {Array<Object>} servers - Registry-shaped server entries
+ */
+export function _setServersForTests(servers) {
+	state.servers = Array.isArray(servers) ? servers : [];
+	state.hosts.clear();
+	stopHostsRefreshScheduler();
 }
 
 export function getMcpServerCount() {
 	return state.servers.length;
+}
+
+/**
+ * Return the registered MetricsHub agents (connection settings only, no
+ * client/tool state). Used by the REST API client (ai/services/metricshub-api.js)
+ * which talks to the same agents on the same origin with the same token.
+ *
+ * @returns {Array<{server_label: string, server_url: string, token: string, allowSelfSignedCert: boolean}>}
+ */
+export function getMcpServers() {
+	return state.servers.map((s) => ({
+		server_label: s.server_label,
+		server_url: s.server_url,
+		token: s.token,
+		allowSelfSignedCert: s.allowSelfSignedCert === true,
+	}));
 }
 
 export function getAggregatedHosts() {

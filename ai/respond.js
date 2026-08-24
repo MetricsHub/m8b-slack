@@ -21,8 +21,10 @@ import {
 	SYSTEM_PROMPT,
 	TOKEN_LIMITS,
 } from "./config/system-prompt.js";
+import { getMcpServerCount } from "./mcp_registry.js";
 import { describeProviderError, getProvider } from "./providers/index.js";
 import { processCitations } from "./services/citations.js";
+import { isConfigAdmin } from "./services/config-editor.js";
 import { trimToContextBudget } from "./services/context-budget.js";
 import {
 	buildConversationInput,
@@ -176,6 +178,10 @@ export async function respond({
 
 	const userDisplayName = `<@${userId}>`;
 	const safetyIdentifier = createSafetyIdentifier(userId, teamId);
+
+	// MetricsHub config editing is allowlist-gated per requesting user: the
+	// tools are only exposed to the model when this user may actually use them
+	const configEditingAllowed = isConfigAdmin(userId);
 	let lastSeenResponseId = null;
 
 	// Resolve the active AI provider (openai or ollama)
@@ -239,6 +245,14 @@ export async function respond({
 		}
 		const messages = thread.messages || [];
 
+		// Human participants in this thread (bot messages excluded). Used to warn
+		// the approving admin when other people could have injected instructions.
+		const threadAuthorIds = new Set(
+			messages
+				.filter((msg) => !msg.bot_id && msg.user && msg.user !== context?.BOT_USER_ID)
+				.map((msg) => msg.user)
+		);
+
 		// Set up file upload manager: real uploads (OpenAI Files API), vision
 		// descriptions (local vision model), or no-op (attachments become notes).
 		// With the local Python sandbox, both Ollama managers also stage data
@@ -285,6 +299,7 @@ export async function respond({
 			codeFileIds: fileManager.codeFileIds,
 			provider,
 			knowledgeBaseAvailable,
+			configEditingAllowed,
 		});
 
 		// Log any configuration warnings
@@ -365,6 +380,12 @@ export async function respond({
 			uploadOnce: fileManager.uploadOnce,
 			slackAppContext,
 			filesUnsupported: fileManager.disabled === true,
+			configAdminNote:
+				getMcpServerCount() > 0
+					? configEditingAllowed
+						? "MetricsHub configuration changes: this user IS an authorized admin (config-editing tools are available)."
+						: "MetricsHub configuration changes: this user is NOT authorized; the config-editing tools are disabled for this conversation. If they ask for a configuration change, refuse and point them to an authorized admin."
+					: null,
 		});
 		const currentUserItem = input[input.length - 1];
 
@@ -401,6 +422,7 @@ export async function respond({
 		let hitIterationLimit = false;
 		let continueLoop = false;
 		let repliedViaTool = false;
+		let truncationRetries = 0;
 
 		// Stateless accumulation: items produced during this turn (assistant text,
 		// function calls, function outputs) that must be resent on each iteration
@@ -537,6 +559,7 @@ export async function respond({
 				hadText,
 				incompleteReason,
 				fullResponseText,
+				usage,
 			} = streamResult;
 
 			// Upload any generated files to Slack (code_interpreter output, OpenAI only)
@@ -599,11 +622,52 @@ export async function respond({
 				continue;
 			}
 
+			// A turn that consumed the entire output budget without completing a
+			// function call was almost certainly cut off mid-generation (typically
+			// while emitting a large tool-call argument) — Ollama reports such
+			// turns as "completed", so incompleteReason is no help. Continue with
+			// a corrective nudge instead of silently stopping mid-task.
+			const outputBudgetExhausted =
+				typeof usage?.outputTokens === "number" &&
+				typeof provider.maxOutputTokens === "number" &&
+				usage.outputTokens >= provider.maxOutputTokens;
+			if (
+				outputBudgetExhausted &&
+				(!functionCalls || functionCalls.length === 0) &&
+				truncationRetries < 2
+			) {
+				truncationRetries += 1;
+				logger.warn?.("[LOOP] Output token budget exhausted with no tool call; continuing", {
+					iteration: loopIteration,
+					outputTokens: usage.outputTokens,
+					maxOutputTokens: provider.maxOutputTokens,
+					truncationRetries,
+				});
+				const truncationNudge = {
+					role: "system",
+					content: [
+						{
+							type: "input_text",
+							text: "Your previous turn hit the output token limit and was CUT OFF — any tool call you were preparing was NEVER executed. Do not restate your plan. If you were about to call a tool, call it now with COMPACT arguments; to modify an existing configuration file, use save_config_file with the `edits` parameter (small find/replace operations) — NEVER retype the whole file. If you were instead finishing your final answer, briefly summarize what was cut off.",
+						},
+					],
+				};
+				if (stateless) {
+					transientItems = [truncationNudge];
+				} else {
+					input = [truncationNudge];
+				}
+				continueLoop = true;
+				continue;
+			}
+
 			// Process function calls
 			for (const fc of functionCalls) {
 				const outItems = await processFunctionCall(fc, {
 					client,
 					message,
+					userId,
+					threadAuthorIds,
 					say,
 					vectorStoreIds,
 					provider,
@@ -681,6 +745,7 @@ export async function respond({
 					codeFileIds: fileManager.codeFileIds,
 					provider,
 					knowledgeBaseAvailable,
+					configEditingAllowed,
 				});
 				logger.debug?.("Rebuilt tools array with updated code_interpreter files", {
 					codeFileCount: fileManager.codeFileIds.size,
@@ -885,6 +950,7 @@ async function appendCurrentMessage({
 	uploadOnce,
 	slackAppContext,
 	filesUnsupported = false,
+	configAdminNote = null,
 }) {
 	const contentItems = [{ type: "input_text", text: message.text }];
 
@@ -915,6 +981,9 @@ async function appendCurrentMessage({
 	);
 	if (userProfile.userTimezone) {
 		userContextParts.push(`User's timezone: ${userProfile.userTimezone}`);
+	}
+	if (configAdminNote) {
+		userContextParts.push(configAdminNote);
 	}
 	const slackEntities = Array.isArray(slackAppContext?.entities)
 		? slackAppContext.entities

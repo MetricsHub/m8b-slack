@@ -6,6 +6,7 @@ import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
 import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
 import { getWebSearchTool } from "../services/web-search.js";
+import { getMetricsHubConfigTools } from "./metricshub-config.js";
 
 const MAX_NAMESPACE_TOOLS = 9;
 const IMMEDIATE_MCP_TOOLS = new Set(["ListHosts", "SearchHost"]);
@@ -150,16 +151,25 @@ export const RUN_PYTHON_TOOL = {
  * @param {Object} options - Tool configuration options
  * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base indexed and usable
  * @param {boolean} [options.codeSandboxAvailable] - Local Python sandbox (run_python) enabled
+ * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of plain function tool definitions
  */
 export function buildFunctionToolsArray({
 	knowledgeBaseAvailable = false,
 	codeSandboxAvailable = false,
+	configEditingAllowed = false,
 } = {}) {
 	const tools = [];
 
 	// MCP function tools, flat (no namespaces, no deferred loading)
 	tools.push(...getOpenAiFunctionTools());
+
+	// MetricsHub configuration editing (REST API on the MCP agents). Hidden
+	// from unauthorized users entirely: the model should not waste turns on
+	// calls our own authorization check would deny anyway.
+	if (configEditingAllowed) {
+		tools.push(...getMetricsHubConfigTools());
+	}
 
 	// Prometheus PromQL tool (if configured)
 	const promqlTool = getPromQLTool();
@@ -219,6 +229,7 @@ export function buildFunctionToolsArray({
  * @param {Set<string>} options.codeFileIds - File IDs for code interpreter
  * @param {import("../providers/index.js").AiProvider} [options.provider] - Active AI provider
  * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base usable (Ollama mode)
+ * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of tool definitions
  */
 export function buildToolsArray({
@@ -226,11 +237,13 @@ export function buildToolsArray({
 	codeFileIds = new Set(),
 	provider,
 	knowledgeBaseAvailable = false,
+	configEditingAllowed = false,
 }) {
 	if (provider && !provider.capabilities.toolNamespaces) {
 		return buildFunctionToolsArray({
 			knowledgeBaseAvailable,
 			codeSandboxAvailable: provider.capabilities.localCodeInterpreter === true,
+			configEditingAllowed,
 		});
 	}
 
@@ -258,6 +271,21 @@ export function buildToolsArray({
 	hasDeferredTools ||= mcpNamespaces.some((namespace) =>
 		namespace.tools.some((tool) => tool.defer_loading)
 	);
+
+	// MetricsHub configuration editing (used rarely; schemas load on demand).
+	// Only exposed when the requesting user is an authorized config admin.
+	const configTools = configEditingAllowed ? getMetricsHubConfigTools() : [];
+	if (configTools.length > 0) {
+		tools.push(
+			...buildFunctionNamespaces({
+				name: "metricshub_config",
+				description:
+					"Edit MetricsHub agent configuration files (YAML): add or modify monitored resources, collect credentials securely.",
+				functionTools: configTools,
+			})
+		);
+		hasDeferredTools = true;
+	}
 
 	// Prometheus PromQL tool (if configured)
 	const promqlTool = getPromQLTool();

@@ -47,6 +47,8 @@ function makeTelemetryResult() {
 jest.unstable_mockModule("./ai/mcp_registry", () => ({
 	getOpenAiFunctionTools: () => [{ name: "GetMetricsFromCacheForHost" }],
 	executeMcpFunctionCall: jest.fn(async () => makeTelemetryResult()),
+	getMcpServers: () => [],
+	refreshHostsForServer: jest.fn(async () => ({ ok: true })),
 }));
 
 const { processFunctionCall } = await import("../function-calls.js");
