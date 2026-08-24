@@ -16,7 +16,6 @@ import {
 	isSafeConfigFileName,
 	normalizeCredentialFields,
 	renderConfigDiff,
-	renderDiffAttachments,
 } from "../config-editor.js";
 import { _setServerSourceForTests } from "../metricshub-api.js";
 import {
@@ -51,12 +50,8 @@ async function waitFor(predicate, attempts = 100) {
 }
 
 function extractInteractionId(sayMock) {
-	const call = sayMock.mock.calls[0][0];
-	const allBlocks = [
-		...(call.blocks || []),
-		...(call.attachments || []).flatMap((attachment) => attachment.blocks || []),
-	];
-	const actions = allBlocks.find((block) => block.type === "actions");
+	const blocks = sayMock.mock.calls[0][0].blocks;
+	const actions = blocks.find((block) => block.type === "actions");
 	const decoded = decodeInteractionValue(actions.elements[0].value);
 	expect(decoded.foreign).toBe(false);
 	return decoded.id;
@@ -130,36 +125,6 @@ describe("config-editor", () => {
 		it("handles new files and no-op edits", () => {
 			expect(renderConfigDiff("", "a: 1")).toContain("+ a: 1");
 			expect(renderConfigDiff("same", "same")).toBe("(no changes)");
-		});
-	});
-
-	describe("renderDiffAttachments", () => {
-		it("emits gray/red/green side-bar attachments in reading order", () => {
-			const oldText = ["a: 1", "b: 2", "c: 3", "d: 4", "e: 5", "f: 6"].join("\n");
-			const newText = ["a: 1", "b: 2", "c: 3", "d: 42", "e: 5", "f: 6"].join("\n");
-
-			const attachments = renderDiffAttachments(oldText, newText);
-			expect(attachments.map((a) => a.color)).toEqual(["#B6B6B6", "#E01E5A", "#2EB67D", "#B6B6B6"]);
-
-			const texts = attachments.map((a) => a.blocks[0].text.text);
-			expect(texts[0]).toContain("... 1 unchanged line(s) ...");
-			expect(texts[0]).toContain("b: 2");
-			expect(texts[1]).toBe("```d: 4```");
-			expect(texts[2]).toBe("```d: 42```");
-			expect(texts[3]).toContain("e: 5");
-			// No +/- markers: the colored bars carry that meaning
-			expect(texts.join("")).not.toContain("- d");
-			expect(texts.join("")).not.toContain("+ d");
-		});
-
-		it("omits phantom hunks (pure addition to a new file shows only green)", () => {
-			const attachments = renderDiffAttachments("", "a: 1\nb: 2");
-			expect(attachments.map((a) => a.color)).toEqual(["#2EB67D"]);
-			expect(attachments[0].blocks[0].text.text).toBe("```a: 1\nb: 2```");
-		});
-
-		it("returns nothing for identical content", () => {
-			expect(renderDiffAttachments("same", "same")).toEqual([]);
 		});
 	});
 

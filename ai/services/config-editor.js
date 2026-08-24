@@ -122,30 +122,6 @@ export function isSafeConfigFileName(fileName) {
  * @returns {string} Human-readable diff
  */
 export function renderConfigDiff(oldText, newText, maxChars = MAX_DIFF_CHARS) {
-	const regions = _computeDiffRegions(oldText, newText);
-	if (!regions) return "(no changes)";
-
-	const lines = [];
-	if (regions.foldedBefore > 0) lines.push(`  ... ${regions.foldedBefore} unchanged line(s) ...`);
-	for (const line of regions.contextBefore) lines.push(`  ${line}`);
-	for (const line of regions.removed) lines.push(`- ${line}`);
-	for (const line of regions.added) lines.push(`+ ${line}`);
-	for (const line of regions.contextAfter) lines.push(`  ${line}`);
-	if (regions.foldedAfter > 0) lines.push(`  ... ${regions.foldedAfter} unchanged line(s) ...`);
-
-	let out = lines.join("\n");
-	if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n... (diff truncated)`;
-	return out;
-}
-
-/**
- * Compute the changed region between two file versions: common prefix/suffix
- * lines are folded away, keeping two context lines on each side.
- *
- * @returns {null | {foldedBefore: number, contextBefore: string[], removed: string[],
- *   added: string[], contextAfter: string[], foldedAfter: number}} null when identical
- */
-function _computeDiffRegions(oldText, newText) {
 	const oldLines = String(oldText).split(/\r?\n/);
 	const newLines = String(newText).split(/\r?\n/);
 
@@ -160,79 +136,23 @@ function _computeDiffRegions(oldText, newText) {
 		endNew--;
 	}
 
-	if (start === endOld && start === endNew) return null;
+	if (start === endOld && start === endNew) return "(no changes)";
 
 	const context = 2;
 	const ctxStart = Math.max(0, start - context);
+	const lines = [];
+	if (ctxStart > 0) lines.push(`  ... ${ctxStart} unchanged line(s) ...`);
+	for (let i = ctxStart; i < start; i++) lines.push(`  ${oldLines[i]}`);
+	for (let i = start; i < endOld; i++) lines.push(`- ${oldLines[i]}`);
+	for (let i = start; i < endNew; i++) lines.push(`+ ${newLines[i]}`);
 	const tailEnd = Math.min(oldLines.length, endOld + context);
+	for (let i = endOld; i < tailEnd; i++) lines.push(`  ${oldLines[i]}`);
+	if (tailEnd < oldLines.length)
+		lines.push(`  ... ${oldLines.length - tailEnd} unchanged line(s) ...`);
 
-	return {
-		foldedBefore: ctxStart,
-		contextBefore: oldLines.slice(ctxStart, start),
-		removed: oldLines.slice(start, endOld),
-		added: newLines.slice(start, endNew),
-		contextAfter: oldLines.slice(endOld, tailEnd),
-		foldedAfter: oldLines.length - tailEnd,
-	};
-}
-
-/** Slack side-bar colors for the diff attachments (GitHub-ish red/green). */
-const DIFF_COLORS = { removed: "#E01E5A", added: "#2EB67D", context: "#B6B6B6" };
-
-/** Per-attachment cap; a Slack section's mrkdwn text tops out at 3000 chars. */
-const MAX_DIFF_ATTACHMENT_CHARS = 2400;
-
-function _diffAttachment(color, fallback, lines) {
-	let text = lines.join("\n");
-	if (text.length > MAX_DIFF_ATTACHMENT_CHARS) {
-		text = `${text.slice(0, MAX_DIFF_ATTACHMENT_CHARS)}\n... (truncated)`;
-	}
-	return {
-		color,
-		fallback,
-		blocks: [{ type: "section", text: { type: "mrkdwn", text: `\`\`\`${text}\`\`\`` } }],
-	};
-}
-
-/**
- * Render the change as Slack attachments with colored side bars — the closest
- * Block Kit gets to a red/green diff (mrkdwn has no text colors or
- * backgrounds). Removed lines get a red bar, added lines a green bar,
- * context a gray one.
- *
- * @param {string} oldText - Current file content ("" for a new file)
- * @param {string} newText - Proposed file content
- * @returns {Array<Object>} Slack message attachments (empty when identical)
- */
-export function renderDiffAttachments(oldText, newText) {
-	const regions = _computeDiffRegions(oldText, newText);
-	if (!regions) return [];
-
-	const attachments = [];
-
-	const before = [...regions.contextBefore];
-	if (regions.foldedBefore > 0) before.unshift(`... ${regions.foldedBefore} unchanged line(s) ...`);
-	if (before.length > 0) {
-		attachments.push(_diffAttachment(DIFF_COLORS.context, "Unchanged context", before));
-	}
-
-	// A hunk that is a single empty line is a phantom (e.g. the "old" side of
-	// a brand-new file); rendering it would show an empty colored block
-	const isPhantom = (lines) => lines.length === 1 && lines[0] === "";
-	if (regions.removed.length > 0 && !isPhantom(regions.removed)) {
-		attachments.push(_diffAttachment(DIFF_COLORS.removed, "Removed lines", regions.removed));
-	}
-	if (regions.added.length > 0 && !isPhantom(regions.added)) {
-		attachments.push(_diffAttachment(DIFF_COLORS.added, "Added lines", regions.added));
-	}
-
-	const after = [...regions.contextAfter];
-	if (regions.foldedAfter > 0) after.push(`... ${regions.foldedAfter} unchanged line(s) ...`);
-	if (after.length > 0) {
-		attachments.push(_diffAttachment(DIFF_COLORS.context, "Unchanged context", after));
-	}
-
-	return attachments;
+	let out = lines.join("\n");
+	if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n... (diff truncated)`;
+	return out;
 }
 
 /**
@@ -630,7 +550,7 @@ async function _reviewAndSaveFile({
 	// Ask the requesting user to approve the change (diff on the SUBSTITUTED
 	// content would leak ciphertext length only — show the raw content diff
 	// instead so placeholders stay visible and reviewable)
-	const diffAttachments = renderDiffAttachments(fileExists ? currentContent : "", rawContent);
+	const diff = renderConfigDiff(fileExists ? currentContent : "", rawContent);
 	const summary = String(changeSummary || "(no summary provided)").slice(0, 500);
 
 	// Confused-deputy guard: when other people wrote in this thread, their
@@ -665,9 +585,6 @@ async function _reviewAndSaveFile({
 		data: { agentLabel, fileName },
 	});
 
-	// Layout note: top-level blocks always render ABOVE attachments, so the
-	// header and warning are blocks, while the colored diff hunks and the
-	// buttons (which must sit below the diff) live in attachments.
 	const posted = await say({
 		text: `Approve configuration change to ${fileName} on ${agentLabel}?`,
 		blocks: [
@@ -678,31 +595,27 @@ async function _reviewAndSaveFile({
 					text: `:pencil: *Configuration change pending approval*\n*Agent:* \`${agentLabel}\` — *File:* \`${fileName}\`${fileExists ? "" : " _(new file)_"}\n*Change:* ${summary}\n_Valid for ${Math.round(timeoutMs / 60000)} minutes._`,
 				},
 			},
-			...multiAuthorWarning,
-		],
-		attachments: [
-			...diffAttachments,
 			{
-				fallback: "Approve or reject the configuration change",
-				blocks: [
+				type: "section",
+				text: { type: "mrkdwn", text: `\`\`\`${diff}\`\`\`` },
+			},
+			...multiAuthorWarning,
+			{
+				type: "actions",
+				elements: [
 					{
-						type: "actions",
-						elements: [
-							{
-								type: "button",
-								style: "primary",
-								text: { type: "plain_text", text: "Approve & save" },
-								action_id: ACTION_IDS.configApprove,
-								value: encodeInteractionValue(id),
-							},
-							{
-								type: "button",
-								style: "danger",
-								text: { type: "plain_text", text: "Reject" },
-								action_id: ACTION_IDS.configReject,
-								value: encodeInteractionValue(id),
-							},
-						],
+						type: "button",
+						style: "primary",
+						text: { type: "plain_text", text: "Approve & save" },
+						action_id: ACTION_IDS.configApprove,
+						value: encodeInteractionValue(id),
+					},
+					{
+						type: "button",
+						style: "danger",
+						text: { type: "plain_text", text: "Reject" },
+						action_id: ACTION_IDS.configReject,
+						value: encodeInteractionValue(id),
 					},
 				],
 			},
@@ -1093,9 +1006,6 @@ async function _disableInteractionMessage(client, posted, text, logger) {
 			ts: posted.ts,
 			text,
 			blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
-			// chat.update keeps attachments unless explicitly replaced — clear
-			// them so no stale diff or buttons survive the expiry
-			attachments: [],
 		});
 	} catch (e) {
 		logger?.debug?.("Failed to update expired interaction message", { e: String(e) });
