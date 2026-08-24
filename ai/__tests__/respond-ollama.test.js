@@ -8,9 +8,7 @@ import { beforeEach, describe, expect, it, jest } from "@jest/globals";
 
 const streamOnceMock = jest.fn();
 
-// Note: mock specifiers resolve from the project root (jest.setup.js location)
-// and are extension-less because jest's moduleNameMapper strips ".js"
-jest.unstable_mockModule("./ai/services/streaming", () => ({
+jest.unstable_mockModule("../services/streaming.js", () => ({
 	streamOnce: streamOnceMock,
 	buildResponseRequest: jest.fn(),
 }));
@@ -34,7 +32,7 @@ const fakeOllamaProvider = {
 	healthCheck: async () => ({ ok: true }),
 };
 
-jest.unstable_mockModule("./ai/providers/index", () => ({
+jest.unstable_mockModule("../providers/index.js", () => ({
 	getProvider: () => fakeOllamaProvider,
 	describeProviderError: () => "Friendly local AI error.",
 	resetProviderCache: () => {},

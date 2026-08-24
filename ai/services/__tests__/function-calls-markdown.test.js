@@ -42,9 +42,7 @@ function makeTelemetryResult() {
 	};
 }
 
-// Note: mock specifiers resolve from the project root (jest.setup.js location)
-// and are extension-less because jest's moduleNameMapper strips ".js"
-jest.unstable_mockModule("./ai/mcp_registry", () => ({
+jest.unstable_mockModule("../../mcp_registry.js", () => ({
 	getOpenAiFunctionTools: () => [{ name: "GetMetricsFromCacheForHost" }],
 	executeMcpFunctionCall: jest.fn(async () => makeTelemetryResult()),
 	getMcpServers: () => [],
