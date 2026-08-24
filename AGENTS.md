@@ -48,7 +48,7 @@ m8b-slackbot/
 4. **Tab indentation**
 5. **100 character line width** (soft limit)
 6. **Trailing commas** in multi-line structures (ES5 style)
-7. **Automatic line endings** (uses native EOL for your OS)
+7. **CRLF line endings** in the working tree (development happens on Windows; git stores LF via autocrlf, Prettier uses endOfLine auto, and Biome enforces crlf)
 
 ### Naming Conventions
 
