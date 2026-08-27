@@ -101,6 +101,20 @@ const SAFETY_LIMITS = {
 	repetitionThreshold: 0.85, // If >85% of chars are identical, stop
 };
 
+/**
+ * Placeholder text models emit when a continuation nudge says no further
+ * output is needed ("[No response needed]"): LLMs cannot reliably produce an
+ * EMPTY response, so they write a meta-note instead. Streaming that to Slack
+ * posts junk. Output is held back until it exceeds HOLDBACK_CHARS (real
+ * answers flush immediately); a response that ends while still held and
+ * matches this pattern is suppressed entirely — the Slack stream is never
+ * even opened. Deliberately narrow: phrases like "No action needed." can be
+ * legitimate ANSWERS and must never match.
+ */
+const NO_REPLY_PLACEHOLDER =
+	/^[\s([{*_`-]*no\s+(further\s+|additional\s+)?(response|reply|output|comment|message)\s*(is\s+)?(needed|required|necessary)?[\s\])}*_`.!-]*$/i;
+const HOLDBACK_CHARS = 64;
+
 function sanitizeForStatus(text) {
 	return text
 		.replace(/[*_`~]/g, "")
@@ -212,6 +226,12 @@ export async function streamOnce(
 	let responseUsage = null;
 	const streamStartTime = Math.floor(Date.now() / 1000); // Unix timestamp for filtering old files
 
+	// End-to-end timing, measured app-side: vLLM only reports its `metrics`
+	// object on /v1/chat/completions, not /v1/responses, and OpenAI reports
+	// none — so time-to-first-token and generation rate are computed here.
+	const startedAtMs = Date.now();
+	let firstTokenAtMs = null;
+
 	// Event counters for diagnostics
 	const evtCounters = {
 		reasoning_summary_delta: 0,
@@ -241,6 +261,10 @@ export async function streamOnce(
 		"response.reasoning_summary_part.added",
 		"response.reasoning_summary_text.done",
 		"response.reasoning_summary_part.done",
+		// vLLM emits detailed reasoning parts instead of summaries
+		"response.reasoning_part.added",
+		"response.reasoning_part.done",
+		"response.reasoning_text.done",
 		"response.content_part.added",
 		"response.content_part.done",
 		"response.output_text.done",
@@ -303,6 +327,51 @@ export async function streamOnce(
 
 	let streamController = null;
 
+	// Output holdback: keep the first HOLDBACK_CHARS unstreamed so a pure
+	// no-reply placeholder (or a whitespace-only / tool-call-only turn) can be
+	// dropped without ever opening a Slack stream
+	let heldText = "";
+	let holdingBack = true;
+	let suppressedOutput = false;
+
+	// Whitespace hygiene for what reaches Slack: models pad their text with
+	// newlines around tool-call blocks. Leading whitespace is trimmed from the
+	// first emission; trailing whitespace is deferred and only emitted when
+	// real text follows it (discarded at stream end). The Slack stream is
+	// opened lazily on the first actual emission, so a turn that produces no
+	// visible text never posts an (empty) message.
+	let pendingTrailingWhitespace = "";
+	let emittedAnything = false;
+
+	async function emitText(text) {
+		let combined = pendingTrailingWhitespace + text;
+		if (!emittedAnything) {
+			combined = combined.replace(/^\s+/, "");
+		}
+		const trailingMatch = combined.match(/\s+$/);
+		pendingTrailingWhitespace = trailingMatch ? trailingMatch[0] : "";
+		const emit = pendingTrailingWhitespace
+			? combined.slice(0, -pendingTrailingWhitespace.length)
+			: combined;
+		if (!emit) return;
+
+		if (onStreamStart && !streamController) {
+			streamController = await onStreamStart(newResponseId);
+		}
+		emittedAnything = true;
+		if (onTextChunk) {
+			await onTextChunk(emit, streamController);
+		}
+	}
+
+	async function flushHeldText() {
+		if (!holdingBack) return;
+		holdingBack = false;
+		const text = heldText;
+		heldText = "";
+		await emitText(text);
+	}
+
 	try {
 		for await (const evt of stream) {
 			if ("response" in evt && evt.response) {
@@ -314,6 +383,15 @@ export async function streamOnce(
 			// Track response ID
 			if (!newResponseId && "response" in evt && evt.response?.id) {
 				newResponseId = evt.response.id;
+			}
+
+			// First generated content of any kind (reasoning, text, tool-call
+			// arguments): everything before this is queueing + prompt processing
+			if (
+				firstTokenAtMs === null &&
+				(("delta" in evt && evt.delta) || evt.type === "response.output_item.added")
+			) {
+				firstTokenAtMs = Date.now();
 			}
 
 			// Process reasoning events (before text output starts)
@@ -475,10 +553,8 @@ export async function streamOnce(
 					try {
 						await setStatus({ status: "writing..." });
 					} catch {}
-
-					if (onStreamStart) {
-						streamController = await onStreamStart(newResponseId);
-					}
+					// The Slack stream is opened lazily on the first holdback flush,
+					// so a suppressed placeholder never creates a Slack message
 				}
 
 				fullResponseText += evt.delta;
@@ -505,8 +581,15 @@ export async function streamOnce(
 
 				// Clean undesirable tokens
 				const cleaned = evt.delta.replace(/\ue200filecite:[^\s]+/g, "").replace(/【】/g, "");
-				if (cleaned.length && onTextChunk) {
-					await onTextChunk(cleaned, streamController);
+				if (cleaned.length) {
+					if (holdingBack) {
+						heldText += cleaned;
+						if (heldText.length > HOLDBACK_CHARS) {
+							await flushHeldText();
+						}
+					} else {
+						await emitText(cleaned);
+					}
 				}
 				continue;
 			}
@@ -575,6 +658,30 @@ export async function streamOnce(
 				}
 			}
 		}
+
+		// Resolve the holdback: whitespace-only output and no-reply placeholders
+		// are dropped entirely (no Slack stream is ever opened for them); any
+		// real (even one-emoji) answer is flushed to Slack now
+		if (holdingBack) {
+			holdingBack = false;
+			const candidate = heldText.trim();
+			heldText = "";
+			if (!candidate) {
+				// Tool-call-only or whitespace-only turn: nothing to show
+				suppressedOutput = evtCounters.output_text_delta > 0;
+				fullResponseText = "";
+			} else if (NO_REPLY_PLACEHOLDER.test(candidate)) {
+				suppressedOutput = true;
+				fullResponseText = "";
+				logger?.info?.("[OUTPUT] Suppressed no-reply placeholder text", { text: candidate });
+			} else {
+				await emitText(candidate);
+			}
+		}
+
+		// The model's own leading/trailing padding (newlines around tool-call
+		// blocks) must not survive into the persisted conversation either
+		fullResponseText = fullResponseText.trim();
 	} finally {
 		// Stop streamer if active
 		if (streamController && typeof streamController.stop === "function") {
@@ -622,7 +729,9 @@ export async function streamOnce(
 		.slice(0, 10)
 		.map(([type, count]) => ({ type, count }));
 
-	const hadText = evtCounters.output_text_delta > 0;
+	// Suppressed output (placeholder or whitespace-only) counts as no text:
+	// the loop must not treat it as a delivered answer (nor persist it)
+	const hadText = evtCounters.output_text_delta > 0 && !suppressedOutput;
 	const validFunctionCalls = functionCalls.filter(Boolean);
 	const validFiles = outputFiles.filter((f) => f?.file_id);
 	const mappedUsage = responseUsage
@@ -635,6 +744,18 @@ export async function streamOnce(
 				totalTokens: responseUsage.total_tokens,
 			}
 		: undefined;
+
+	const finishedAtMs = Date.now();
+	const generationMs = firstTokenAtMs === null ? null : finishedAtMs - firstTokenAtMs;
+	const timing = {
+		durationMs: finishedAtMs - startedAtMs,
+		timeToFirstTokenMs: firstTokenAtMs === null ? null : firstTokenAtMs - startedAtMs,
+		// Generated tokens (reasoning included) per second of generation time
+		tokensPerSecond:
+			generationMs > 0 && typeof mappedUsage?.outputTokens === "number"
+				? Math.round((mappedUsage.outputTokens / (generationMs / 1000)) * 10) / 10
+				: null,
+	};
 
 	if (fullResponseText) {
 		logger?.info?.(
@@ -668,6 +789,7 @@ export async function streamOnce(
 				? `incomplete: ${incompleteReason}`
 				: "unknown",
 		usage: mappedUsage,
+		timing,
 	});
 
 	// Only log detailed summary if there's something notable
@@ -678,6 +800,8 @@ export async function streamOnce(
 		textChars: fullResponseText.length || undefined,
 		reasoningChars: reasoningBuf.length || undefined,
 		incomplete: incompleteReason || undefined,
+		durationMs: timing.durationMs,
+		tokensPerSecond: timing.tokensPerSecond ?? undefined,
 	};
 	// Add unexpected events only if present
 	if (otherTypesSummary.length > 0) {
@@ -714,6 +838,7 @@ export async function streamOnce(
 		sawCompleted,
 		fullResponseText,
 		usage: mappedUsage,
+		timing,
 		streamController,
 		debug: {
 			startedWriting,

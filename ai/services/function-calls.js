@@ -88,10 +88,6 @@ export async function processFunctionCall(functionCall, context) {
 				output = await handleSlackReaction(args, client, message);
 				break;
 
-			case "slack_add_reply":
-				output = await handleSlackReply(args, say, logger);
-				break;
-
 			case "update_knowledge":
 				output = knowledgeBase
 					? await handleLocalUpdateKnowledge(args, knowledgeBase, say, logger)
@@ -335,21 +331,6 @@ async function handleSlackReaction(args, client, message) {
 		}
 		throw e;
 	}
-}
-
-/**
- * Handle slack_add_reply function call.
- */
-async function handleSlackReply(args, say, logger) {
-	const text = String(args.text || "").trim();
-
-	if (text) {
-		await say({ markdown_text: text });
-		return { ok: true };
-	}
-
-	logger?.debug?.("slack_add_reply called without text argument");
-	return { ok: false, error: "No text provided" };
 }
 
 /**

@@ -42,6 +42,7 @@ const { respond } = await import("../respond.js");
 const { MAX_AGENT_ITERATIONS } = await import("../config/providers.js");
 const conversationStore = await import("../services/conversation-store.js");
 const { clearConversationStore, conversationKey, getConversation } = conversationStore;
+const { getTokenCalibration, resetTokenCalibration } = await import("../utils/tokens.js");
 
 function textResult(text, responseId = "resp_1") {
 	return {
@@ -130,6 +131,7 @@ function allText(input) {
 beforeEach(() => {
 	streamOnceMock.mockReset();
 	clearConversationStore();
+	resetTokenCalibration();
 	process.env.KNOWLEDGE_BASE_DIR = "data/does-not-exist-for-tests";
 });
 
@@ -160,6 +162,34 @@ describe("respond in Ollama mode", () => {
 		}
 	});
 
+	it("processes a bare attachment sent without any message text", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Nice screenshot. Now what?"));
+
+		const harness = makeHarness({ text: "" });
+		harness.message.files = [{ id: "F1", name: "error.png", mimetype: "image/png" }];
+		await runRespond(harness);
+
+		expect(streamOnceMock).toHaveBeenCalledTimes(1);
+		const [params] = streamOnceMock.mock.calls[0];
+
+		// The user message reached the model, carrying the attachment (as a
+		// note on this capability-less fake provider), with no empty text item
+		const userItems = params.input.filter((item) => item?.role === "user");
+		expect(userItems.length).toBeGreaterThan(0);
+		const lastUser = userItems[userItems.length - 1];
+		expect(lastUser.content.length).toBeGreaterThan(0);
+		expect(lastUser.content.every((c) => c.text !== "")).toBe(true);
+		expect(allText(params.input)).toContain("error.png");
+	});
+
+	it("still ignores a message with neither text nor files", async () => {
+		const harness = makeHarness({ text: "" });
+		await runRespond(harness);
+
+		expect(streamOnceMock).not.toHaveBeenCalled();
+		expect(harness.say).not.toHaveBeenCalled();
+	});
+
 	it("keeps multi-turn context in the same Slack thread without previous_response_id", async () => {
 		streamOnceMock.mockResolvedValueOnce(textResult("Noted, Bertrand. What do you want?"));
 
@@ -186,6 +216,84 @@ describe("respond in Ollama mode", () => {
 		expect(inputText).toContain("Noted, Bertrand. What do you want?");
 		expect(inputText).toContain("What is my name?");
 		expect(params.previous_response_id).toBeFalsy();
+	});
+
+	it("records prompt-token calibration from the server's reported usage", async () => {
+		streamOnceMock.mockResolvedValueOnce({
+			...textResult("Fine."),
+			usage: { inputTokens: 5000, outputTokens: 40, totalTokens: 5040 },
+		});
+
+		await runRespond(makeHarness({ text: "Is the server up?" }));
+
+		const calibration = getTokenCalibration();
+		expect(calibration.samples).toBe(1);
+		expect(calibration.ema).toBeGreaterThan(0);
+	});
+
+	it("does not record calibration when the server reports no usage", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Fine."));
+
+		await runRespond(makeHarness({ text: "Is the server up?" }));
+
+		expect(getTokenCalibration().samples).toBe(0);
+	});
+
+	it("persists the user-context note and never duplicates it (prefix-cache stability)", async () => {
+		const countContextNotes = (items) =>
+			items.filter(
+				(item) =>
+					item?.role === "system" &&
+					item?.content?.[0]?.type === "input_text" &&
+					item.content[0].text.includes("User's Slack ID:")
+			).length;
+
+		streamOnceMock.mockResolvedValueOnce(textResult("Fine."));
+		await runRespond(makeHarness({ text: "First message.", ts: "100.2" }));
+
+		// The note is persisted with the conversation, right before the message
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		const storedAfterTurn1 = getConversation(key);
+		expect(countContextNotes(storedAfterTurn1)).toBe(1);
+		expect(storedAfterTurn1[0].content[0].text).toContain("User's Slack ID:");
+		expect(allText([storedAfterTurn1[1]])).toContain("First message.");
+
+		streamOnceMock.mockResolvedValueOnce(textResult("Still fine."));
+		await runRespond(makeHarness({ text: "Second message.", ts: "100.3" }));
+
+		// Same user, same context: the note appears exactly once in the request,
+		// at its original (replayed) position — the token prefix is unchanged
+		const [params] = streamOnceMock.mock.calls[1];
+		expect(countContextNotes(params.input)).toBe(1);
+		const noteIndex = params.input.findIndex(
+			(item) => item?.role === "system" && item?.content?.[0]?.text?.includes("User's Slack ID:")
+		);
+		const firstMessageIndex = params.input.findIndex((item) =>
+			allText([item]).includes("First message.")
+		);
+		expect(noteIndex).toBeLessThan(firstMessageIndex);
+
+		// And the store still carries exactly one
+		expect(countContextNotes(getConversation(key))).toBe(1);
+	});
+
+	it("appends a fresh user-context note when a different user joins the thread", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Hello U1."));
+		await runRespond(makeHarness({ text: "Hi from U1.", ts: "100.2" }));
+
+		streamOnceMock.mockResolvedValueOnce(textResult("Hello U2."));
+		const other = makeHarness({ text: "Hi from U2.", ts: "100.3" });
+		other.context = { ...other.context, userId: "U2" };
+		other.message.user = "U2";
+		await runRespond(other);
+
+		const [params] = streamOnceMock.mock.calls[1];
+		const notes = params.input.filter(
+			(item) => item?.role === "system" && item?.content?.[0]?.text?.includes("User's Slack ID:")
+		);
+		expect(notes).toHaveLength(2);
+		expect(notes[0].content[0].text).toContain("<@U1>");
+		expect(notes[1].content[0].text).toContain("<@U2>");
 	});
 
 	it("runs the full agent loop: function call -> execution -> result -> final answer", async () => {
@@ -315,93 +423,78 @@ describe("respond in Ollama mode", () => {
 		expect(answers).toHaveLength(1);
 	});
 
-	it("continues after a reply-only turn and stays silent when the reply was the answer", async () => {
-		// A slack_add_reply with no streamed text is ambiguous (interim note or
-		// full answer), so the loop runs one more nudged turn; a model whose
-		// reply WAS the answer then produces nothing, and no fallback is posted
+	it("continues after a streamed preamble + data call, without repeating the preamble", async () => {
+		// Rule 13 without slack_add_reply: the model streams a short interim
+		// note in the SAME turn as its data tool call, then answers next turn
+		streamOnceMock
+			.mockResolvedValueOnce({
+				...textResult("On it. Grabbing the CPU numbers."),
+				functionCalls: [
+					{
+						type: "function_call",
+						call_id: "call_1",
+						name: "search_knowledge_base",
+						arguments: '{"query":"cpu"}',
+					},
+				],
+			})
+			.mockResolvedValueOnce(textResult("Average CPU: 42%. You're welcome."));
+
+		const harness = makeHarness({ text: "Show me the average cpu utilization" });
+		await runRespond(harness);
+
+		// The loop continued past the preamble turn, telling the model its
+		// message is already posted
+		expect(streamOnceMock).toHaveBeenCalledTimes(2);
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		expect(allText(secondParams.input)).toContain("Do NOT repeat it");
+
+		// Both the preamble and the final answer are persisted; the nudge is not
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		const storedText = allText(getConversation(key));
+		expect(storedText).toContain("On it. Grabbing the CPU numbers.");
+		expect(storedText).toContain("Average CPU: 42%. You're welcome.");
+		expect(storedText).not.toContain("Do NOT repeat it");
+
+		// No fallback message was posted
+		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
+		expect(saidTexts.join("\n")).not.toContain("I've got nothing");
+	});
+
+	it("accepts a reaction-only response without posting the got-nothing fallback", async () => {
+		// Rule 11: a greeting may be answered with just an emoji reaction. The
+		// follow-up turn produces no output; that must not look like a failure.
 		streamOnceMock
 			.mockResolvedValueOnce(
 				functionCallResult([
 					{
 						type: "function_call",
 						call_id: "call_1",
-						name: "slack_add_reply",
-						arguments: '{"text":"I have no idea. Ask the platform team."}',
+						name: "slack_add_reaction",
+						arguments: '{"emoji":"wave"}',
 					},
 				])
 			)
 			.mockResolvedValueOnce(functionCallResult([], "resp_silent"));
 
-		const harness = makeHarness({ text: "Which LLM model are you running on?" });
+		const harness = makeHarness({ text: "Hey!" });
 		await runRespond(harness);
 
-		// The reply went out through say()
-		expect(harness.say).toHaveBeenCalledWith({
-			markdown_text: "I have no idea. Ask the platform team.",
-		});
-
-		// One nudged follow-up turn ran, telling the model not to repeat itself
-		expect(streamOnceMock).toHaveBeenCalledTimes(2);
-		const [secondParams] = streamOnceMock.mock.calls[1];
-		expect(allText(secondParams.input)).toContain("Do NOT repeat or rephrase");
-
-		// The model stayed silent: no "I've got nothing" fallback, and the
-		// reply is the only thread message (say is also used for the MCP
-		// config warning, so count reply-shaped calls only)
+		expect(harness.client.reactions.add).toHaveBeenCalledWith(
+			expect.objectContaining({ name: "wave" })
+		);
 		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
 		expect(saidTexts.join("\n")).not.toContain("I've got nothing");
-		expect(harness.say.mock.calls.filter(([arg]) => arg?.markdown_text)).toHaveLength(1);
 	});
 
-	it("keeps working after an interim slack_add_reply progress note", async () => {
-		// Regression: "Show me the graph of the average cpu utilization" — the
-		// model's first turn was ONLY a "working on it" slack_add_reply (rule 13),
-		// and the loop treated it as the delivered answer and stopped, dropping
-		// the actual task (no data fetched, no chart produced)
-		streamOnceMock
-			.mockResolvedValueOnce(
-				functionCallResult([
-					{
-						type: "function_call",
-						call_id: "call_1",
-						name: "slack_add_reply",
-						arguments: '{"text":"On it. Grabbing the hosts and their CPU numbers."}',
-					},
-				])
-			)
-			.mockResolvedValueOnce(
-				functionCallResult(
-					[
-						{
-							type: "function_call",
-							call_id: "call_2",
-							name: "search_knowledge_base",
-							arguments: '{"query":"cpu"}',
-						},
-					],
-					"resp_work"
-				)
-			)
-			.mockResolvedValueOnce(textResult("Here is your chart. Average CPU: 42%."));
+	it("still posts the got-nothing fallback when a turn delivers neither text nor reaction", async () => {
+		streamOnceMock.mockResolvedValueOnce(functionCallResult([], "resp_empty"));
 
-		const harness = makeHarness({ text: "Show me the graph of the average cpu utilization" });
+		const harness = makeHarness({ text: "Diagnose the flux capacitor." });
 		await runRespond(harness);
 
-		// The progress note went out, then the loop kept going: nudge, data
-		// call, and the final answer — three model turns in total
-		expect(harness.say).toHaveBeenCalledWith({
-			markdown_text: "On it. Grabbing the hosts and their CPU numbers.",
-		});
-		expect(streamOnceMock).toHaveBeenCalledTimes(3);
-
-		const [secondParams] = streamOnceMock.mock.calls[1];
-		expect(allText(secondParams.input)).toContain("continue it now");
-
-		// The nudge is transient: not persisted in the conversation store,
-		// which does carry the final answer
-		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
-		expect(allText(getConversation(key))).not.toContain("continue it now");
-		expect(allText(getConversation(key))).toContain("Here is your chart. Average CPU: 42%.");
+		const saidTexts = harness.say.mock.calls.map(([arg]) => arg?.text || "");
+		expect(saidTexts.join("\n")).toContain("I've got nothing");
 	});
 
 	it("continues the loop after a failed reaction without treating it as an answer", async () => {

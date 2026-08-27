@@ -197,7 +197,8 @@ async function main() {
 
 	const results = [];
 	for (const scenario of selectScenarios(SCENARIOS)) {
-		if (scenario.onlyProvider && scenario.onlyProvider !== provider.name) {
+		const onlyProviders = scenario.onlyProvider && [].concat(scenario.onlyProvider);
+		if (onlyProviders && !onlyProviders.includes(provider.name)) {
 			console.log(`Skipping ${scenario.name} (provider is ${provider.name})`);
 			continue;
 		}

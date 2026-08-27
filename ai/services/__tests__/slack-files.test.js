@@ -2,10 +2,14 @@
  * Tests for Slack files service.
  */
 
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { jest } from "@jest/globals";
 import {
 	buildOpenAIFileContentItem,
 	createDescribingFileUploadManager,
+	createNativeImageFileUploadManager,
 	createNoopFileUploadManager,
 	extractPreviousUploads,
 } from "../slack-files.js";
@@ -262,6 +266,165 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 			expect(manager.sandboxFiles.size).toBe(0);
 			expect(global.fetch).not.toHaveBeenCalled();
 		});
+	});
+});
+
+describe("createNativeImageFileUploadManager (vLLM native vision)", () => {
+	const savedFetch = global.fetch;
+	const MEDIA_ENV_KEYS = ["M8B_MEDIA_DIR", "M8B_MEDIA_BASE_URL", "M8B_MEDIA_MAX_FILE_BYTES"];
+	const savedEnv = {};
+	let mediaDir;
+
+	const imageFile = {
+		id: "F_IMG",
+		name: "dashboard.png",
+		mimetype: "image/png",
+		url_private_download: "https://files.slack.com/dashboard.png",
+	};
+
+	beforeEach(async () => {
+		for (const key of MEDIA_ENV_KEYS) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		mediaDir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-media-mgr-test-"));
+		process.env.M8B_MEDIA_DIR = mediaDir;
+		process.env.M8B_MEDIA_BASE_URL = "https://bm-linux-slack.internal.example.net/m8b-media";
+
+		global.fetch = jest.fn(async () => ({
+			ok: true,
+			status: 200,
+			headers: { get: (name) => (name === "content-type" ? "image/png" : null) },
+			arrayBuffer: async () => new TextEncoder().encode("png-bytes").buffer,
+		}));
+	});
+
+	afterEach(async () => {
+		global.fetch = savedFetch;
+		for (const key of MEDIA_ENV_KEYS) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+		await fsp.rm(mediaDir, { recursive: true, force: true }).catch(() => {});
+	});
+
+	it("saves the image to the media store and returns an input_image URL item", async () => {
+		const manager = createNativeImageFileUploadManager();
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_image");
+		// vLLM's input_image schema requires the detail field
+		expect(result.contentItem.detail).toBe("auto");
+		expect(result.contentItem.image_url).toMatch(
+			/^https:\/\/bm-linux-slack\.internal\.example\.net\/m8b-media\/[0-9a-f-]{36}\.png$/
+		);
+		expect(result.fileId).toBeNull();
+
+		// The bytes landed in the store, not in the content item
+		const fileName = result.contentItem.image_url.split("/").pop();
+		expect(await fsp.readFile(path.join(mediaDir, fileName), "utf8")).toBe("png-bytes");
+	});
+
+	it("downloads and saves each image only once per conversation turn", async () => {
+		const manager = createNativeImageFileUploadManager();
+		const first = await manager.uploadOnce(imageFile);
+		const second = await manager.uploadOnce(imageFile);
+
+		expect(second).toBe(first);
+		expect(global.fetch).toHaveBeenCalledTimes(1);
+		expect(await fsp.readdir(mediaDir)).toHaveLength(1);
+	});
+
+	it("falls back to an inline base64 data URL when the media store is not configured", async () => {
+		delete process.env.M8B_MEDIA_BASE_URL;
+		const manager = createNativeImageFileUploadManager();
+
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_image");
+		expect(result.contentItem.detail).toBe("auto");
+		expect(result.contentItem.image_url).toBe(
+			`data:image/png;base64,${Buffer.from("png-bytes").toString("base64")}`
+		);
+	});
+
+	it("degrades unsupported image formats to a note without downloading", async () => {
+		const manager = createNativeImageFileUploadManager();
+		const result = await manager.uploadOnce({
+			id: "F_HEIC",
+			name: "photo.heic",
+			mimetype: "image/heic",
+		});
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("unsupported format");
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it("degrades oversized images to a note", async () => {
+		process.env.M8B_MEDIA_MAX_FILE_BYTES = "4";
+		const manager = createNativeImageFileUploadManager();
+
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("could not be processed");
+		expect(await fsp.readdir(mediaDir)).toHaveLength(0);
+	});
+
+	it("degrades to an error note when the Slack download fails", async () => {
+		global.fetch = jest.fn(async () => ({
+			ok: false,
+			status: 403,
+			headers: { get: () => null },
+		}));
+		const manager = createNativeImageFileUploadManager();
+
+		const result = await manager.uploadOnce(imageFile);
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("could not be processed");
+	});
+
+	it("stages non-image attachments for run_python when enabled", async () => {
+		global.fetch = jest.fn(async () => ({
+			ok: true,
+			status: 200,
+			headers: { get: (name) => (name === "content-type" ? "text/csv" : null) },
+			arrayBuffer: async () => new TextEncoder().encode("a,b\n1,2\n").buffer,
+		}));
+		const manager = createNativeImageFileUploadManager({ stageAttachments: true });
+
+		const result = await manager.uploadOnce({
+			id: "F_CSV",
+			name: "data.csv",
+			mimetype: "text/csv",
+			size: 8,
+			url_private_download: "https://files.slack.com/data.csv",
+		});
+
+		expect(result.contentItem.type).toBe("input_text");
+		expect(result.contentItem.text).toContain("/data/data.csv");
+		expect(manager.sandboxFiles.has("data.csv")).toBe(true);
+
+		// Images are never staged
+		expect(await manager.stageAttachment(imageFile)).toBeNull();
+	});
+
+	it("returns an unsupported-type note for non-images without staging", async () => {
+		const manager = createNativeImageFileUploadManager();
+		const result = await manager.uploadOnce({ id: "F_CSV", name: "x.csv", mimetype: "text/csv" });
+
+		expect(result.contentItem.text).toContain("only images can be analyzed");
+		expect(manager.stageAttachment).toBeUndefined();
+	});
+
+	it("exposes the shared manager interface with empty code-interpreter state", () => {
+		const manager = createNativeImageFileUploadManager();
+		expect(manager.codeFileIds.size).toBe(0);
+		expect(manager.codeContainerFiles.size).toBe(0);
+		expect(manager.uploadedFilesThisTurn).toEqual([]);
+		expect(manager.disabled).toBeUndefined();
 	});
 });
 

@@ -1,10 +1,15 @@
 /**
- * Tests for the AI provider abstraction (OpenAI vs Ollama).
+ * Tests for the AI provider abstraction (OpenAI vs Ollama vs vLLM).
  */
 
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { getAiProviderName, getOllamaConfig } from "../../config/providers.js";
-import { getProvider, resetProviderCache } from "../index.js";
+import {
+	getAiProviderName,
+	getEmbeddingBackendConfig,
+	getOllamaConfig,
+	getVllmConfig,
+} from "../../config/providers.js";
+import { describeProviderError, getProvider, resetProviderCache } from "../index.js";
 
 const ENV_KEYS = [
 	"AI_PROVIDER",
@@ -17,6 +22,16 @@ const ENV_KEYS = [
 	"OLLAMA_VISION_MODEL",
 	"OLLAMA_VISION_MAX_OUTPUT_TOKENS",
 	"CODE_SANDBOX_ENABLED",
+	"VLLM_BASE_URL",
+	"VLLM_MODEL",
+	"VLLM_API_KEY",
+	"VLLM_CONTEXT_LENGTH",
+	"VLLM_MAX_OUTPUT_TOKENS",
+	"VLLM_MAX_TOOL_OUTPUT_CHARS",
+	"VLLM_EMBEDDING_BASE_URL",
+	"VLLM_EMBEDDING_MODEL",
+	"VLLM_EMBEDDING_API_KEY",
+	"M8B_MEDIA_BASE_URL",
 ];
 
 describe("provider selection", () => {
@@ -412,6 +427,293 @@ describe("Ollama vision model", () => {
 		health = await getProvider().healthCheck();
 		expect(health.ok).toBe(true);
 		expect(health.warning).toContain("OLLAMA_VISION_MODEL");
+	});
+});
+
+describe("vLLM provider", () => {
+	const savedFetch = global.fetch;
+	const savedEnv = {};
+
+	function mockModelsEndpoint({
+		models = [{ id: "qwen3.8-27b-int8", max_model_len: 65536 }],
+	} = {}) {
+		global.fetch = jest.fn(async (url) => {
+			const target = String(url);
+			if (target.endsWith("/models")) {
+				return { ok: true, json: async () => ({ data: models }) };
+			}
+			throw new Error(`Unexpected fetch: ${target}`);
+		});
+	}
+
+	beforeEach(() => {
+		for (const key of ENV_KEYS) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		process.env.AI_PROVIDER = "vllm";
+		process.env.VLLM_BASE_URL = "http://dev-nvidia-01:8000/v1";
+		process.env.VLLM_MODEL = "qwen3.8-27b-int8";
+		resetProviderCache();
+	});
+
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+		global.fetch = savedFetch;
+		resetProviderCache();
+	});
+
+	it("selects vLLM with environment configuration", () => {
+		expect(getAiProviderName()).toBe("vllm");
+
+		const provider = getProvider();
+		expect(provider.name).toBe("vllm");
+		expect(provider.isLocal).toBe(true);
+		expect(provider.model).toBe("qwen3.8-27b-int8");
+		expect(provider.endpoint).toBe("http://dev-nvidia-01:8000/v1");
+		expect(provider.contextWindow).toBe(32768);
+		expect(provider.capabilities).toMatchObject({
+			serverSideState: false,
+			hostedFileSearch: false,
+			codeInterpreter: false,
+			localCodeInterpreter: true,
+			hostedWebSearch: false,
+			providerFileUploads: false,
+			imageDescriptions: false,
+			imageInput: true,
+			toolNamespaces: false,
+		});
+	});
+
+	it("uses a dummy API key by default", () => {
+		expect(getVllmConfig().apiKey).toBe("vllm");
+	});
+
+	it("only sends fields supported by vLLM's /v1/responses", () => {
+		process.env.VLLM_MAX_OUTPUT_TOKENS = "4000";
+		resetProviderCache();
+
+		const provider = getProvider();
+		const tools = [{ type: "function", name: "web_search", parameters: {} }];
+		const request = provider.buildRequest({
+			input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+			tools,
+			tool_choice: undefined,
+			previous_response_id: "resp_should_not_be_sent",
+			safety_identifier: "hash_should_not_be_sent",
+		});
+
+		expect(request).toEqual({
+			model: "qwen3.8-27b-int8",
+			input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+			max_output_tokens: 4000,
+			stream: true,
+			tools,
+		});
+		expect(request).not.toHaveProperty("previous_response_id");
+		expect(request).not.toHaveProperty("safety_identifier");
+		expect(request).not.toHaveProperty("reasoning");
+	});
+
+	it("emulates tool_choice 'none' by omitting tools", () => {
+		const provider = getProvider();
+		const request = provider.buildRequest({
+			input: [],
+			tools: [{ type: "function", name: "anything", parameters: {} }],
+			tool_choice: "none",
+		});
+
+		expect(request).not.toHaveProperty("tools");
+	});
+
+	it("merges leading system items and re-roles mid-conversation ones (single-system Qwen template)", () => {
+		const provider = getProvider();
+		const input = [
+			{ role: "system", content: [{ type: "input_text", text: "base prompt" }] },
+			{ role: "system", content: [{ type: "input_text", text: "second leading system" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ role: "system", content: [{ type: "input_text", text: "user context note" }] },
+			{ role: "user", content: [{ type: "input_text", text: "current question" }] },
+			{ type: "function_call", call_id: "c1", name: "ping", arguments: "{}" },
+			{ type: "function_call_output", call_id: "c1", output: "{}" },
+			{ role: "system", content: [{ type: "input_text", text: "do not repeat yourself" }] },
+		];
+
+		const request = provider.buildRequest({ input, tools: [] });
+
+		// The leading system block collapses into ONE system message
+		expect(request.input[0]).toEqual({
+			role: "system",
+			content: [{ type: "input_text", text: "base prompt\n\nsecond leading system" }],
+		});
+		expect(request.input.filter((item) => item?.role === "system")).toHaveLength(1);
+		// Mid-conversation system items become labeled user notes
+		expect(request.input[2].role).toBe("user");
+		expect(request.input[2].content[0].text).toBe("[System note] user context note");
+		expect(request.input[6].role).toBe("user");
+		expect(request.input[6].content[0].text).toBe("[System note] do not repeat yourself");
+		// Non-system items are untouched (same references)
+		expect(request.input[1]).toBe(input[2]);
+		expect(request.input[4]).toBe(input[5]);
+	});
+
+	it("leaves a single-leading-system input untouched", () => {
+		const provider = getProvider();
+		const input = [
+			{ role: "system", content: [{ type: "input_text", text: "base prompt" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hi" }] },
+		];
+
+		expect(provider.buildRequest({ input, tools: [] }).input).toBe(input);
+	});
+
+	it("flattens replayed assistant output_text content to a string (vLLM schema)", () => {
+		const provider = getProvider();
+		const input = [
+			{ role: "system", content: [{ type: "input_text", text: "base prompt" }] },
+			{ role: "user", content: [{ type: "input_text", text: "Hey:" }] },
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "\n\nHey yourself. What broke today?" }],
+			},
+			{
+				role: "assistant",
+				phase: "final_answer",
+				content: [
+					{ type: "output_text", text: "part one. " },
+					{ type: "output_text", text: "part two." },
+				],
+			},
+			{ role: "user", content: [{ type: "input_text", text: "the network is down" }] },
+		];
+
+		const request = provider.buildRequest({ input, tools: [] });
+
+		expect(request.input[2]).toEqual({
+			role: "assistant",
+			content: "\n\nHey yourself. What broke today?",
+		});
+		// Multiple parts are joined; other fields (phase) survive
+		expect(request.input[3]).toEqual({
+			role: "assistant",
+			phase: "final_answer",
+			content: "part one. part two.",
+		});
+		// Non-assistant items are untouched (same references)
+		expect(request.input[1]).toBe(input[1]);
+		expect(request.input[4]).toBe(input[4]);
+	});
+
+	it("adopts the served context length from /v1/models max_model_len", async () => {
+		mockModelsEndpoint();
+
+		const provider = getProvider();
+		expect(provider.contextWindow).toBe(32768); // default before detection
+
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(true);
+		expect(provider.contextWindow).toBe(65536);
+		expect(health.detail).toContain("max_model_len");
+	});
+
+	it("caps an over-configured context length with a warning", async () => {
+		process.env.VLLM_CONTEXT_LENGTH = "131072";
+		resetProviderCache();
+		mockModelsEndpoint();
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(provider.contextWindow).toBe(65536);
+		expect(health.warning).toContain("max_model_len");
+	});
+
+	it("keeps a deliberately tighter configured context length", async () => {
+		process.env.VLLM_CONTEXT_LENGTH = "16384";
+		resetProviderCache();
+		mockModelsEndpoint();
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(provider.contextWindow).toBe(16384);
+		expect(health.detail).toContain("server allows 65536");
+	});
+
+	it("adopts the single served model when VLLM_MODEL is unset", async () => {
+		delete process.env.VLLM_MODEL;
+		resetProviderCache();
+		mockModelsEndpoint();
+
+		const provider = getProvider();
+		expect(provider.model).toBe("");
+
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(true);
+		expect(provider.model).toBe("qwen3.8-27b-int8");
+		expect(provider.buildRequest({ input: [] }).model).toBe("qwen3.8-27b-int8");
+	});
+
+	it("fails the health check when the configured model is not served", async () => {
+		mockModelsEndpoint({ models: [{ id: "some-other-model", max_model_len: 4096 }] });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("qwen3.8-27b-int8");
+		expect(health.error).toContain("some-other-model");
+	});
+
+	it("warns when the media store is not configured (base64 fallback)", async () => {
+		mockModelsEndpoint();
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.warning).toContain("M8B_MEDIA_BASE_URL");
+
+		process.env.M8B_MEDIA_BASE_URL = "https://bm-linux-slack.internal.example.net/m8b-media";
+		resetProviderCache();
+		mockModelsEndpoint();
+		const healthy = await getProvider().healthCheck();
+		expect(healthy.warning).toBeUndefined();
+		expect(healthy.detail).toContain("media store");
+	});
+
+	it("uses the friendly local-backend error messages", () => {
+		const provider = getProvider();
+		expect(describeProviderError(new Error("fetch failed"), provider)).toContain(
+			"local AI backend"
+		);
+	});
+
+	it("requires a dedicated embedding endpoint for the knowledge base", () => {
+		expect(getEmbeddingBackendConfig()).toBeNull();
+
+		process.env.VLLM_EMBEDDING_BASE_URL = "http://dev-nvidia-01:8001/v1/";
+		process.env.VLLM_EMBEDDING_MODEL = "qwen3-embedding-0.6b";
+		expect(getEmbeddingBackendConfig()).toEqual({
+			baseUrl: "http://dev-nvidia-01:8001/v1",
+			apiKey: "vllm",
+			model: "qwen3-embedding-0.6b",
+		});
+
+		// The chat API key is reused unless a dedicated one is set
+		process.env.VLLM_API_KEY = "chat-key";
+		expect(getEmbeddingBackendConfig().apiKey).toBe("chat-key");
+		process.env.VLLM_EMBEDDING_API_KEY = "embed-key";
+		expect(getEmbeddingBackendConfig().apiKey).toBe("embed-key");
+	});
+
+	it("resolves the Ollama embedding backend from the Ollama config", () => {
+		process.env.AI_PROVIDER = "ollama";
+		expect(getEmbeddingBackendConfig()).toMatchObject({ model: "nomic-embed-text" });
+	});
+
+	it("has no embedding backend in OpenAI mode (hosted file_search)", () => {
+		process.env.AI_PROVIDER = "openai";
+		expect(getEmbeddingBackendConfig()).toBeNull();
 	});
 });
 

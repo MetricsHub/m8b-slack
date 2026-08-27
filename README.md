@@ -1,20 +1,21 @@
 # M8B Slack Bot (MetricsHub)
 
-M8B is a grumpy but competent Slack bot that helps solve IT issues. It supports two AI backends:
-GPT-5.6 Sol through the hosted OpenAI Responses API (default), or a local model (Qwen 3.8 27B)
-served by Ollama's OpenAI-compatible `/v1/responses` API for fully on-prem/private AI. It can
-query one or more MetricsHub MCP servers for real monitoring data. It is built with Slack Bolt
-for Node.js.
+M8B is a grumpy but competent Slack bot that helps solve IT issues. It supports three AI
+backends: GPT-5.6 Sol through the hosted OpenAI Responses API (default), or a local model
+(Qwen 3.8 27B) served by Ollama's or vLLM's OpenAI-compatible `/v1/responses` API for fully
+on-prem/private AI. It can query one or more MetricsHub MCP servers for real monitoring data.
+It is built with Slack Bolt for Node.js.
 
 ## Features
 
-- 🤖 IT troubleshooting with `gpt-5.6-sol` (OpenAI) or `qwen3.8:27b` (local Ollama), with streamed Responses API output
-- 🔀 Configurable AI backend (`AI_PROVIDER=openai` or `AI_PROVIDER=ollama`), no silent cross-provider fallback
+- 🤖 IT troubleshooting with `gpt-5.6-sol` (OpenAI) or Qwen 3.8 27B (local Ollama/vLLM), with streamed Responses API output
+- 🔀 Configurable AI backend (`AI_PROVIDER=openai`, `ollama`, or `vllm`), no silent cross-provider fallback
 - 📊 Real-time metrics from MetricsHub MCP servers
 - 🧰 Hosted tool search with deferred MetricsHub, Prometheus, and knowledge-write schemas (OpenAI mode)
 - 🔍 Prometheus PromQL query support
 - 📁 Image and PDF analysis plus Code Interpreter support for data and code files (OpenAI mode)
-- 🧠 Knowledge base: OpenAI vector store search, or a local embeddings index in Ollama mode
+- 🖼️ Native screenshot analysis in vLLM mode (multimodal model + local media store), sidecar vision model in Ollama mode
+- 🧠 Knowledge base: OpenAI vector store search, or a local embeddings index in Ollama/vLLM mode
 - 🌐 Web search: hosted (OpenAI) or pluggable application-side search (SearXNG / opt-in Ollama cloud)
 - 💬 Slack Assistant threads and mentions with streaming responses and conversation continuity
 - 🔧 Grumpy personality for maximum entertainment
@@ -31,18 +32,20 @@ m8b-slackbot/
 │   ├── prometheus.js         # Prometheus PromQL integration
 │   ├── config/
 │   │   ├── system-prompt.js  # Bot personality and configuration
-│   │   └── providers.js      # AI provider configuration (OpenAI vs Ollama)
+│   │   └── providers.js      # AI provider configuration (OpenAI vs Ollama vs vLLM)
 │   ├── providers/
 │   │   ├── index.js          # Provider abstraction (capabilities, request builder)
 │   │   ├── openai-provider.js # Hosted OpenAI backend
-│   │   └── ollama-provider.js # Local Ollama backend (/v1/responses)
+│   │   ├── ollama-provider.js # Local Ollama backend (/v1/responses)
+│   │   └── vllm-provider.js  # Local vLLM backend (/v1/responses, native vision)
 │   ├── services/
 │   │   ├── openai.js         # OpenAI client and helpers
 │   │   ├── streaming.js      # Response streaming handler
 │   │   ├── context-manager.js # Conversation context management
-│   │   ├── context-budget.js # Deterministic context trimming (Ollama, 32K window)
-│   │   ├── conversation-store.js # App-side thread state (Ollama, stateless API)
-│   │   ├── knowledge-base.js # Local RAG (chunks + Ollama embeddings + cosine search)
+│   │   ├── context-budget.js # Deterministic context trimming (local modes)
+│   │   ├── conversation-store.js # App-side thread state (local modes, stateless API)
+│   │   ├── media-store.js    # Local image store served to the vLLM host by URL
+│   │   ├── knowledge-base.js # Local RAG (chunks + local embeddings + cosine search)
 │   │   ├── web-search.js     # Application-side web search (SearXNG / Ollama cloud)
 │   │   ├── function-calls.js # Tool call processing
 │   │   ├── slack-files.js    # File upload handling
@@ -70,12 +73,13 @@ m8b-slackbot/
 
 - Node.js 20+ and npm
 - A Slack workspace where you can install apps
-- An AI backend, either:
-  - an OpenAI API key with access to `gpt-5.6-sol` and the required Responses API tools, or
-  - an Ollama server (current version) with `qwen3.8:27b` and an embedding model pulled
+- An AI backend, one of:
+  - an OpenAI API key with access to `gpt-5.6-sol` and the required Responses API tools,
+  - an Ollama server (current version) with `qwen3.8:27b` and an embedding model pulled, or
+  - a vLLM server (0.27+) serving a multimodal model (e.g. Qwen 3.8 27B INT8) via `/v1/responses`
 - Optional: MetricsHub MCP servers (URLs + API tokens)
 - Optional: Prometheus server for PromQL queries
-- Optional (Ollama mode): a SearXNG instance for web search
+- Optional (local modes): a SearXNG instance for web search
 
 ## Quick Start (Development)
 
@@ -127,13 +131,17 @@ The AI backend is selected with `AI_PROVIDER`:
 
 - `AI_PROVIDER=openai` (default): hosted OpenAI Responses API with `gpt-5.6-sol` — current behavior, unchanged.
 - `AI_PROVIDER=ollama`: a local model through Ollama's OpenAI-compatible `/v1/responses` API. When Ollama mode is active, nothing is ever sent to OpenAI: capabilities without a local equivalent are reported as unavailable instead of falling back.
+- `AI_PROVIDER=vllm`: a local model through vLLM's OpenAI-compatible `/v1/responses` API. Same
+  local-only guarantees as Ollama mode, with one capability upgrade: the served model is
+  multimodal, so screenshots are passed to it natively (no sidecar vision model needed).
 
-At startup the bot logs the active backend and runs a health check (Ollama reachability + model
+At startup the bot logs the active backend and runs a health check (backend reachability + model
 presence). In Ollama mode it also reads the server's _effective_ context length from the native
-API (`/api/ps` for a loaded model, `/api/show` for a Modelfile `num_ctx`): an unset
-`OLLAMA_CONTEXT_LENGTH` adopts the detected value, a smaller configured value is kept (tighter
+API (`/api/ps` for a loaded model, `/api/show` for a Modelfile `num_ctx`); in vLLM mode it reads
+`max_model_len` from `/v1/models`. In both cases: an unset `OLLAMA_CONTEXT_LENGTH` /
+`VLLM_CONTEXT_LENGTH` adopts the detected value, a smaller configured value is kept (tighter
 budgets are safe), and a larger one is capped to the server's value with a warning — so the bot
-can never believe it has more context than Ollama actually allocates:
+can never believe it has more context than the server actually allocates:
 
 ```text
 AI provider: ollama
@@ -198,17 +206,51 @@ ollama pull nomic-embed-text
 ollama pull qwen3-vl:8b-instruct-8k   # optional, for screenshot analysis
 ```
 
-### Ollama mode: conversation state
+### Example vLLM configuration
+
+```bash
+AI_PROVIDER=vllm
+VLLM_BASE_URL=http://dev-nvidia-01:8000/v1
+VLLM_API_KEY=vllm_...                  # whatever the reverse proxy in front of vLLM expects
+VLLM_MODEL=qwen3.8-27b-int8            # optional: adopted automatically (vLLM serves one model)
+# VLLM_CONTEXT_LENGTH=65536            # optional: detected from /v1/models max_model_len
+VLLM_MAX_OUTPUT_TOKENS=4000
+# VLLM_REQUEST_TIMEOUT_MS=300000
+# VLLM_MAX_TOOL_OUTPUT_CHARS=          # default scales with the context window
+
+# Media store: screenshots are saved locally and served to the vLLM host by URL
+# (unset M8B_MEDIA_BASE_URL = degraded fallback: images inlined as base64 every turn)
+M8B_MEDIA_DIR=/var/lib/m8b/media
+M8B_MEDIA_BASE_URL=https://bm-linux-slack.internal.sentrysoftware.net/m8b-media
+M8B_MEDIA_RETENTION_DAYS=7
+
+# Local knowledge base embeddings: a vLLM instance serves ONE model, so the chat
+# instance cannot embed. Point these at a dedicated embedding endpoint (a second
+# small vLLM instance, or an Ollama server kept around for embeddings).
+# Unset = knowledge base disabled (search_knowledge_base is not offered).
+# VLLM_EMBEDDING_BASE_URL=http://dev-nvidia-01:8001/v1
+# VLLM_EMBEDDING_MODEL=qwen3-embedding-0.6b
+# VLLM_EMBEDDING_API_KEY=              # defaults to VLLM_API_KEY
+KNOWLEDGE_BASE_DIR=data/knowledge
+
+# Web search backend (optional; unset = web search unavailable)
+WEB_SEARCH_PROVIDER=searxng
+SEARXNG_URL=http://searxng.internal:8080
+```
+
+### Local modes (Ollama/vLLM): conversation state
 
 Ollama's `/v1/responses` API is **stateless** — it does not implement OpenAI's
-`previous_response_id` or `conversation`. In Ollama mode the bot therefore keeps
-conversation history application-side, keyed by `team + channel + thread_ts`, and resends the
-relevant user/assistant/tool items in `input` on every request. History is trimmed
-deterministically to fit the model's context window (`OLLAMA_CONTEXT_LENGTH`, default 32K),
-always retaining the system prompt, recent turns, and intact tool-call/result pairs. The store
-is in-memory; after a restart the text history is rebuilt from the Slack thread itself (the
-same cold-start path OpenAI mode uses), losing only the tool-call detail of earlier turns.
-OpenAI mode continues to use `previous_response_id` unchanged.
+`previous_response_id` or `conversation`. vLLM has a Responses API store, but it is an
+unbounded, process-local in-memory store, so the bot deliberately does not rely on it either.
+In both local modes the bot therefore keeps conversation history application-side, keyed by
+`team + channel + thread_ts`, and resends the relevant user/assistant/tool items in `input` on
+every request. History is trimmed deterministically to fit the model's context window
+(`OLLAMA_CONTEXT_LENGTH`/`VLLM_CONTEXT_LENGTH`), always retaining the system prompt, recent
+turns, and intact tool-call/result pairs. The store is in-memory; after a restart the text
+history is rebuilt from the Slack thread itself (the same cold-start path OpenAI mode uses),
+losing only the tool-call detail of earlier turns. OpenAI mode continues to use
+`previous_response_id` unchanged.
 
 ### Ollama mode: local knowledge base
 
@@ -271,6 +313,50 @@ small (8k for `qwen3-vl:8b-instruct-8k`): it must hold the image tokens plus the
 which is why the context snippet and the output cap (`OLLAMA_VISION_MAX_OUTPUT_TOKENS`,
 default 600) are kept deliberately tight.
 
+### vLLM mode: screenshots and images (media store)
+
+The vLLM-served model is multimodal, so screenshots go to it **natively** as `input_image`
+items — no sidecar vision model, no lossy text description. Because the local conversation
+history is resent on every turn, images are NOT embedded as base64 in the history (five 2 MB
+screenshots would add ~13 MB to every subsequent request). Instead:
+
+1. The bot downloads the image from Slack once (with its Slack credentials — those are never
+   given to vLLM), saves it under `M8B_MEDIA_DIR` as `<uuid>.<ext>`, and stores only the short
+   URL `M8B_MEDIA_BASE_URL/<uuid>.<ext>` in the conversation.
+2. A reverse proxy (NGINX) serves `M8B_MEDIA_DIR` at that URL, restricted to the vLLM host's IP.
+3. vLLM fetches the image itself (and caches it, when its bounded media cache is enabled).
+
+Files older than `M8B_MEDIA_RETENTION_DAYS` (default 7) are deleted by the bot itself (a sweep
+runs at startup and every 6 hours). If a stored conversation still references a deleted image,
+the reference is replaced by a text marker before the request is sent — one expired screenshot
+never fails the whole conversation. Threads rebuilt from Slack history re-download and re-save
+their images, so old threads recover on their own. Unsupported formats (only PNG, JPEG, GIF,
+and WebP are passed through) and oversized files (`M8B_MEDIA_MAX_FILE_BYTES`, default 10 MB)
+degrade to explicit notes. Without `M8B_MEDIA_BASE_URL` the bot falls back to inline base64
+data URLs — functional for development, with a startup warning, but not for production.
+
+Server-side deployment notes (outside this repo):
+
+```nginx
+# NGINX on the bot host: expose the media dir to the vLLM host ONLY
+location /m8b-media/ {
+    alias /var/lib/m8b/media/;
+    allow <vLLM-host-IP>;
+    deny all;
+    autoindex off;
+}
+```
+
+```ini
+# vLLM systemd unit: restrict remote media fetching to the bot host (anti-SSRF)
+# and enable the bounded media-download cache
+# vllm serve ... --allowed-media-domains bm-linux-slack.internal.sentrysoftware.net
+Environment=VLLM_MEDIA_URL_ALLOW_REDIRECTS=0
+Environment=VLLM_MEDIA_CACHE=/var/lib/vllm/media-cache
+Environment=VLLM_MEDIA_CACHE_MAX_SIZE_MB=4096
+Environment=VLLM_MEDIA_CACHE_TTL_HOURS=24
+```
+
 ### Tool availability per provider
 
 | Capability            | OpenAI mode                        | Ollama mode                                                                                             |
@@ -286,6 +372,11 @@ default 600) are kept deliberately tight.
 | Conversation state    | Server-side `previous_response_id` | Application-side per-thread store                                                                       |
 | Streaming             | ✅                                 | ✅                                                                                                      |
 
+**vLLM mode** matches the Ollama column, with two differences: images are passed natively to
+the multimodal model via the media store (no `OLLAMA_VISION_MODEL` sidecar), and knowledge-base
+embeddings need a dedicated endpoint (`VLLM_EMBEDDING_BASE_URL` + `VLLM_EMBEDDING_MODEL`;
+without them the knowledge base is disabled).
+
 **Code Interpreter in Ollama mode:** the hosted `code_interpreter` is replaced by a local
 `run_python` function tool backed by [Pyodide](https://pyodide.org) (CPython compiled to
 WebAssembly, running in a worker thread). The WASM boundary is the sandbox: the generated code
@@ -300,9 +391,9 @@ bounded by a hard timeout (`CODE_SANDBOX_TIMEOUT_MS`, default 60s) enforced with
 `worker.terminate()`. Set `CODE_SANDBOX_ENABLED=false` to disable the tool entirely; the
 system prompt then tells the model to provide file contents inline instead.
 
-**Privacy note:** in Ollama mode, prompts, documents, and tool results never leave your
-network unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends the
-search query — not the conversation — to ollama.com).
+**Privacy note:** in Ollama and vLLM modes, prompts, documents, and tool results never leave
+your network unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends
+the search query — not the conversation — to ollama.com).
 
 `NODE_ENV` controls Bolt logging:
 
@@ -442,11 +533,11 @@ The codebase is organized into clear modules:
 - **Services**: Responses API streaming, context management, conversation store, local
   knowledge base, web search, files, citations, and tool execution
 - **Tools**: Immediate and deferred function definitions grouped for hosted tool search
-  (OpenAI), or flat function tools (Ollama)
+  (OpenAI), or flat function tools (Ollama/vLLM)
 - **Utils**: Helper functions (token counting, output handling)
 
 Conversation history uses OpenAI response IDs when available (OpenAI mode) or the application-
-side per-thread store (Ollama mode). On a cold start it reconstructs history from Slack,
+side per-thread store (local modes). On a cold start it reconstructs history from Slack,
 excluding Slack's synthetic `assistant_app_thread` root so the initial user question is not
 replayed as an assistant message.
 

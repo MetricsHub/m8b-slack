@@ -75,5 +75,6 @@ Append to `SCENARIOS` in [`scenarios.js`](scenarios.js):
 }
 ```
 
-The `screenshot-analysis` scenario exercises the vision pipeline (Ollama mode) and is skipped
-unless `OLLAMA_VISION_MODEL` is set.
+The `screenshot-analysis` scenario exercises the vision pipeline. It runs in vLLM and OpenAI
+modes (native image input) and in Ollama mode only when `OLLAMA_VISION_MODEL` is set (sidecar
+vision model); otherwise it is skipped.

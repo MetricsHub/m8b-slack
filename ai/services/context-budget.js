@@ -17,7 +17,11 @@
  * OpenAI, and a deterministic trim keeps behavior predictable.
  */
 
-import { estimateTokenCount, PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
+import {
+	estimateTokenCount,
+	getTokenCalibrationFactor,
+	PAYLOAD_CHARS_PER_TOKEN,
+} from "../utils/tokens.js";
 
 const TRIM_NOTICE = {
 	role: "system",
@@ -116,7 +120,11 @@ export function trimToContextBudget(
 		return items;
 	}
 
-	const budget = contextWindow - maxOutputTokens - reserveTokens;
+	// Scale the window by the measured estimate accuracy (see tokens.js):
+	// when estimates run high (factor < 1) the effective budget grows, keeping
+	// more history; when they run low (factor > 1) it shrinks preemptively
+	const calibration = getTokenCalibrationFactor();
+	const budget = Math.floor((contextWindow - maxOutputTokens) / calibration) - reserveTokens;
 	if (budget <= 0) {
 		logger?.warn?.("[Context] Context budget is non-positive; sending items unmodified");
 		return items;
@@ -171,7 +179,7 @@ export function trimToContextBudget(
 	const finalEstimate = estimateTokenCount(trimmed);
 
 	logger?.info?.(
-		`[Context] Trimmed ${dropCount} conversation group(s) to fit context budget (${finalEstimate}/${budget} estimated tokens)`
+		`[Context] Trimmed ${dropCount} conversation group(s) to fit context budget (${finalEstimate}/${budget} estimated tokens, calibration ${calibration.toFixed(2)})`
 	);
 
 	if (finalEstimate > budget) {

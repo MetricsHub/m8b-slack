@@ -5,7 +5,8 @@
  * AI_PROVIDER directly. A provider exposes:
  *
  * @typedef {Object} AiProvider
- * @property {string} name - "openai" or "ollama"
+ * @property {string} name - "openai", "ollama", or "vllm"
+ * @property {boolean} [isLocal] - Local backend (Ollama/vLLM): friendly local error messages apply
  * @property {string} model - Active chat model
  * @property {string} endpoint - Base URL used for the Responses API (for logging)
  * @property {Object} client - OpenAI SDK client bound to the provider endpoint
@@ -20,15 +21,17 @@
  * @property {boolean} capabilities.hostedWebSearch - Hosted web_search tool
  * @property {boolean} capabilities.providerFileUploads - Files API for Slack attachments
  * @property {boolean} capabilities.imageDescriptions - Sidecar vision model describes image attachments as text
+ * @property {boolean} capabilities.imageInput - Model reads images natively via input_image items
  * @property {boolean} capabilities.toolNamespaces - Deferred tool_search namespaces
  * @property {Function} buildRequest - Build a Responses API streaming request
  * @property {Function} [describeImage] - Describe an image attachment as text (imageDescriptions providers)
  * @property {Function} healthCheck - Async health check: {ok, detail?, error?}
  */
 
-import { getAiProviderName, PROVIDER_OLLAMA } from "../config/providers.js";
+import { getAiProviderName, PROVIDER_OLLAMA, PROVIDER_VLLM } from "../config/providers.js";
 import { createOllamaProvider } from "./ollama-provider.js";
 import { createOpenAiProvider } from "./openai-provider.js";
+import { createVllmProvider } from "./vllm-provider.js";
 
 let cachedProvider = null;
 
@@ -39,8 +42,13 @@ let cachedProvider = null;
  */
 export function getProvider() {
 	if (!cachedProvider) {
+		const name = getAiProviderName();
 		cachedProvider =
-			getAiProviderName() === PROVIDER_OLLAMA ? createOllamaProvider() : createOpenAiProvider();
+			name === PROVIDER_OLLAMA
+				? createOllamaProvider()
+				: name === PROVIDER_VLLM
+					? createVllmProvider()
+					: createOpenAiProvider();
 	}
 	return cachedProvider;
 }
@@ -64,7 +72,7 @@ export function describeProviderError(error, provider) {
 	const message = String(error?.message || error || "").toLowerCase();
 	const status = error?.status;
 
-	if (provider?.name === "ollama") {
+	if (provider?.isLocal) {
 		if (
 			message.includes("econnrefused") ||
 			message.includes("fetch failed") ||

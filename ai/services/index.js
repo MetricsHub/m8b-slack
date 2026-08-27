@@ -11,6 +11,7 @@ export * from "./context-manager.js";
 export * from "./conversation-store.js";
 export * from "./function-calls.js";
 export * from "./knowledge-base.js";
+export * from "./media-store.js";
 export * from "./metricshub-api.js";
 export * from "./openai.js";
 export * from "./slack-files.js";

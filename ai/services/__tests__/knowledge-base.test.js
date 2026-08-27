@@ -108,6 +108,7 @@ describe("local knowledge base", () => {
 	let dir;
 	const savedFetch = global.fetch;
 	const savedEmbeddingModel = process.env.OLLAMA_EMBEDDING_MODEL;
+	const savedProvider = process.env.AI_PROVIDER;
 
 	/**
 	 * Deterministic fake embeddings: axis 0 = docker, axis 1 = prometheus, axis 2 = other.
@@ -121,6 +122,8 @@ describe("local knowledge base", () => {
 
 	beforeEach(async () => {
 		dir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-kb-test-"));
+		// The embedding backend is resolved from the active provider
+		process.env.AI_PROVIDER = "ollama";
 		process.env.OLLAMA_EMBEDDING_MODEL = "test-embed";
 
 		global.fetch = jest.fn(async (_url, init) => {
@@ -135,6 +138,8 @@ describe("local knowledge base", () => {
 
 	afterEach(async () => {
 		global.fetch = savedFetch;
+		if (savedProvider === undefined) delete process.env.AI_PROVIDER;
+		else process.env.AI_PROVIDER = savedProvider;
 		if (savedEmbeddingModel === undefined) delete process.env.OLLAMA_EMBEDDING_MODEL;
 		else process.env.OLLAMA_EMBEDDING_MODEL = savedEmbeddingModel;
 		await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});

@@ -128,7 +128,8 @@ export function printResults(results) {
 
 /**
  * Select the scenarios to run: applies the optional `--only <name>` CLI filter
- * and drops scenarios whose `skipUnlessEnv` variable is not set (with a note).
+ * and drops scenarios whose `skipUnlessEnv` variable is not set or whose
+ * `skipUnless()` predicate returns false (with a note).
  *
  * @param {Array<Object>} scenarios
  * @param {string[]} [argv] - defaults to process.argv
@@ -151,6 +152,10 @@ export function selectScenarios(scenarios, argv = process.argv) {
 	return selected.filter((s) => {
 		if (s.skipUnlessEnv && !process.env[s.skipUnlessEnv]) {
 			console.log(`Skipping ${s.name} (${s.skipUnlessEnv} is not set)`);
+			return false;
+		}
+		if (typeof s.skipUnless === "function" && !s.skipUnless()) {
+			console.log(`Skipping ${s.name} (${s.skipReason || "skipUnless returned false"})`);
 			return false;
 		}
 		return true;

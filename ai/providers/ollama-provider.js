@@ -131,6 +131,7 @@ export function createOllamaProvider() {
 
 	const provider = {
 		name: "ollama",
+		isLocal: true,
 		model: config.model,
 		endpoint: config.baseUrl,
 		client,
@@ -145,6 +146,7 @@ export function createOllamaProvider() {
 			hostedWebSearch: false,
 			providerFileUploads: false,
 			imageDescriptions: Boolean(config.visionModel),
+			imageInput: false,
 			toolNamespaces: false,
 		},
 		buildRequest({ input, tools, tool_choice }) {

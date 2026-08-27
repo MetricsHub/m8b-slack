@@ -101,6 +101,79 @@ export function estimateTokenCount(inputItems) {
 }
 
 /**
+ * Prompt-token calibration: the estimates above are deliberately conservative,
+ * so on a real conversation they typically over-count. Stateless providers
+ * report the EXACT prompt size of every request (usage.input_tokens); an
+ * exponential moving average of actual/estimated feeds a correction factor
+ * back into the context budget, recovering headroom the raw estimates waste —
+ * and tightening the budget if estimates ever under-count.
+ *
+ * The factor is safe by construction: clamped to [0.75, 1.5], and when it
+ * would EXPAND the budget (ratio < 1) it is pulled 5% back toward 1 so a
+ * shift in content mix cannot immediately push a prompt over the window.
+ * State is in-memory (per process) and resets on restart.
+ */
+const CALIBRATION_EMA_ALPHA = 0.3;
+const CALIBRATION_MIN_FACTOR = 0.75;
+const CALIBRATION_MAX_FACTOR = 1.5;
+const CALIBRATION_EXPANSION_MARGIN = 1.05;
+
+let calibrationEma = null;
+let calibrationSamples = 0;
+
+/**
+ * Record one (estimated, actual) prompt-token pair from a completed request.
+ *
+ * @param {Object} params
+ * @param {number} params.estimatedTokens - Pre-flight estimate for the request (items + reserve)
+ * @param {number} params.actualTokens - usage.input_tokens reported by the server
+ */
+export function recordTokenCalibration({ estimatedTokens, actualTokens }) {
+	if (!(estimatedTokens > 0) || !(actualTokens > 0)) return;
+
+	const ratio = actualTokens / estimatedTokens;
+	calibrationEma =
+		calibrationEma === null
+			? ratio
+			: CALIBRATION_EMA_ALPHA * ratio + (1 - CALIBRATION_EMA_ALPHA) * calibrationEma;
+	calibrationSamples += 1;
+}
+
+/**
+ * Current correction factor to apply to estimated prompt sizes
+ * (estimate * factor ≈ actual). 1 until a sample has been recorded.
+ *
+ * @returns {number}
+ */
+export function getTokenCalibrationFactor() {
+	if (calibrationEma === null) return 1;
+
+	let factor = Math.min(Math.max(calibrationEma, CALIBRATION_MIN_FACTOR), CALIBRATION_MAX_FACTOR);
+	if (factor < 1) {
+		// Only partially trust over-estimation: keep a safety margin
+		factor = Math.min(factor * CALIBRATION_EXPANSION_MARGIN, 1);
+	}
+	return factor;
+}
+
+/**
+ * Calibration state snapshot (for logs and tests).
+ *
+ * @returns {{factor: number, ema: number|null, samples: number}}
+ */
+export function getTokenCalibration() {
+	return { factor: getTokenCalibrationFactor(), ema: calibrationEma, samples: calibrationSamples };
+}
+
+/**
+ * Reset the calibration state (used by tests).
+ */
+export function resetTokenCalibration() {
+	calibrationEma = null;
+	calibrationSamples = 0;
+}
+
+/**
  * Check if an error is a context window overflow error.
  *
  * @param {Error & {type?: string, param?: string}} error - The error to check
@@ -109,6 +182,14 @@ export function estimateTokenCount(inputItems) {
 export function isContextWindowError(error) {
 	const msg = String(error?.message || "").toLowerCase();
 	const type = String(error?.type || "").toLowerCase();
+
+	// vLLM schema-validation 400s echo the ENTIRE submitted input in the error
+	// message, so any conversation containing phrases like "context window"
+	// (the system prompt does) would substring-match below. A validation error
+	// is a malformed request, never an overflow.
+	if (msg.includes("validation error")) {
+		return false;
+	}
 
 	return (
 		msg.includes("context window") ||

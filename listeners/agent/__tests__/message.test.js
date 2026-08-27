@@ -41,10 +41,37 @@ describe("normalizeAgentMessage", () => {
 		});
 	});
 
+	it("accepts a bare attachment with no message text (the file IS the message)", () => {
+		expect(
+			normalizeAgentMessage({
+				...baseMessage,
+				text: "",
+				subtype: "file_share",
+				files: [{ id: "F123", mimetype: "image/png" }],
+			})
+		).toMatchObject({
+			thread_ts: "1234.5678",
+			text: "",
+			files: [{ id: "F123", mimetype: "image/png" }],
+		});
+	});
+
+	it("accepts a bare attachment whose event has no text field at all", () => {
+		const { text: _text, ...withoutText } = baseMessage;
+		expect(
+			normalizeAgentMessage({
+				...withoutText,
+				subtype: "file_share",
+				files: [{ id: "F123" }],
+			})
+		).toMatchObject({ text: "", files: [{ id: "F123" }] });
+	});
+
 	it.each([
 		[{ ...baseMessage, channel_type: "channel" }, "non-DM messages"],
 		[{ ...baseMessage, subtype: "bot_message", bot_id: "B123" }, "bot messages"],
-		[{ ...baseMessage, text: "" }, "empty messages"],
+		[{ ...baseMessage, text: "" }, "empty messages without files"],
+		[{ ...baseMessage, text: "", files: [] }, "empty messages with an empty files array"],
 	])("ignores %s", (message) => {
 		expect(normalizeAgentMessage(message)).toBeNull();
 	});

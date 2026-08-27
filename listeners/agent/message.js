@@ -11,10 +11,12 @@ export function normalizeAgentMessage(event) {
 	if (!event) return null;
 
 	const subtype = "subtype" in event ? event.subtype : undefined;
+	// A file shared without a caption arrives with empty text: the attachment
+	// itself is the message, so files count as content
+	const hasFiles = Array.isArray(event.files) && event.files.length > 0;
 	if (
 		event.channel_type !== "im" ||
-		!("text" in event) ||
-		!event.text ||
+		(!event.text && !hasFiles) ||
 		!("user" in event) ||
 		!event.user ||
 		!("ts" in event) ||
@@ -27,6 +29,7 @@ export function normalizeAgentMessage(event) {
 
 	return {
 		...event,
+		text: event.text || "",
 		channel: event.channel,
 		user: event.user,
 		thread_ts: "thread_ts" in event && event.thread_ts ? event.thread_ts : event.ts,

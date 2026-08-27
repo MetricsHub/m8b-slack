@@ -17,16 +17,20 @@
  * - judge:         optional criteria string graded by the LLM judge (soft assertion)
  * - timeoutMs:     per-turn timeout waiting for the answer
  * - skipUnlessEnv: optional env var name; the scenario is skipped when it is not set
+ * - skipUnless:    optional () => boolean, evaluated against process.env by both
+ *                  harnesses; the scenario is skipped (with the skipReason note)
+ *                  when it returns false
+ * - skipReason:    optional short note shown when skipUnless skips the scenario
  * - liveOnly:      optional; run only in the respond-live harness (e.g. scenarios that
  *                  inspect or clean up local state the Slack round-trip cannot reach)
  * - files:         optional [{fixture, name, mimetype}] attachments for the FIRST prompt;
  *                  fixture is a filename under e2e/fixtures/, served to the bot over a
  *                  local HTTP server (respond-live harness only)
  * - verifyLive:    optional async (context) => string[] of failures, run by respond-live
- *                  after the scenario (Ollama mode only) for deterministic state checks;
- *                  context carries {uploads}: every client.filesUploadV2 call captured
- * - onlyProvider:  optional provider name ("openai"/"ollama"); the respond-live harness
- *                  skips the scenario on any other provider
+ *                  after the scenario (local-KB providers only) for deterministic state
+ *                  checks; context carries {uploads}: every client.filesUploadV2 call
+ * - onlyProvider:  optional provider name or array ("openai"/"ollama"/"vllm"); the
+ *                  respond-live harness skips the scenario on any other provider
  */
 
 /**
@@ -198,15 +202,38 @@ export const SCENARIOS = [
 			"least one concrete detail from the image — the full disk (C: drive / 0 bytes free), the " +
 			"failed backup job BKP-4412, or the host SRV-WEB-01. It must NOT claim it cannot view " +
 			"images or ask the user to paste the error as text.",
-		// Requires a vision backend: OLLAMA_VISION_MODEL in Ollama mode (OpenAI mode
-		// reads images natively, but this dev harness gates on the local setup)
-		skipUnlessEnv: "OLLAMA_VISION_MODEL",
+		// Requires a vision backend: Ollama mode needs the OLLAMA_VISION_MODEL
+		// sidecar; vLLM and OpenAI modes read images natively
+		skipUnless: () =>
+			(process.env.AI_PROVIDER || "openai").trim().toLowerCase() !== "ollama" ||
+			Boolean(process.env.OLLAMA_VISION_MODEL),
+		skipReason: "Ollama mode without OLLAMA_VISION_MODEL",
+		timeoutMs: 300000,
+	},
+	{
+		name: "screenshot-without-text",
+		liveOnly: true,
+		// Regression: a bare attachment (no message text) used to be dropped
+		// before ever reaching the model
+		prompt: "",
+		files: [{ fixture: "backup-error.png", name: "backup-error.png", mimetype: "image/png" }],
+		judge:
+			"The user posted ONLY a screenshot, with no message text. The reply must show the " +
+			"assistant actually saw the screenshot content: it must mention at least one concrete " +
+			"detail from the image — the full disk (C: drive / 0 bytes free), the failed backup job " +
+			"BKP-4412, or the host SRV-WEB-01. It must NOT claim it cannot view images, must NOT " +
+			"say the user sent nothing, and must NOT merely ask what the user wants without " +
+			"addressing the image.",
+		skipUnless: () =>
+			(process.env.AI_PROVIDER || "openai").trim().toLowerCase() !== "ollama" ||
+			Boolean(process.env.OLLAMA_VISION_MODEL),
+		skipReason: "Ollama mode without OLLAMA_VISION_MODEL",
 		timeoutMs: 300000,
 	},
 	{
 		name: "file-generation",
 		liveOnly: true,
-		onlyProvider: "ollama",
+		onlyProvider: ["ollama", "vllm"],
 		prompt:
 			'Generate a CSV file named "squares.csv" with two columns, n and n_squared, for n from 1 to 10, and send it to me here.',
 		expectToolCall: /run_python/,
@@ -221,7 +248,7 @@ export const SCENARIOS = [
 	{
 		name: "csv-analysis",
 		liveOnly: true,
-		onlyProvider: "ollama",
+		onlyProvider: ["ollama", "vllm"],
 		prompt:
 			"I've attached a CSV with response-time measurements from our web tier. What is the average latency_ms across all rows?",
 		files: [{ fixture: "server-latency.csv", name: "server-latency.csv", mimetype: "text/csv" }],
@@ -239,10 +266,11 @@ export const SCENARIOS = [
 	{
 		name: "cpu-graph",
 		liveOnly: true,
-		onlyProvider: "ollama",
+		onlyProvider: ["ollama", "vllm"],
 		// Regression: the model's first turn on this prompt was ONLY a
-		// "working on it" slack_add_reply, and the agent loop used to treat
-		// that as the delivered answer and stop without doing the work
+		// "working on it" note (formerly via slack_add_reply, now streamed
+		// text), and the agent loop used to treat that as the delivered
+		// answer and stop without doing the work
 		prompt: "Show me the graph of the average cpu utilization of all servers monitored here",
 		expectToolCall: /run_python/,
 		judge:

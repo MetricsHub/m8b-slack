@@ -115,7 +115,8 @@ describe("buildToolsArray", () => {
 		expect(names).toContain("search_knowledge_base");
 		expect(names).toContain("update_knowledge");
 		expect(names).toContain("slack_add_reaction");
-		expect(names).toContain("slack_add_reply");
+		// Interim notes are streamed text now (system-prompt rule 13), not a tool
+		expect(names).not.toContain("slack_add_reply");
 		expect(names).toContain("ListHosts");
 		expect(names).toContain("run_python");
 	});

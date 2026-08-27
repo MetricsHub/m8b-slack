@@ -2,6 +2,7 @@ import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
+import { isMediaStoreConfigured, startMediaCleanup } from "./ai/services/media-store.js";
 import { registerListeners } from "./listeners/index.js";
 
 // Determine log level based on NODE_ENV
@@ -68,6 +69,12 @@ const app = new App({
 			}
 		} catch (e) {
 			app.logger.warn("AI backend health check errored", e);
+		}
+
+		// Age-based cleanup of the local media store (screenshots saved for the
+		// native-vision provider); no-op unless M8B_MEDIA_BASE_URL is configured
+		if (isMediaStoreConfigured()) {
+			startMediaCleanup(app.logger);
 		}
 
 		// Register the action and event listeners

@@ -4,14 +4,15 @@
  * This module coordinates:
  * - Message validation and context extraction
  * - File uploads and conversation history
- * - Streaming responses from the active AI provider (OpenAI or Ollama)
+ * - Streaming responses from the active AI provider (OpenAI, Ollama, or vLLM)
  * - Function call processing (the agent loop)
  * - Citation handling
  *
  * Conversation state:
  * - OpenAI: server-side via previous_response_id (unchanged behavior)
- * - Ollama: application-side; history is stored per Slack thread and resent
- *   as structured input items on every request (Ollama's /v1/responses is stateless)
+ * - Ollama/vLLM: application-side; history is stored per Slack thread and
+ *   resent as structured input items on every request (their /v1/responses
+ *   is used statelessly)
  */
 
 import { MAX_AGENT_ITERATIONS } from "./config/providers.js";
@@ -50,6 +51,7 @@ import {
 import {
 	createDescribingFileUploadManager,
 	createFileUploadManager,
+	createNativeImageFileUploadManager,
 	createNoopFileUploadManager,
 	extractPreviousUploads,
 	uploadOutputFilesToSlack,
@@ -58,8 +60,10 @@ import { streamOnce } from "./services/streaming.js";
 import { buildToolsArray, logToolWarnings } from "./tools/index.js";
 import {
 	estimateTokenCount,
+	getTokenCalibration,
 	isContextWindowError,
 	PAYLOAD_CHARS_PER_TOKEN,
+	recordTokenCalibration,
 	summarizeInputItems,
 } from "./utils/tokens.js";
 
@@ -81,7 +85,7 @@ const SLACK_SAFE_LENGTH = 35000; // Leave buffer for markdown formatting overhea
  * only these tools are pending, no extra model turn is needed — running one
  * makes local models repeat the answer as a duplicate Slack message.
  */
-const SIDE_EFFECT_TOOLS = new Set(["slack_add_reaction", "slack_add_reply"]);
+const SIDE_EFFECT_TOOLS = new Set(["slack_add_reaction"]);
 
 /**
  * One-shot nudge for stateless continuation turns after text was already
@@ -93,23 +97,6 @@ const NO_REPEAT_NUDGE = {
 		{
 			type: "input_text",
 			text: "Your previous assistant message was already delivered to the user in Slack. Do NOT repeat it. Reply only with new information based on the latest tool results, or with a very short addition if nothing new is needed.",
-		},
-	],
-};
-
-/**
- * One-shot nudge for stateless continuation turns whose only user-visible
- * output so far was a slack_add_reply. That reply is ambiguous: often an
- * interim "working on it" note (system-prompt rule 13) — the task must keep
- * going — but sometimes the complete answer, in which case the model must
- * stay silent instead of rephrasing it as a duplicate message.
- */
-const CONTINUE_AFTER_REPLY_NUDGE = {
-	role: "system",
-	content: [
-		{
-			type: "input_text",
-			text: "Your slack_add_reply message was already posted to the user in Slack. Do NOT repeat or rephrase it, and do not post another status note. If the task is not finished, continue it now: call the tools you need, then give the final answer. If that reply already fully answered the user, produce no further output at all.",
 		},
 	],
 };
@@ -153,8 +140,11 @@ export async function respond({
 	setStatus,
 	slackAppContext,
 }) {
-	// Skip non-text or incomplete messages
-	if (!("text" in message) || !("thread_ts" in message) || !message.text || !message.thread_ts) {
+	// Skip incomplete messages. A message may carry no text at all when the
+	// user posts a bare attachment (screenshot without a caption): the files
+	// are the content, so they count as a processable message.
+	const messageHasFiles = Array.isArray(message.files) && message.files.length > 0;
+	if (!("thread_ts" in message) || !message.thread_ts || (!message.text && !messageHasFiles)) {
 		return;
 	}
 
@@ -213,7 +203,7 @@ export async function respond({
 		// Set initial status (cosmetic: a transient Slack error here must not
 		// abort the whole turn)
 		try {
-			await setTitle(message.text);
+			await setTitle(message.text || "(file attachment)");
 			await setStatus({
 				status: "thinking...",
 				loading_messages: LOADING_MESSAGES,
@@ -253,22 +243,25 @@ export async function respond({
 				.map((msg) => msg.user)
 		);
 
-		// Set up file upload manager: real uploads (OpenAI Files API), vision
-		// descriptions (local vision model), or no-op (attachments become notes).
-		// With the local Python sandbox, both Ollama managers also stage data
-		// attachments so run_python can read them from /data/.
+		// Set up file upload manager: real uploads (OpenAI Files API), native
+		// image input (vLLM multimodal, via the local media store), vision
+		// descriptions (Ollama sidecar model), or no-op (attachments become
+		// notes). With the local Python sandbox, the local-provider managers
+		// also stage data attachments so run_python can read them from /data/.
 		const previousUploads = extractPreviousUploads(messages);
 		const stageAttachments = provider.capabilities.localCodeInterpreter === true;
 		const fileManager = provider.capabilities.providerFileUploads
 			? createFileUploadManager(previousUploads, logger)
-			: provider.capabilities.imageDescriptions
-				? createDescribingFileUploadManager({
-						describeImage: (params) => provider.describeImage(params),
-						contextText: buildVisionContext(messages, message),
-						stageAttachments,
-						logger,
-					})
-				: createNoopFileUploadManager(logger, { stageAttachments });
+			: provider.capabilities.imageInput
+				? createNativeImageFileUploadManager({ stageAttachments, logger })
+				: provider.capabilities.imageDescriptions
+					? createDescribingFileUploadManager({
+							describeImage: (params) => provider.describeImage(params),
+							contextText: buildVisionContext(messages, message),
+							stageAttachments,
+							logger,
+						})
+					: createNoopFileUploadManager(logger, { stageAttachments });
 
 		// Upload all files from thread (providers with a Files API only: uploads
 		// must exist before the tools array is built so code_interpreter sees
@@ -371,8 +364,13 @@ export async function respond({
 			);
 		}
 
-		// ALWAYS add current message (regardless of previous_response_id)
-		await appendCurrentMessage({
+		// ALWAYS add current message (regardless of previous_response_id).
+		// In stateless mode the appended items (user-context note + message) are
+		// also persisted, and an unchanged context note is not re-appended: the
+		// resent history then matches the previous request token-for-token, so
+		// the server's prefix cache covers the whole previous turn instead of
+		// being invalidated right before the previous user message.
+		const appendedCurrentItems = await appendCurrentMessage({
 			input,
 			message,
 			userProfile,
@@ -380,6 +378,7 @@ export async function respond({
 			uploadOnce: fileManager.uploadOnce,
 			slackAppContext,
 			filesUnsupported: fileManager.disabled === true,
+			priorHistory: stateless ? statelessHistory : null,
 			configAdminNote:
 				getMcpServerCount() > 0
 					? configEditingAllowed
@@ -387,7 +386,6 @@ export async function respond({
 						: "MetricsHub configuration changes: this user is NOT authorized; the config-editing tools are disabled for this conversation. If they ask for a configuration change, refuse and point them to an authorized admin."
 					: null,
 		});
-		const currentUserItem = input[input.length - 1];
 
 		// Pre-flight context check
 		let contextSummarized = false;
@@ -421,7 +419,7 @@ export async function respond({
 		let loopIteration = 0;
 		let hitIterationLimit = false;
 		let continueLoop = false;
-		let repliedViaTool = false;
+		let reactedViaTool = false;
 		let truncationRetries = 0;
 
 		// Stateless accumulation: items produced during this turn (assistant text,
@@ -562,6 +560,22 @@ export async function respond({
 				usage,
 			} = streamResult;
 
+			// Feed the server's exact prompt size back into the estimate
+			// calibration (see tokens.js). Skipped for forced text-only turns:
+			// they omit the tools array, so the schema reserve would not apply.
+			if (stateless && usage?.inputTokens > 0 && forceToolChoiceNext !== "none") {
+				const estimatedPromptTokens = estimateTokenCount(requestInput) + trimReserveTokens;
+				recordTokenCalibration({
+					estimatedTokens: estimatedPromptTokens,
+					actualTokens: usage.inputTokens,
+				});
+				logger.info?.("[Context] Prompt token calibration", {
+					estimated: estimatedPromptTokens,
+					actual: usage.inputTokens,
+					...getTokenCalibration(),
+				});
+			}
+
 			// Upload any generated files to Slack (code_interpreter output, OpenAI only)
 			if (outputFiles && outputFiles.length > 0) {
 				logger.info?.("Processing output files from code_interpreter", {
@@ -688,15 +702,16 @@ export async function respond({
 					outItemCount: outItems?.length || 0,
 				});
 
-				// A successful slack_add_reply IS a user-visible answer: track it so
-				// the loop doesn't force an extra turn the model fills with rambling
-				if (fc?.name === "slack_add_reply") {
+				// A successful reaction is a deliberate user-visible acknowledgment
+				// (rule 11 allows an emoji-only response): remember it so a turn
+				// that ends without text is not treated as a failed answer
+				if (fc?.name === "slack_add_reaction") {
 					try {
 						if (JSON.parse(outItems[0]?.output || "{}")?.ok === true) {
-							repliedViaTool = true;
+							reactedViaTool = true;
 						}
 					} catch {
-						/* malformed output: treat as not replied */
+						/* malformed output: treat as not reacted */
 					}
 				}
 
@@ -716,9 +731,6 @@ export async function respond({
 					// The visible answer was already streamed and the remaining tool
 					// results carry no information — an extra turn would only make the
 					// model repeat itself or narrate its tool calls in Slack. Stop here.
-					// A slack_add_reply WITHOUT streamed text must not stop the loop:
-					// it is usually an interim "working on it" note (rule 13), and
-					// stopping would silently drop the actual task.
 					logger.info?.(
 						"Answer already delivered; skipping extra model turn for side-effect tool results",
 						{ iteration: loopIteration, tools: functionCalls.map((fc) => fc?.name) }
@@ -727,13 +739,10 @@ export async function respond({
 				} else {
 					continueLoop = true;
 					if (hadText) {
-						// The turn delivered the streamed answer AND fetched data: continue,
-						// but tell the model its message is already posted so it doesn't repeat it
+						// The turn's streamed text was an interim note (rule 13) or a partial
+						// answer alongside data fetching: continue, but tell the model its
+						// message is already posted so it doesn't repeat it
 						transientItems = [NO_REPEAT_NUDGE];
-					} else if (repliedViaTool) {
-						// Only a slack_add_reply went out so far: keep working (or, if that
-						// reply was the whole answer, end the next turn with no output)
-						transientItems = [CONTINUE_AFTER_REPLY_NUDGE];
 					}
 				}
 			}
@@ -765,7 +774,7 @@ export async function respond({
 
 		// Persist the conversation for stateless providers
 		if (stateless) {
-			setConversation(storeKey, [...statelessHistory, currentUserItem, ...turnItems]);
+			setConversation(storeKey, [...statelessHistory, ...appendedCurrentItems, ...turnItems]);
 		}
 
 		if (hitIterationLimit) {
@@ -777,11 +786,12 @@ export async function respond({
 
 		// Handle final response
 		if (stateless) {
-			// A slack_add_reply already put the answer in the thread: nothing to add
-			if (!anyTextStreamed && !repliedViaTool) {
+			if (!anyTextStreamed) {
 				if (lastFullText) {
 					await say({ text: lastFullText });
-				} else {
+				} else if (!reactedViaTool) {
+					// No text AND no reaction: the turn produced nothing user-visible.
+					// (A reaction-only response is a legitimate rule-11 answer.)
 					await say({ text: "I've got nothing. Rephrase and try again. 🤷" });
 				}
 			}
@@ -940,7 +950,14 @@ function buildInitialInput({
 }
 
 /**
- * Append current message to input.
+ * Append the current message (preceded by a user-context system note) to input.
+ *
+ * With priorHistory (stateless providers), the context note is skipped when the
+ * history already carries an identical one: repeating it would both waste
+ * tokens and, once persisted, change the token stream of the replayed history
+ * — breaking the inference server's prefix cache for everything after it.
+ *
+ * @returns {Promise<Array>} The items appended to input (persisted by stateless callers)
  */
 async function appendCurrentMessage({
 	input,
@@ -950,9 +967,11 @@ async function appendCurrentMessage({
 	uploadOnce,
 	slackAppContext,
 	filesUnsupported = false,
+	priorHistory = null,
 	configAdminNote = null,
 }) {
-	const contentItems = [{ type: "input_text", text: message.text }];
+	// A bare attachment arrives with empty text: the files are the message
+	const contentItems = message.text ? [{ type: "input_text", text: message.text }] : [];
 
 	// Upload any attached files
 	const files = Array.isArray(message.files) ? message.files : [];
@@ -969,6 +988,16 @@ async function appendCurrentMessage({
 		if (result?.contentItem) {
 			contentItems.push(result.contentItem);
 		}
+	}
+
+	// Never send an empty user message (rejected by the backends). Content can
+	// end up empty for a bare attachment whose file produced no content item —
+	// either it lives elsewhere (OpenAI code_interpreter files) or it failed.
+	if (contentItems.length === 0) {
+		contentItems.push({
+			type: "input_text",
+			text: "[The user sent one or more file attachments without any message text.]",
+		});
 	}
 
 	// Build user context message
@@ -997,12 +1026,31 @@ async function appendCurrentMessage({
 	if (slackEntities.length > 0) {
 		userContextParts.push(`User's current Slack context:\n${slackEntities.join("\n")}`);
 	}
+	const contextNoteText = userContextParts.join("\n");
 
-	input.push({
-		role: "system",
-		content: [{ type: "input_text", text: userContextParts.join("\n") }],
-	});
-	input.push({ role: "user", content: contentItems });
+	// Skip the note when the replayed history already ends with an identical
+	// one (same user, same context). A different requesting user or changed
+	// Slack context produces a different text and is appended normally.
+	const lastContextNote = Array.isArray(priorHistory)
+		? priorHistory.findLast(
+				(item) =>
+					item?.role === "system" &&
+					item?.content?.[0]?.type === "input_text" &&
+					item.content[0].text.includes("User's Slack ID:")
+			)
+		: null;
+
+	const appended = [];
+	if (lastContextNote?.content?.[0]?.text !== contextNoteText) {
+		appended.push({
+			role: "system",
+			content: [{ type: "input_text", text: contextNoteText }],
+		});
+	}
+	appended.push({ role: "user", content: contentItems });
+
+	input.push(...appended);
+	return appended;
 }
 
 /**

@@ -71,22 +71,6 @@ export const SLACK_TOOLS = [
 			additionalProperties: false,
 		},
 	},
-	{
-		type: "function",
-		name: "slack_add_reply",
-		description: "Add a Slack reply message in the current thread.",
-		parameters: {
-			type: "object",
-			properties: {
-				text: {
-					type: "string",
-					description: "The text (in Slack mrkdwn format) of the reply message.",
-				},
-			},
-			required: ["text"],
-			additionalProperties: false,
-		},
-	},
 ];
 
 /**

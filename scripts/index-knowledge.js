@@ -3,8 +3,12 @@
  * Build (or rebuild) the local knowledge base embedding index from the markdown
  * documents in <KNOWLEDGE_BASE_DIR>/docs/.
  *
- * Requires a running Ollama server with the configured embedding model pulled:
- *   ollama pull nomic-embed-text   (or whatever OLLAMA_EMBEDDING_MODEL is set to)
+ * Requires a running embedding backend for the active AI provider:
+ * - Ollama mode: the Ollama server with OLLAMA_EMBEDDING_MODEL pulled
+ *   (e.g. ollama pull bge-m3)
+ * - vLLM mode: a dedicated embedding endpoint via VLLM_EMBEDDING_BASE_URL
+ *   and VLLM_EMBEDDING_MODEL (a vLLM instance serves a single model, so the
+ *   chat instance cannot embed)
  *
  * Usage:
  *   node scripts/index-knowledge.js                 # full rebuild
@@ -15,13 +19,20 @@
  */
 
 import "dotenv/config";
-import { getOllamaConfig } from "../ai/config/providers.js";
+import { getEmbeddingBackendConfig } from "../ai/config/providers.js";
 import { createLocalKnowledgeBase } from "../ai/services/knowledge-base.js";
 
 async function main() {
-	const { baseUrl, embeddingModel } = getOllamaConfig();
-	console.log(`Embedding endpoint: ${baseUrl}/embeddings`);
-	console.log(`Embedding model:    ${embeddingModel}`);
+	const backend = getEmbeddingBackendConfig();
+	if (!backend) {
+		console.error(
+			"No embedding backend is configured for this AI provider.\n" +
+				"Ollama mode: set OLLAMA_EMBEDDING_MODEL. vLLM mode: set VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL."
+		);
+		process.exit(1);
+	}
+	console.log(`Embedding endpoint: ${backend.baseUrl}/embeddings`);
+	console.log(`Embedding model:    ${backend.model}`);
 
 	const kb = createLocalKnowledgeBase({ logger: console });
 	console.log(`Documents dir:      ${kb.docsDir}`);

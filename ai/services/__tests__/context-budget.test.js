@@ -2,9 +2,16 @@
  * Tests for deterministic context-budget trimming (Ollama mode).
  */
 
-import { describe, expect, it } from "@jest/globals";
-import { estimateTokenCount } from "../../utils/tokens.js";
+import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
+import {
+	estimateTokenCount,
+	recordTokenCalibration,
+	resetTokenCalibration,
+} from "../../utils/tokens.js";
 import { trimToContextBudget } from "../context-budget.js";
+
+beforeEach(() => resetTokenCalibration());
+afterEach(() => resetTokenCalibration());
 
 function systemItem(text) {
 	return { role: "system", content: [{ type: "input_text", text }] };
@@ -49,6 +56,44 @@ describe("trimToContextBudget", () => {
 		expect(result[result.length - 1].content[0].text).toContain("answer 199");
 		// The estimate fits the budget
 		expect(estimateTokenCount(result)).toBeLessThanOrEqual(contextWindow - maxOutputTokens - 1500);
+	});
+
+	it("keeps more history when calibration says estimates run high", () => {
+		// A conversation whose ESTIMATE slightly exceeds the raw budget
+		const items = [systemItem("SYSTEM")];
+		for (let i = 0; i < 12; i++) {
+			items.push(userItem(`question ${i} ${"x".repeat(2000)}`));
+			items.push(assistantItem(`answer ${i} ${"y".repeat(2000)}`));
+		}
+		// ~12k estimated tokens vs an 11.5k raw budget (15000 - 2000 - 1500)
+		const options = { contextWindow: 15000, maxOutputTokens: 2000 };
+
+		// Without calibration: over budget, older turns are dropped
+		const uncalibrated = trimToContextBudget(items, options);
+		expect(uncalibrated).not.toBe(items);
+		expect(uncalibrated.length).toBeLessThan(items.length + 1);
+
+		// With measured 30%-high estimates, the effective budget grows and the
+		// same conversation fits untouched
+		recordTokenCalibration({ estimatedTokens: 13000, actualTokens: 9100 });
+		expect(trimToContextBudget(items, options)).toBe(items);
+	});
+
+	it("trims earlier when calibration says estimates run low", () => {
+		const items = [systemItem("SYSTEM")];
+		for (let i = 0; i < 12; i++) {
+			items.push(userItem(`question ${i} ${"x".repeat(2000)}`));
+			items.push(assistantItem(`answer ${i} ${"y".repeat(2000)}`));
+		}
+		// ~12k estimated tokens vs a 14.5k raw budget: fits with neutral calibration
+		const options = { contextWindow: 18000, maxOutputTokens: 2000 };
+		expect(trimToContextBudget(items, options)).toBe(items);
+
+		// The server reported 40% MORE tokens than estimated: budget shrinks
+		recordTokenCalibration({ estimatedTokens: 10000, actualTokens: 14000 });
+		const calibrated = trimToContextBudget(items, options);
+		expect(calibrated).not.toBe(items);
+		expect(calibrated[1].content[0].text).toContain("removed to fit");
 	});
 
 	it("never splits a function_call from its function_call_output", () => {

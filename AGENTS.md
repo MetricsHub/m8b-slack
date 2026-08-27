@@ -4,7 +4,7 @@ This document provides instructions for AI agents working on this codebase.
 
 ## Project Overview
 
-M8B is a Slack bot powered by OpenAI (hosted) or Ollama (local, OpenAI-compatible `/v1/responses`) that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights. The AI backend is selected with `AI_PROVIDER` and abstracted behind `ai/providers/` — application code depends on provider capability flags, not provider names.
+M8B is a Slack bot powered by OpenAI (hosted), Ollama, or vLLM (both local, OpenAI-compatible `/v1/responses`) that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights. The AI backend is selected with `AI_PROVIDER` and abstracted behind `ai/providers/` — application code depends on provider capability flags, not provider names.
 
 ## Tech Stack
 
@@ -169,7 +169,9 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
    - `SLACK_APP_TOKEN` - App-level token (xapp-...)
    - `OPENAI_API_KEY` - OpenAI API key (OpenAI mode)
 3. To use a local model instead of OpenAI, set `AI_PROVIDER=ollama` plus
-   `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_EMBEDDING_MODEL` (see README)
+   `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_EMBEDDING_MODEL`, or
+   `AI_PROVIDER=vllm` plus `VLLM_BASE_URL`/`VLLM_API_KEY` (and `M8B_MEDIA_*`
+   for URL-based screenshot handling) — see README
 
 ## Common Tasks
 
@@ -202,7 +204,12 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 - Ollama's `/v1/responses` is stateless: no `previous_response_id`/`conversation`. Its request
   builder must only emit fields Ollama supports (model, input, instructions, tools, stream,
   temperature, top_p, max_output_tokens)
-- In Ollama mode, never send data to OpenAI (no silent fallback)
+- vLLM is used statelessly too (its Responses store is unbounded/in-memory, so
+  `previous_response_id` is deliberately not used). Its model is multimodal:
+  `capabilities.imageInput` — images go in as `input_image` items (the `detail` field is
+  REQUIRED by vLLM's schema) referencing local media-store URLs (`ai/services/media-store.js`),
+  falling back to base64 data URLs when `M8B_MEDIA_BASE_URL` is unset
+- In local modes (ollama/vllm), never send data to OpenAI (no silent fallback)
 
 ## Key Files Reference
 
@@ -217,9 +224,10 @@ This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
 | `ai/mcp_registry.js`                | MCP server discovery and management                          |
 | `ai/providers/index.js`             | AI provider abstraction                                      |
 | `ai/config/providers.js`            | Provider env configuration                                   |
-| `ai/services/conversation-store.js` | App-side thread state (Ollama)                               |
-| `ai/services/knowledge-base.js`     | Local RAG knowledge base (Ollama)                            |
-| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (Ollama, Pyodide)        |
+| `ai/services/conversation-store.js` | App-side thread state (local modes)                          |
+| `ai/services/knowledge-base.js`     | Local RAG knowledge base (local modes)                       |
+| `ai/services/media-store.js`        | Local image store served to the vLLM host by URL             |
+| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (local modes, Pyodide)   |
 | `ai/services/web-search.js`         | App-side web search backends                                 |
 | `ai/services/metricshub-api.js`     | MetricsHub Agent REST API client (config files, encryption)  |
 | `ai/services/config-editor.js`      | Config-editing tool handlers (auth, validate, approve, save) |

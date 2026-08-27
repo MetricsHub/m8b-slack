@@ -1,14 +1,15 @@
 /**
  * AI provider configuration.
  *
- * Selects between the hosted OpenAI backend (default) and a local Ollama backend
- * exposing the OpenAI-compatible /v1/responses API.
+ * Selects between the hosted OpenAI backend (default) and a local backend
+ * exposing the OpenAI-compatible /v1/responses API: Ollama or vLLM.
  */
 
 import { PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
 
 export const PROVIDER_OPENAI = "openai";
 export const PROVIDER_OLLAMA = "ollama";
+export const PROVIDER_VLLM = "vllm";
 
 /**
  * Maximum agent-loop iterations (model -> tool calls -> model) per Slack message.
@@ -30,11 +31,13 @@ function parsePositiveInt(value, fallback) {
 /**
  * Get the configured AI provider name.
  *
- * @returns {string} "openai" or "ollama"
+ * @returns {string} "openai", "ollama", or "vllm"
  */
 export function getAiProviderName() {
 	const raw = (process.env.AI_PROVIDER || PROVIDER_OPENAI).trim().toLowerCase();
-	return raw === PROVIDER_OLLAMA ? PROVIDER_OLLAMA : PROVIDER_OPENAI;
+	if (raw === PROVIDER_OLLAMA) return PROVIDER_OLLAMA;
+	if (raw === PROVIDER_VLLM) return PROVIDER_VLLM;
+	return PROVIDER_OPENAI;
 }
 
 /**
@@ -129,4 +132,62 @@ export function getOllamaConfig() {
 			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
 	};
+}
+
+/**
+ * Get the vLLM backend configuration from environment variables.
+ *
+ * VLLM_MODEL may be left unset: vLLM serves a single model per instance, so
+ * the health check adopts the served model automatically. VLLM_CONTEXT_LENGTH
+ * may also be left unset: the health check detects max_model_len via
+ * /v1/models (an explicit smaller value still wins as a tighter budget).
+ *
+ * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
+ *   maxOutputTokens: number, requestTimeoutMs: number, maxToolOutputChars: number}}
+ */
+export function getVllmConfig() {
+	const contextWindow = parsePositiveInt(process.env.VLLM_CONTEXT_LENGTH, 32768);
+	const maxOutputTokens = parsePositiveInt(process.env.VLLM_MAX_OUTPUT_TOKENS, 4000);
+
+	return {
+		baseUrl: (process.env.VLLM_BASE_URL || "http://localhost:8000/v1").replace(/\/+$/, ""),
+		apiKey: process.env.VLLM_API_KEY || "vllm",
+		model: (process.env.VLLM_MODEL || "").trim(),
+		contextWindow,
+		maxOutputTokens,
+		requestTimeoutMs: parsePositiveInt(process.env.VLLM_REQUEST_TIMEOUT_MS, 300000),
+		maxToolOutputChars: parsePositiveInt(
+			process.env.VLLM_MAX_TOOL_OUTPUT_CHARS,
+			defaultToolOutputChars(contextWindow, maxOutputTokens)
+		),
+	};
+}
+
+/**
+ * Get the embedding backend for the local knowledge base, based on the active
+ * AI provider. Returns null when no embedding backend applies (OpenAI mode
+ * uses hosted file_search; vLLM mode needs a dedicated endpoint because a
+ * vLLM instance serves a single model, so the chat instance cannot embed).
+ *
+ * @param {string} [providerName] - Provider name (defaults to the active one)
+ * @returns {{baseUrl: string, apiKey: string, model: string}|null}
+ */
+export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
+	if (providerName === PROVIDER_OLLAMA) {
+		const { baseUrl, apiKey, embeddingModel } = getOllamaConfig();
+		return { baseUrl, apiKey, model: embeddingModel };
+	}
+
+	if (providerName === PROVIDER_VLLM) {
+		const baseUrl = (process.env.VLLM_EMBEDDING_BASE_URL || "").trim().replace(/\/+$/, "");
+		const model = (process.env.VLLM_EMBEDDING_MODEL || "").trim();
+		if (!baseUrl || !model) return null;
+		return {
+			baseUrl,
+			apiKey: process.env.VLLM_EMBEDDING_API_KEY || process.env.VLLM_API_KEY || "vllm",
+			model,
+		};
+	}
+
+	return null;
 }

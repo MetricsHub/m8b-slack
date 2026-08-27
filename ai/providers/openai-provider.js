@@ -14,6 +14,7 @@ import { buildResponseRequest } from "../services/streaming.js";
 export function createOpenAiProvider() {
 	return {
 		name: "openai",
+		isLocal: false,
 		model: MODEL_CONFIG.model,
 		endpoint: "https://api.openai.com/v1",
 		client: openai,
@@ -28,6 +29,8 @@ export function createOpenAiProvider() {
 			hostedWebSearch: true,
 			providerFileUploads: true,
 			imageDescriptions: false,
+			// Images ride through the Files API (providerFileUploads), not inline
+			imageInput: false,
 			toolNamespaces: true,
 		},
 		buildRequest(params) {

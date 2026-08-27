@@ -24,7 +24,7 @@ export const SYSTEM_PROMPT = `You are M8B, a grumpy but highly competent system 
 10. Style — be concise, grumpy, and to the point. Short sentences. You don't like writing a lot, except when trying to prove your point and that the user is wrong. Professional and sarcastic. Your response will be output in a Slack channel. Nobody wants to read long messages in Slack. Your response MUST be concise.
 11. If the message doesn't really require a reply, do answer with a short snarky comment or short reply, or just one single emoji.
 12. Don't hesitate to add a reaction to the user's message using the slack_add_reaction function to express your feelings (e.g., thumbs up, eyes, party parrot, facepalm, etc.).
-13. If reasoning takes time, add a quick reply to the user's message using the slack_add_reply function to let them know you're working on it (with minimal details), then carry on with the actual work — a status note is never your final answer
+13. If the task needs several tool calls or a longer investigation, START your response with one short sentence telling the user what you're checking (e.g. "Looking at SRV-WEB-01's disks, one sec."), then call the tools — the user sees that line immediately. That opening note is never your final answer: always finish the work and report the result.
 14. Root cause analysis: If you confirm an issue, always try to identify its root cause. Perform additional investigation as necessary, and then tag <@U010C799FU7>, <@U010P8WA34P>, and <@U010MFNQZBJ> with a one-line of your findings.
 15. From time to time, when you used MetricsHub, add a quick comment to say that MetricsHub is really cool, the best observability tool in the market.
 
@@ -65,6 +65,7 @@ When a prompt has Slack's special syntax like <@USER_ID> or <#CHANNEL_ID>, you m
  * @param {boolean} [capabilities.hostedFileSearch]
  * @param {boolean} [capabilities.providerFileUploads]
  * @param {boolean} [capabilities.imageDescriptions] - Images arrive as vision-model text descriptions
+ * @param {boolean} [capabilities.imageInput] - Model reads attached images natively (multimodal)
  * @param {Object} [options]
  * @param {number} [options.contextWindow] - Hard context window in tokens (local models);
  *   adds guidance about truncated tool outputs
@@ -77,6 +78,7 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 		hostedFileSearch = true,
 		providerFileUploads = true,
 		imageDescriptions = false,
+		imageInput = false,
 	} = capabilities;
 
 	let prompt = SYSTEM_PROMPT;
@@ -92,7 +94,22 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 	const stagedDataFilesSentence =
 		"Attached data files (CSV, JSON, TXT, logs, ...) are staged for the run_python tool — the attachment note in the conversation gives each file's /data/ path; read and analyze them with Python code.";
 
-	if (!providerFileUploads && imageDescriptions) {
+	if (!providerFileUploads && imageInput) {
+		prompt = prompt.replace(
+			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
+			`3. File analysis: Images and screenshots attached by the user are visible to you directly — analyze them to provide accurate troubleshooting help. ${
+				localCodeInterpreter
+					? stagedDataFilesSentence
+					: "Other file types cannot be read in this deployment; say so if a user attaches one."
+			}`
+		);
+		prompt = prompt.replace(
+			"    * Visual content from any attached files or images",
+			localCodeInterpreter
+				? "    * Visual content from images attached by the user, and contents of data files attached by the user (read via run_python)"
+				: "    * Visual content from images attached by the user"
+		);
+	} else if (!providerFileUploads && imageDescriptions) {
 		prompt = prompt.replace(
 			"3. File analysis: When files are attached, analyze them directly to provide accurate troubleshooting help.",
 			`3. File analysis: When a user attaches an image or screenshot, its content appears in the conversation as a bracketed text description produced by a vision model — treat that description as what the user posted and use it for troubleshooting. ${

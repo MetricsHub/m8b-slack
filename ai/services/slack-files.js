@@ -8,6 +8,12 @@ import os from "node:os";
 import path from "node:path";
 import { getCodeSandboxConfig } from "../config/providers.js";
 import { sanitizeSandboxFileName } from "./code-sandbox.js";
+import {
+	getMediaStoreConfig,
+	isMediaStoreConfigured,
+	saveMedia,
+	supportedImageExtension,
+} from "./media-store.js";
 import { openai } from "./openai.js";
 
 /**
@@ -447,6 +453,130 @@ export function createDescribingFileUploadManager({
 				});
 				result = note(
 					`[Image "${fileName}" attached by the user could not be analyzed (vision backend error). Tell the user you could not look at it.]`
+				);
+			}
+		}
+
+		cache.set(key, result);
+		return result;
+	}
+
+	return {
+		uploadOnce,
+		stageAttachment: stage
+			? (file) =>
+					String(file?.mimetype || "").startsWith("image/") ? Promise.resolve(null) : stage(file)
+			: undefined,
+		codeFileIds: new Set(),
+		codeContainerFiles: new Map(),
+		uploadedFilesThisTurn: [],
+		sandboxFiles,
+	};
+}
+
+/**
+ * Create a file "upload" manager for native-vision providers (vLLM): image
+ * attachments become input_image content items the model reads directly.
+ *
+ * The image bytes are downloaded from Slack once (with Slack credentials) and
+ * saved into the local media store; the content item then carries only the
+ * short internal media URL, which the inference host fetches itself — Slack
+ * URLs (which require a Bearer token) are never sent to the backend, and the
+ * conversation history stays small when it is resent every turn. Without a
+ * configured media store (M8B_MEDIA_BASE_URL unset) the item degrades to an
+ * inline base64 data URL, which works but bloats every subsequent request.
+ *
+ * Content items end up embedded in the stored conversation input, so each
+ * image is downloaded and saved once per store lifetime. Non-image files are
+ * staged into the Python sandbox when stageAttachments is set
+ * (localCodeInterpreter providers) and degrade to an unsupported-type note
+ * otherwise.
+ *
+ * @param {Object} params
+ * @param {boolean} [params.stageAttachments] - Stage data files for run_python
+ * @param {Object} [params.logger] - Logger instance
+ * @returns {Object} Upload manager with uploadOnce (and stageAttachment) methods
+ */
+export function createNativeImageFileUploadManager({ stageAttachments = false, logger } = {}) {
+	const cache = new Map(); // key -> { contentItem, fileId }
+	const sandboxFiles = new Map();
+	const stage = stageAttachments
+		? createAttachmentStager({
+				sandboxFiles,
+				maxBytes: getCodeSandboxConfig().maxInputFileBytes,
+				logger,
+			})
+		: null;
+	let warnedBase64Fallback = false;
+
+	function note(text) {
+		return { contentItem: { type: "input_text", text }, fileId: null };
+	}
+
+	async function uploadOnce(file) {
+		const key = fileCacheKey(file);
+		if (cache.has(key)) {
+			return cache.get(key);
+		}
+
+		const fileName = file.name || "unknown";
+		const mimetype = String(file.mimetype || "");
+		let result;
+
+		if (!mimetype.startsWith("image/")) {
+			result = stage
+				? note(stagedAttachmentNote(file, await stage(file)))
+				: note(
+						`[Attached file "${fileName}" (${mimetype || "unknown type"}) — only images can be analyzed on the local AI backend.]`
+					);
+		} else if (!supportedImageExtension(mimetype)) {
+			result = note(
+				`[Image "${fileName}" attached by the user uses an unsupported format (${mimetype}). Tell the user you can only look at PNG, JPEG, GIF, or WebP images.]`
+			);
+		} else {
+			try {
+				const downloaded = await downloadSlackFile(file);
+				if (!downloaded) throw new Error("file has no downloadable URL");
+
+				const { maxFileBytes } = getMediaStoreConfig();
+				if (downloaded.buffer.length > maxFileBytes) {
+					throw new Error(
+						`image is too large (${downloaded.buffer.length} bytes, cap ${maxFileBytes})`
+					);
+				}
+
+				let imageUrl;
+				if (isMediaStoreConfigured()) {
+					const saved = await saveMedia({ buffer: downloaded.buffer, mimetype });
+					imageUrl = saved.url;
+					logger?.info?.("Saved image attachment to the media store", {
+						name: fileName,
+						mediaId: saved.mediaId,
+						bytes: downloaded.buffer.length,
+					});
+				} else {
+					if (!warnedBase64Fallback) {
+						warnedBase64Fallback = true;
+						logger?.warn?.(
+							"M8B_MEDIA_BASE_URL is not set: embedding image as base64 (heavy on resent history)",
+							{ name: fileName }
+						);
+					}
+					imageUrl = `data:${mimetype};base64,${downloaded.buffer.toString("base64")}`;
+				}
+
+				// vLLM's input_image schema requires the detail field
+				result = {
+					contentItem: { type: "input_image", detail: "auto", image_url: imageUrl },
+					fileId: null,
+				};
+			} catch (err) {
+				logger?.warn?.("Failed to prepare Slack image for native vision", {
+					name: fileName,
+					err: String(err),
+				});
+				result = note(
+					`[Image "${fileName}" attached by the user could not be processed (${err?.message || err}). Tell the user you could not look at it.]`
 				);
 			}
 		}
