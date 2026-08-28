@@ -9,6 +9,22 @@ describe("buildSystemPrompt", () => {
 		expect(buildSystemPrompt()).toBe(SYSTEM_PROMPT);
 	});
 
+	it("mandates one host per call on small context windows", () => {
+		const prompt = buildSystemPrompt({}, { contextWindow: 32768 });
+		expect(prompt).toContain("(32768 tokens)");
+		expect(prompt).toContain("query ONE host per call");
+		expect(prompt).toContain("NEVER guess");
+	});
+
+	it("relaxes per-host querying on large context windows, keeping truncation honesty", () => {
+		const prompt = buildSystemPrompt({}, { contextWindow: 262144 });
+		expect(prompt).toContain("(262144 tokens)");
+		expect(prompt).not.toContain("query ONE host per call");
+		expect(prompt).toContain("batch a handful of hosts");
+		expect(prompt).toContain("monitorTypes");
+		expect(prompt).toContain("NEVER guess");
+	});
+
 	it("tells the model attachments are unreadable without file uploads or vision", () => {
 		const prompt = buildSystemPrompt({ providerFileUploads: false, imageDescriptions: false });
 		expect(prompt).toContain("File analysis is not available in this deployment");

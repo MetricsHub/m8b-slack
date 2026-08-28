@@ -84,11 +84,18 @@ export function buildSystemPrompt(capabilities = {}, { contextWindow } = {}) {
 	let prompt = SYSTEM_PROMPT;
 
 	if (contextWindow) {
+		// Below ~100k tokens, one metric-heavy host per call is a hard necessity;
+		// with a large window the model may batch, and only needs to stay honest
+		// about truncation (which the deterministic trimmer can still cause)
+		const metricQueryGuidance =
+			contextWindow < 100000
+				? "For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), query ONE host per call."
+				: "For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), keep queries focused: batch a handful of hosts at most, and use the monitorTypes filter when you only need specific data.";
 		prompt += `
 
 **Local model constraints:**
 
-19. Your context window is limited (${contextWindow} tokens) and large tool outputs are truncated to fit it. For metric-heavy tools (GetMetricsFromCacheForHost, CollectMetricsForHost, etc.), query ONE host per call. When a tool result says it was truncated, NEVER guess, assume, or report values for hosts/items missing from the data you actually received — re-query them one at a time, or tell the user their data is missing.`;
+19. Your context window is limited (${contextWindow} tokens) and large tool outputs are truncated to fit it. ${metricQueryGuidance} When a tool result says it was truncated, NEVER guess, assume, or report values for hosts/items missing from the data you actually received — re-query them one at a time, or tell the user their data is missing.`;
 	}
 
 	const stagedDataFilesSentence =
