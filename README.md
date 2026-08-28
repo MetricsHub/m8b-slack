@@ -63,9 +63,10 @@ m8b-slackbot/
 │   ├── export-openai-knowledge.js # Export OpenAI vector-store docs to local files
 │   └── index-knowledge.js    # Build the local knowledge base embedding index
 ├── listeners/
-│   ├── actions/              # Slack action handlers
-│   ├── assistant/            # Assistant thread handlers
-│   └── events/               # Event handlers (app_mention, etc.)
+│   ├── actions/              # Slack action handlers (config approval, feedback)
+│   ├── agent/                # Agent messaging handlers (home opened, context, messages)
+│   ├── events/               # Event handlers (app_mention, etc.)
+│   └── views/                # Slack views (credentials modal, feedback blocks)
 └── manifest.json             # Slack app manifest
 ```
 
@@ -436,6 +437,9 @@ The active model configuration is in `ai/config/system-prompt.js`:
 - Output: low verbosity, up to 8,000 tokens
 - Conversation continuity: `previous_response_id`
 - End-user safety identifier: a privacy-preserving hash of the Slack workspace and user IDs
+- Context overflow: when server-side history grows past ~100k tokens (or a context-window
+  error is hit), older messages are summarized with `gpt-4o-mini` (OpenAI mode only — local
+  modes trim deterministically instead)
 
 MetricsHub tools are grouped into namespaces of fewer than ten functions. `ListHosts` and
 `SearchHost` remain immediately callable; larger MetricsHub schemas, PromQL, and knowledge-base

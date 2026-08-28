@@ -33,8 +33,9 @@ m8b-slackbot/
 ├── scripts/               # KB migration/indexing CLI scripts (kb:export, kb:index)
 ├── listeners/
 │   ├── actions/           # Slack interactive actions
-│   ├── assistant/         # Assistant thread handlers
-│   └── events/            # Slack event handlers
+│   ├── agent/             # Agent messaging handlers (app home, context, messages)
+│   ├── events/            # Slack event handlers
+│   └── views/             # Slack views (modals, blocks)
 └── __tests__/             # Test files (co-located with source in __tests__ folders)
 ```
 
@@ -159,7 +160,8 @@ Before committing, run the full validation:
 npm run validate
 ```
 
-This runs: `format:check` → `lint` → `check` (TypeScript) → `test`
+This runs: `format:check` → `lint` → `test` (TypeScript type checking is separate:
+`npm run check` — run it too when touching typed interfaces)
 
 ## Environment Setup
 
