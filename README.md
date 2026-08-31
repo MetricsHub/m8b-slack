@@ -381,10 +381,14 @@ without them the knowledge base is disabled).
 **Code Interpreter in Ollama mode:** the hosted `code_interpreter` is replaced by a local
 `run_python` function tool backed by [Pyodide](https://pyodide.org) (CPython compiled to
 WebAssembly, running in a worker thread). The WASM boundary is the sandbox: the generated code
-sees no host filesystem and no network — only an in-memory virtual filesystem with `/data`
-(inputs staged by the app: user-attached data files, capped by
-`CODE_SANDBOX_MAX_INPUT_FILE_BYTES`, and large tool outputs as JSON) and `/outputs` (files collected
-after the run and posted to the Slack thread). numpy, pandas, matplotlib, and openpyxl load on
+sees no network and no host filesystem except `/data`, a per-execution NODEFS mount holding the
+inputs staged by the app — user-attached data files (streamed into a persistent disk cache under
+`CODE_SANDBOX_STAGING_DIR`, downloaded from Slack once per file version, capped per file by
+`CODE_SANDBOX_MAX_INPUT_FILE_BYTES` and in total by `CODE_SANDBOX_STAGING_CACHE_MAX_BYTES`) and
+large tool outputs as JSON. Reads stream from host disk, so large attachments are not copied into
+the WASM heap up front; the mount only contains per-execution copies deleted after the run.
+`/outputs` (files collected after the run and posted to the Slack thread) stays an in-memory
+filesystem. numpy, pandas, matplotlib, and openpyxl load on
 demand (downloaded once by the _host_ — from the Pyodide CDN, plus pinned PyPI wheels for
 openpyxl — then cached in `CODE_SANDBOX_PACKAGE_CACHE_DIR`). Pyodide's `js` interop module — which would expose the host
 JavaScript scope in Node — is stripped from the interpreter at startup, and every execution is

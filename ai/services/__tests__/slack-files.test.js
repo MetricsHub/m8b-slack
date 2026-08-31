@@ -149,6 +149,8 @@ describe("createDescribingFileUploadManager", () => {
 
 describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 	const savedFetch = global.fetch;
+	const savedStagingDir = process.env.CODE_SANDBOX_STAGING_DIR;
+	let stagingDir;
 
 	const csvFile = {
 		id: "F_CSV",
@@ -158,19 +160,30 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 		url_private_download: "https://files.slack.com/hosts.csv",
 	};
 
-	beforeEach(() => {
+	/** Read a staged {path, bytes} sandbox entry back from disk. */
+	async function readStaged(entry) {
+		return fsp.readFile(entry.path, "utf8");
+	}
+
+	beforeEach(async () => {
+		stagingDir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-staging-test-"));
+		process.env.CODE_SANDBOX_STAGING_DIR = stagingDir;
 		global.fetch = jest.fn(async () => ({
 			ok: true,
 			status: 200,
 			headers: { get: (name) => (name === "content-type" ? "text/csv" : null) },
-			// TextEncoder allocates a standalone ArrayBuffer; Buffer.from(str).buffer
-			// would expose Node's shared buffer pool instead of just these bytes
+			// The stream path is exercised via body; arrayBuffer stays as the
+			// fallback for responses without one
+			body: new Response(new TextEncoder().encode("hostname,cpu\nsrv-01,42\n")).body,
 			arrayBuffer: async () => new TextEncoder().encode("hostname,cpu\nsrv-01,42\n").buffer,
 		}));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		global.fetch = savedFetch;
+		if (savedStagingDir === undefined) delete process.env.CODE_SANDBOX_STAGING_DIR;
+		else process.env.CODE_SANDBOX_STAGING_DIR = savedStagingDir;
+		await fsp.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
 	});
 
 	describe("createDescribingFileUploadManager with stageAttachments", () => {
@@ -181,7 +194,7 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 			});
 		}
 
-		it("stages a CSV attachment and points the note at /data", async () => {
+		it("stages a CSV attachment on disk and points the note at /data", async () => {
 			const manager = makeManager();
 			const result = await manager.uploadOnce(csvFile);
 
@@ -190,9 +203,10 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 			expect(result.contentItem.text).toContain("/data/hosts.csv");
 			expect(result.contentItem.text).not.toContain("only images can be analyzed");
 
-			expect(manager.sandboxFiles.get("hosts.csv").toString("utf8")).toBe(
-				"hostname,cpu\nsrv-01,42\n"
-			);
+			const entry = manager.sandboxFiles.get("hosts.csv");
+			expect(entry.bytes).toBe(23);
+			expect(entry.path.startsWith(path.join(stagingDir, "cache"))).toBe(true);
+			expect(await readStaged(entry)).toBe("hostname,cpu\nsrv-01,42\n");
 		});
 
 		it("downloads each attachment only once across stageAttachment and uploadOnce", async () => {
@@ -204,14 +218,49 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 			expect(manager.sandboxFiles.size).toBe(1);
 		});
 
+		it("serves repeat turns from the disk cache without re-downloading", async () => {
+			await makeManager().stageAttachment(csvFile);
+			expect(global.fetch).toHaveBeenCalledTimes(1);
+
+			// A later turn builds a fresh manager, but the same file version
+			// is already in the staging cache
+			const secondTurn = makeManager();
+			const result = await secondTurn.stageAttachment(csvFile);
+
+			expect(result.ok).toBe(true);
+			expect(global.fetch).toHaveBeenCalledTimes(1);
+			expect(await readStaged(secondTurn.sandboxFiles.get("hosts.csv"))).toBe(
+				"hostname,cpu\nsrv-01,42\n"
+			);
+		});
+
 		it("refuses attachments above the size cap without downloading", async () => {
 			const manager = makeManager();
-			const result = await manager.uploadOnce({ ...csvFile, size: 6 * 1024 * 1024 });
+			const result = await manager.uploadOnce({ ...csvFile, size: 200 * 1024 * 1024 });
 
 			expect(result.contentItem.text).toContain("could not be staged");
 			expect(result.contentItem.text).toContain("too large");
 			expect(manager.sandboxFiles.size).toBe(0);
 			expect(global.fetch).not.toHaveBeenCalled();
+		});
+
+		it("aborts mid-download when the stream exceeds the cap", async () => {
+			process.env.CODE_SANDBOX_MAX_INPUT_FILE_BYTES = "10";
+			try {
+				const manager = makeManager();
+				// Declared size passes the cheap check; the streamed bytes do not
+				const result = await manager.uploadOnce({ ...csvFile, size: 8 });
+
+				expect(result.contentItem.text).toContain("could not be staged");
+				expect(result.contentItem.text).toContain("too large");
+				expect(manager.sandboxFiles.size).toBe(0);
+				// Nothing partial is left in the cache
+				const cacheDir = path.join(stagingDir, "cache");
+				const leftovers = await fsp.readdir(cacheDir).catch(() => []);
+				expect(leftovers).toEqual([]);
+			} finally {
+				delete process.env.CODE_SANDBOX_MAX_INPUT_FILE_BYTES;
+			}
 		});
 
 		it("resolves staged-name collisions between distinct attachments", async () => {
@@ -271,7 +320,12 @@ describe("sandbox attachment staging (Ollama mode with run_python)", () => {
 
 describe("createNativeImageFileUploadManager (vLLM native vision)", () => {
 	const savedFetch = global.fetch;
-	const MEDIA_ENV_KEYS = ["M8B_MEDIA_DIR", "M8B_MEDIA_BASE_URL", "M8B_MEDIA_MAX_FILE_BYTES"];
+	const MEDIA_ENV_KEYS = [
+		"M8B_MEDIA_DIR",
+		"M8B_MEDIA_BASE_URL",
+		"M8B_MEDIA_MAX_FILE_BYTES",
+		"CODE_SANDBOX_STAGING_DIR",
+	];
 	const savedEnv = {};
 	let mediaDir;
 
@@ -290,6 +344,7 @@ describe("createNativeImageFileUploadManager (vLLM native vision)", () => {
 		mediaDir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-media-mgr-test-"));
 		process.env.M8B_MEDIA_DIR = mediaDir;
 		process.env.M8B_MEDIA_BASE_URL = "https://bm-linux-slack.internal.example.net/m8b-media";
+		process.env.CODE_SANDBOX_STAGING_DIR = path.join(mediaDir, "staging");
 
 		global.fetch = jest.fn(async () => ({
 			ok: true,

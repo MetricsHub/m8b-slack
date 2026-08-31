@@ -277,7 +277,9 @@ export async function respond({
 		} else if (fileManager.stageAttachment) {
 			// Re-stage every data attachment in the thread on every turn: the
 			// sandbox staging map only lives for this message, but the notes
-			// persisted in the conversation promise /data/<name> stays readable
+			// persisted in the conversation promise /data/<name> stays readable.
+			// Cheap on repeat turns — the bytes are served from the persistent
+			// disk staging cache, not re-downloaded from Slack
 			for (const msg of messages) {
 				const files = Array.isArray(msg.files) ? msg.files : [];
 				for (const file of files) {

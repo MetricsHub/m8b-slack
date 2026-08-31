@@ -230,6 +230,7 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 | `ai/services/knowledge-base.js`     | Local RAG knowledge base (local modes)                       |
 | `ai/services/media-store.js`        | Local image store served to the vLLM host by URL             |
 | `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (local modes, Pyodide)   |
+| `ai/services/sandbox-staging.js`    | Disk cache for attachments staged into the sandbox's /data   |
 | `ai/services/web-search.js`         | App-side web search backends                                 |
 | `ai/services/metricshub-api.js`     | MetricsHub Agent REST API client (config files, encryption)  |
 | `ai/services/config-editor.js`      | Config-editing tool handlers (auth, validate, approve, save) |

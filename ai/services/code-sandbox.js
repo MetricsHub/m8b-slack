@@ -10,8 +10,16 @@
  *
  * Executions are serialized: the single interpreter cannot run two scripts at
  * once, and serialization keeps the memory footprint bounded.
+ *
+ * Input files are never sent over postMessage: each execution gets a
+ * per-execution directory under the staging area (string/Buffer entries are
+ * written there, disk-staged attachments are copied there) that the worker
+ * mounts as /data via NODEFS. Copying — rather than hardlinking — isolates the
+ * shared download cache from writes the sandboxed code may make under /data.
  */
 
+import fsp from "node:fs/promises";
+import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { getCodeSandboxConfig } from "../config/providers.js";
 
@@ -21,6 +29,9 @@ let nextExecutionId = 1;
 
 /** Serialization chain: each execution waits for the previous one. */
 let executionQueue = Promise.resolve();
+
+/** One-time cleanup of exec dirs a previous process left behind (e.g. crash). */
+let sweptStaleExecDirs = false;
 
 /**
  * Keep only a safe basename for files crossing the sandbox boundary
@@ -88,17 +99,64 @@ function discardWorker(local) {
 	local.worker.terminate().catch(() => {});
 }
 
+/**
+ * Materialize an execution's input files into a fresh host directory the
+ * worker will mount as /data. String/Buffer entries (large tool outputs) are
+ * written directly; disk-staged attachments ({path} references) are copied so
+ * sandbox writes can never reach the shared download cache.
+ *
+ * @param {Array<{name: string, data: (Uint8Array|Buffer|string|{path: string})}>} inputFiles
+ * @param {Object} config - Code sandbox configuration
+ * @param {number} id - Execution id (unique per process)
+ * @returns {Promise<string>} Absolute path of the /data directory
+ */
+async function prepareDataDir(inputFiles, config, id) {
+	const stagingDir = path.resolve(config.stagingDir);
+
+	if (!sweptStaleExecDirs) {
+		sweptStaleExecDirs = true;
+		// exec-* dirs live for one execution; an old one is debris from a
+		// process that crashed or was killed mid-run. The age check keeps the
+		// sweep from deleting a concurrent process's live dir (e.g. parallel
+		// Jest workers sharing the default staging dir).
+		const staleBeforeMs = Date.now() - 24 * 3600 * 1000;
+		try {
+			for (const name of await fsp.readdir(stagingDir)) {
+				if (!name.startsWith("exec-") || name.startsWith(`exec-${process.pid}-`)) continue;
+				const dirPath = path.join(stagingDir, name);
+				const stat = await fsp.stat(dirPath).catch(() => null);
+				if (stat && stat.mtimeMs < staleBeforeMs) {
+					await fsp.rm(dirPath, { recursive: true, force: true });
+				}
+			}
+		} catch {
+			// Staging dir does not exist yet
+		}
+	}
+
+	const dataDir = path.join(stagingDir, `exec-${process.pid}-${id}`);
+	await fsp.mkdir(dataDir, { recursive: true });
+
+	for (const file of inputFiles || []) {
+		const dest = path.join(dataDir, sanitizeSandboxFileName(file.name));
+		const data = file.data;
+		if (typeof data === "string" || data instanceof Uint8Array) {
+			await fsp.writeFile(dest, data);
+		} else if (data && typeof data.path === "string") {
+			await fsp.copyFile(data.path, dest);
+		} else {
+			await fsp.writeFile(dest, "");
+		}
+	}
+
+	return dataDir;
+}
+
 async function executeInWorker({ code, inputFiles, timeoutMs, config, logger }) {
 	const local = getOrCreateWorker(config, logger);
 	const id = nextExecutionId++;
 
-	const files = (inputFiles || []).map((file) => ({
-		name: sanitizeSandboxFileName(file.name),
-		data:
-			file.data instanceof Uint8Array
-				? file.data
-				: new Uint8Array(Buffer.from(file.data ?? "", "utf8")),
-	}));
+	const dataDir = await prepareDataDir(inputFiles, config, id);
 
 	const response = await new Promise((resolve) => {
 		const timer = setTimeout(() => {
@@ -117,8 +175,11 @@ async function executeInWorker({ code, inputFiles, timeoutMs, config, logger }) 
 		}, timeoutMs);
 
 		local.pending.set(id, { resolve, timer });
-		local.worker.postMessage({ type: "execute", id, code, files });
+		local.worker.postMessage({ type: "execute", id, code, dataDir });
 	});
+
+	// A timed-out worker is already terminated, so the mount is gone either way
+	await fsp.rm(dataDir, { recursive: true, force: true }).catch(() => {});
 
 	return {
 		ok: response.ok === true,
@@ -139,8 +200,9 @@ async function executeInWorker({ code, inputFiles, timeoutMs, config, logger }) 
  *
  * @param {Object} params
  * @param {string} params.code - Python source code
- * @param {Array<{name: string, data: (Uint8Array|Buffer|string)}>} [params.inputFiles]
- *   Files staged into /data before the run
+ * @param {Array<{name: string, data: (Uint8Array|Buffer|string|{path: string})}>} [params.inputFiles]
+ *   Files staged into /data before the run; {path} entries reference
+ *   disk-staged attachments and are copied, not loaded into memory
  * @param {number} [params.timeoutMs] - Override the configured execution timeout
  * @param {Object} [params.logger] - Logger instance
  * @returns {Promise<{ok: boolean, error?: string, stdout: string, stderr: string,

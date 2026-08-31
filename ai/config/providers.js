@@ -64,7 +64,8 @@ export function defaultToolOutputChars(contextWindow, maxOutputTokens) {
  * to turn the tool off entirely.
  *
  * @returns {{enabled: boolean, timeoutMs: number, packageCacheDir: string,
- *   maxOutputFileBytes: number, maxInputFileBytes: number}}
+ *   maxOutputFileBytes: number, maxInputFileBytes: number, stagingDir: string,
+ *   stagingCacheMaxBytes: number}}
  */
 export function getCodeSandboxConfig() {
 	return {
@@ -80,10 +81,22 @@ export function getCodeSandboxConfig() {
 			process.env.CODE_SANDBOX_MAX_OUTPUT_FILE_BYTES,
 			20 * 1024 * 1024
 		),
-		// Size cap for a single user attachment staged into /data for run_python
+		// Size cap for a single user attachment staged into /data for run_python.
+		// Attachments are streamed to disk (never buffered whole in memory) and
+		// the sandbox reads them through a NODEFS mount, so this can be large;
+		// Pyodide's ~2 GB WASM heap is the practical limit on what Python can
+		// then load at once.
 		maxInputFileBytes: parsePositiveInt(
 			process.env.CODE_SANDBOX_MAX_INPUT_FILE_BYTES,
-			5 * 1024 * 1024
+			100 * 1024 * 1024
+		),
+		// On-disk staging area: downloaded attachments (cache/, reused across
+		// turns and restarts) and per-execution /data directories (exec-*)
+		stagingDir: process.env.CODE_SANDBOX_STAGING_DIR || "node_modules/.cache/m8b-staging",
+		// Total size the download cache may grow to before oldest files are evicted
+		stagingCacheMaxBytes: parsePositiveInt(
+			process.env.CODE_SANDBOX_STAGING_CACHE_MAX_BYTES,
+			2 * 1024 * 1024 * 1024
 		),
 	};
 }

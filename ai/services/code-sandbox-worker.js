@@ -2,9 +2,12 @@
  * Pyodide sandbox worker (worker_threads side of ai/services/code-sandbox.js).
  *
  * Runs LLM-generated Python inside a Pyodide (CPython-on-WebAssembly)
- * interpreter. The WASM boundary means the code has no host filesystem and no
- * network; it only sees an in-memory virtual filesystem with /data (inputs
- * staged by the app) and /outputs (files to deliver to the user).
+ * interpreter. The WASM boundary means the code has no network and no host
+ * filesystem except one deliberate window: /data is a NODEFS mount of the
+ * per-execution staging directory the parent prepared (so large attachments
+ * are read from disk instead of being copied into the WASM heap). The mount
+ * is writable, but it only contains per-execution copies that are deleted
+ * after the run. /outputs (files to deliver to the user) stays in MEMFS.
  *
  * Host-access lockdown: in Node, Pyodide's `js` / `pyodide_js` modules expose
  * the worker's JavaScript scope, and ANY reachable JsProxy yields the Function
@@ -18,8 +21,9 @@
  *
  * The parent serializes executions (one at a time) and terminates the worker
  * on timeout, so this file can keep a single warm interpreter. Each execution
- * gets fresh Python globals and a wiped /data + /outputs, but interpreter-level
- * state (loaded packages, module caches) is intentionally reused for speed.
+ * gets fresh Python globals, a wiped /outputs, and its own /data mount, but
+ * interpreter-level state (loaded packages, module caches) is intentionally
+ * reused for speed.
  */
 
 import { parentPort, workerData } from "node:worker_threads";
@@ -128,71 +132,88 @@ function truncateStream(text) {
 	return `${text.slice(0, MAX_STREAM_CHARS)}\n[... truncated at ${MAX_STREAM_CHARS} chars]`;
 }
 
-async function execute({ code, files }) {
+async function execute({ code, dataDir }) {
 	const pyodide = await getPyodide();
 
-	clearDir(pyodide, "/data");
 	clearDir(pyodide, "/outputs");
-	for (const file of files || []) {
-		pyodide.FS.writeFile(`/data/${file.name}`, file.data);
-	}
 
-	// Fetch the Pyodide-built packages the code imports (numpy, pandas,
-	// matplotlib, ...). Unknown imports are skipped and surface as a normal
-	// Python ModuleNotFoundError below. Packages must load BEFORE stdout
-	// capture is armed so loader progress never reaches the model.
-	await pyodide.loadPackagesFromImports(code, SILENT_LOAD);
-	for (const extra of EXTRA_WHEELS) {
-		if (extra.trigger.test(code)) {
-			await pyodide.loadPackage(extra.wheels, SILENT_LOAD);
-		}
-	}
-
-	let stdout = "";
-	let stderr = "";
-	pyodide.setStdout({
-		batched: (line) => {
-			stdout += `${line}\n`;
-		},
-	});
-	pyodide.setStderr({
-		batched: (line) => {
-			stderr += `${line}\n`;
-		},
-	});
-
-	const namespace = pyodide.globals.get("dict")();
-	let ok = true;
-	let error = "";
-	let resultText = "";
+	// Mount the per-execution staging directory as /data: Python reads the
+	// files straight from host disk, so a 100 MB attachment never crosses
+	// postMessage and only enters the WASM heap if the code actually reads it
+	let dataMounted = false;
 	try {
-		const result = await pyodide.runPythonAsync(code, { globals: namespace });
-		if (result !== undefined && result !== null) {
-			resultText = String(result);
-			if (typeof result?.destroy === "function") result.destroy();
+		if (dataDir) {
+			pyodide.mountNodeFS("/data", dataDir);
+			dataMounted = true;
 		}
-	} catch (e) {
-		// PythonError.message carries the traceback
-		ok = false;
-		error = String(e?.message || e);
+
+		// Fetch the Pyodide-built packages the code imports (numpy, pandas,
+		// matplotlib, ...). Unknown imports are skipped and surface as a normal
+		// Python ModuleNotFoundError below. Packages must load BEFORE stdout
+		// capture is armed so loader progress never reaches the model.
+		await pyodide.loadPackagesFromImports(code, SILENT_LOAD);
+		for (const extra of EXTRA_WHEELS) {
+			if (extra.trigger.test(code)) {
+				await pyodide.loadPackage(extra.wheels, SILENT_LOAD);
+			}
+		}
+
+		let stdout = "";
+		let stderr = "";
+		pyodide.setStdout({
+			batched: (line) => {
+				stdout += `${line}\n`;
+			},
+		});
+		pyodide.setStderr({
+			batched: (line) => {
+				stderr += `${line}\n`;
+			},
+		});
+
+		const namespace = pyodide.globals.get("dict")();
+		let ok = true;
+		let error = "";
+		let resultText = "";
+		try {
+			const result = await pyodide.runPythonAsync(code, { globals: namespace });
+			if (result !== undefined && result !== null) {
+				resultText = String(result);
+				if (typeof result?.destroy === "function") result.destroy();
+			}
+		} catch (e) {
+			// PythonError.message carries the traceback
+			ok = false;
+			error = String(e?.message || e);
+		} finally {
+			namespace.destroy();
+		}
+
+		const collected = { files: [], skipped: [] };
+		collectFiles(pyodide, "/outputs", "", collected, {
+			remaining: workerData?.maxOutputFileBytes || 20 * 1024 * 1024,
+		});
+
+		return {
+			ok,
+			error: error || undefined,
+			stdout: truncateStream(stdout),
+			stderr: truncateStream(stderr),
+			result: truncateStream(resultText),
+			outputFiles: collected.files,
+			skippedFiles: collected.skipped,
+		};
 	} finally {
-		namespace.destroy();
+		// Unmount even on interpreter-level failures, or the next execution's
+		// mount would land on a busy mountpoint
+		if (dataMounted) {
+			try {
+				pyodide.FS.unmount("/data");
+			} catch {
+				// Already unmounted
+			}
+		}
 	}
-
-	const collected = { files: [], skipped: [] };
-	collectFiles(pyodide, "/outputs", "", collected, {
-		remaining: workerData?.maxOutputFileBytes || 20 * 1024 * 1024,
-	});
-
-	return {
-		ok,
-		error: error || undefined,
-		stdout: truncateStream(stdout),
-		stderr: truncateStream(stderr),
-		result: truncateStream(resultText),
-		outputFiles: collected.files,
-		skippedFiles: collected.skipped,
-	};
 }
 
 parentPort.on("message", async (message) => {

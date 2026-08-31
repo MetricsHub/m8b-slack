@@ -6,6 +6,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { getCodeSandboxConfig } from "../config/providers.js";
 import { sanitizeSandboxFileName } from "./code-sandbox.js";
 import {
@@ -15,6 +17,7 @@ import {
 	supportedImageExtension,
 } from "./media-store.js";
 import { openai } from "./openai.js";
+import { evictStagingCache, findStagedFile, stagedFilePathFor } from "./sandbox-staging.js";
 
 /**
  * Build a Responses API content item for a Slack image or PDF.
@@ -45,16 +48,15 @@ export function buildOpenAIFileContentItem({ fileId, fileName, mimetype }) {
 }
 
 /**
- * Download a Slack file's bytes using the bot token.
+ * Fetch a Slack file's private URL with the bot token, following the one
+ * cross-domain redirect Slack uses while preserving Authorization.
  *
  * @param {Object} file - Slack file object
- * @returns {Promise<{buffer: Buffer, fileName: string, mimetype: string}|null>}
+ * @returns {Promise<Response|null>} Verified OK response, or null without a URL
  */
-export async function downloadSlackFile(file) {
+async function fetchSlackFileResponse(file) {
 	const url = file.url_private_download || file.url_private;
 	if (!url) return null;
-
-	const fileName = file.name || `slack-file-${file.id || Date.now()}`;
 
 	const headers = {
 		Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
@@ -81,8 +83,83 @@ export async function downloadSlackFile(file) {
 		);
 	}
 
+	return res;
+}
+
+/**
+ * Download a Slack file's bytes into memory using the bot token. Only for
+ * small payloads (images for vision/media handling); data attachments for the
+ * sandbox go through downloadSlackFileToPath instead.
+ *
+ * @param {Object} file - Slack file object
+ * @returns {Promise<{buffer: Buffer, fileName: string, mimetype: string}|null>}
+ */
+export async function downloadSlackFile(file) {
+	const res = await fetchSlackFileResponse(file);
+	if (!res) return null;
+
+	const fileName = file.name || `slack-file-${file.id || Date.now()}`;
 	const ab = await res.arrayBuffer();
 	return { buffer: Buffer.from(ab), fileName, mimetype: file.mimetype || "" };
+}
+
+/**
+ * Stream a Slack file to disk using the bot token, enforcing a byte cap while
+ * downloading (Slack's declared size is advisory). The file is written to a
+ * temp path and renamed into place so concurrent stagers never observe a
+ * partial file; losing the rename race to another download is fine.
+ *
+ * @param {Object} file - Slack file object
+ * @param {string} destPath - Final path for the downloaded bytes
+ * @param {number} maxBytes - Abort the download past this many bytes
+ * @returns {Promise<{path: string, bytes: number}|null>} null without a URL
+ */
+export async function downloadSlackFileToPath(file, destPath, maxBytes) {
+	const res = await fetchSlackFileResponse(file);
+	if (!res) return null;
+
+	await fsp.mkdir(path.dirname(destPath), { recursive: true });
+	const tmpPath = `${destPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+
+	let bytes = 0;
+	try {
+		if (res.body) {
+			const capCounter = new Transform({
+				transform(chunk, _encoding, callback) {
+					bytes += chunk.length;
+					if (bytes > maxBytes) {
+						callback(new Error(`file is too large (over ${maxBytes} bytes cap)`));
+					} else {
+						callback(null, chunk);
+					}
+				},
+			});
+			await pipeline(Readable.fromWeb(res.body), capCounter, fs.createWriteStream(tmpPath));
+		} else {
+			// No streamable body (some fetch polyfills/mocks): buffer as fallback
+			const buffer = Buffer.from(await res.arrayBuffer());
+			bytes = buffer.length;
+			if (bytes > maxBytes) {
+				throw new Error(`file is too large (${bytes} bytes, cap ${maxBytes})`);
+			}
+			await fsp.writeFile(tmpPath, buffer);
+		}
+	} catch (err) {
+		await fsp.rm(tmpPath, { force: true }).catch(() => {});
+		throw err;
+	}
+
+	try {
+		await fsp.rename(tmpPath, destPath);
+	} catch (err) {
+		// A concurrent download of the same file version already renamed its copy
+		const existing = await fsp.stat(destPath).catch(() => null);
+		await fsp.rm(tmpPath, { force: true }).catch(() => {});
+		if (!existing) throw err;
+		bytes = existing.size;
+	}
+
+	return { path: destPath, bytes };
 }
 
 /**
@@ -224,14 +301,20 @@ export function createFileUploadManager(previousUploads, logger) {
 }
 
 /**
- * Create a helper that downloads non-image Slack attachments and stages their
- * bytes into the local Python sandbox staging map, making them readable with
- * run_python at /data/<name>. Results are cached per Slack file, so staging
- * the same attachment from the thread loop and again from the current-message
- * path downloads it only once per turn.
+ * Create a helper that stages non-image Slack attachments for the local
+ * Python sandbox, making them readable with run_python at /data/<name>.
+ *
+ * The bytes are streamed into the persistent staging cache on disk (keyed by
+ * the immutable Slack file version) and the per-turn sandboxFiles map only
+ * carries {path, bytes} references — a 100 MB attachment is downloaded once
+ * per file version, not once per turn, and never held whole in memory.
+ * Results are also cached per Slack file within the turn, so staging the same
+ * attachment from the thread loop and again from the current-message path
+ * does the disk lookup only once.
  *
  * @param {Object} params
- * @param {Map<string, (Buffer|string)>} params.sandboxFiles - Per-turn staging map
+ * @param {Map<string, ({path: string, bytes: number}|Buffer|string)>} params.sandboxFiles
+ *   Per-turn staging map
  * @param {number} params.maxBytes - Per-attachment size cap
  * @param {Object} [params.logger] - Logger instance
  * @returns {Function} async (file) => {ok, name?, bytes?, reason?}
@@ -251,14 +334,18 @@ function createAttachmentStager({ sandboxFiles, maxBytes, logger }) {
 			result = { ok: false, reason: `file is too large (${declaredSize} bytes, cap ${maxBytes})` };
 		} else {
 			try {
-				const downloaded = await downloadSlackFile(file);
-				if (!downloaded) throw new Error("file has no downloadable URL");
-				if (downloaded.buffer.length > maxBytes) {
-					throw new Error(`file is too large (${downloaded.buffer.length} bytes, cap ${maxBytes})`);
+				const baseName = sanitizeSandboxFileName(file.name || `slack-file-${file.id || "unknown"}`);
+				const cachePath = stagedFilePathFor(key, baseName);
+
+				let cached = await findStagedFile(cachePath);
+				if (!cached) {
+					cached = await downloadSlackFileToPath(file, cachePath, maxBytes);
+					if (!cached) throw new Error("file has no downloadable URL");
+					await evictStagingCache(logger);
 				}
 
 				// Resolve staged-name collisions between distinct attachments
-				let name = sanitizeSandboxFileName(downloaded.fileName);
+				let name = baseName;
 				if (sandboxFiles.has(name)) {
 					const dot = name.lastIndexOf(".");
 					const [base, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
@@ -267,11 +354,12 @@ function createAttachmentStager({ sandboxFiles, maxBytes, logger }) {
 					name = `${base}-${suffix}${ext}`;
 				}
 
-				sandboxFiles.set(name, downloaded.buffer);
-				result = { ok: true, name, bytes: downloaded.buffer.length };
+				sandboxFiles.set(name, { path: cached.path, bytes: cached.bytes });
+				result = { ok: true, name, bytes: cached.bytes };
 				logger?.info?.("Staged Slack attachment for the Python sandbox", {
 					name,
-					bytes: downloaded.buffer.length,
+					bytes: cached.bytes,
+					path: cached.path,
 				});
 			} catch (err) {
 				logger?.warn?.("Failed to stage Slack attachment for the Python sandbox", {

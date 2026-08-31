@@ -6,6 +6,9 @@
  * paths (numpy, pandas) are exercised by the live scenarios, not here.
  */
 
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterAll, describe, expect, it, jest } from "@jest/globals";
 import { executePython, sanitizeSandboxFileName, shutdownCodeSandbox } from "../code-sandbox.js";
 
@@ -60,6 +63,58 @@ describe("executePython", () => {
 
 		expect(result.ok).toBe(true);
 		expect(result.stdout).toContain("srv-42");
+	});
+
+	it("exposes disk-staged {path} input files under /data without copying into memory", async () => {
+		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-sandbox-test-"));
+		const staged = path.join(dir, "big.log");
+		try {
+			await fsp.writeFile(staged, "ERROR srv-07 disk full\nINFO all good\n");
+
+			const result = await executePython({
+				code: [
+					"import re",
+					"text = open('/data/big.log').read()",
+					"print(re.findall(r'ERROR (\\S+)', text)[0])",
+				].join("\n"),
+				inputFiles: [{ name: "big.log", data: { path: staged } }],
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.stdout).toContain("srv-07");
+		} finally {
+			await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("never lets sandbox writes under /data reach the staged source file", async () => {
+		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "m8b-sandbox-test-"));
+		const staged = path.join(dir, "cached.txt");
+		try {
+			await fsp.writeFile(staged, "original");
+
+			const result = await executePython({
+				code: "open('/data/cached.txt', 'w').write('tampered')",
+				inputFiles: [{ name: "cached.txt", data: { path: staged } }],
+			});
+
+			expect(result.ok).toBe(true);
+			// The execution wrote to its private copy; the cache entry is intact
+			expect(await fsp.readFile(staged, "utf8")).toBe("original");
+		} finally {
+			await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("gives each execution its own /data (files do not leak between runs)", async () => {
+		await executePython({
+			code: "pass",
+			inputFiles: [{ name: "first.txt", data: "one" }],
+		});
+		const result = await executePython({ code: "import os\nprint(os.listdir('/data'))" });
+
+		expect(result.ok).toBe(true);
+		expect(result.stdout).not.toContain("first.txt");
 	});
 
 	it("does not leak variables between executions", async () => {
