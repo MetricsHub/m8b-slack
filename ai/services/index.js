@@ -18,6 +18,7 @@ export * from "./sandbox-staging.js";
 export * from "./slack-files.js";
 export * from "./slack-interactions.js";
 export * from "./streaming.js";
+export * from "./thread-inbox.js";
 export * from "./tool-middleware.js";
 export * from "./web-search.js";
 export * from "./yaml-resources.js";

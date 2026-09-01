@@ -227,6 +227,7 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 | `ai/providers/index.js`             | AI provider abstraction                                      |
 | `ai/config/providers.js`            | Provider env configuration                                   |
 | `ai/services/conversation-store.js` | App-side thread state (local modes)                          |
+| `ai/services/thread-inbox.js`       | Queue/inject messages that arrive while a run is in flight   |
 | `ai/services/knowledge-base.js`     | Local RAG knowledge base (local modes)                       |
 | `ai/services/media-store.js`        | Local image store served to the vLLM host by URL             |
 | `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (local modes, Pyodide)   |

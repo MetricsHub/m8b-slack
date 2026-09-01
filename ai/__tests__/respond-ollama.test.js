@@ -43,6 +43,7 @@ const { MAX_AGENT_ITERATIONS } = await import("../config/providers.js");
 const conversationStore = await import("../services/conversation-store.js");
 const { clearConversationStore, conversationKey, getConversation } = conversationStore;
 const { getTokenCalibration, resetTokenCalibration } = await import("../utils/tokens.js");
+const { clearThreadInbox } = await import("../services/thread-inbox.js");
 
 function textResult(text, responseId = "resp_1") {
 	return {
@@ -131,6 +132,7 @@ function allText(input) {
 beforeEach(() => {
 	streamOnceMock.mockReset();
 	clearConversationStore();
+	clearThreadInbox();
 	resetTokenCalibration();
 	process.env.KNOWLEDGE_BASE_DIR = "data/does-not-exist-for-tests";
 });
@@ -712,6 +714,167 @@ describe("respond in Ollama mode", () => {
 		const inputText = allText(params.input);
 		expect(inputText).toContain("My name is Bertrand.");
 		expect(inputText).toContain("Noted.");
+	});
+
+	it("injects a message that arrives while a tool turn is running", async () => {
+		const harness = makeHarness({ text: "Check the CPU.", ts: "100.2" });
+		const late = makeHarness({ text: "Also check the disk!", ts: "100.4" });
+
+		streamOnceMock
+			.mockImplementationOnce(async () => {
+				// A second message from the same user lands mid-turn: it must be
+				// queued (no concurrent run) and injected before the next model call
+				await runRespond(late);
+				return functionCallResult([
+					{
+						type: "function_call",
+						call_id: "call_1",
+						name: "search_knowledge_base",
+						arguments: '{"query":"cpu"}',
+					},
+				]);
+			})
+			.mockResolvedValueOnce(textResult("CPU fine. Disk fine too."));
+
+		await runRespond(harness);
+
+		// The late message did NOT start its own run
+		expect(streamOnceMock).toHaveBeenCalledTimes(2);
+
+		// It was acknowledged with a reaction while queued
+		expect(late.client.reactions.add).toHaveBeenCalledWith({
+			channel: "C1",
+			timestamp: "100.4",
+			name: "eyes",
+		});
+
+		// The second model call sees the tool output AND the injected message,
+		// preceded by the injection note
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		const secondText = allText(secondParams.input);
+		expect(secondText).toContain("Also check the disk!");
+		expect(secondText).toContain("additional message(s)");
+		expect(secondParams.input.some((i) => i?.type === "function_call_output")).toBe(true);
+
+		// Both user messages and the single final answer are persisted, in order
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		const storedText = allText(getConversation(key));
+		expect(storedText).toContain("Check the CPU.");
+		expect(storedText).toContain("Also check the disk!");
+		expect(storedText).toContain("CPU fine. Disk fine too.");
+		expect(storedText.indexOf("Check the CPU.")).toBeLessThan(
+			storedText.indexOf("Also check the disk!")
+		);
+
+		// Same user, same context: the user-context note still appears only once
+		const stored = getConversation(key);
+		const notes = stored.filter(
+			(i) => i?.role === "system" && i?.content?.[0]?.text?.includes("User's Slack ID:")
+		);
+		expect(notes).toHaveLength(1);
+	});
+
+	it("keeps the run alive for a message that arrives during the final answer", async () => {
+		const harness = makeHarness({ text: "Is the server up?", ts: "100.2" });
+		const late = makeHarness({ text: "And the database?", ts: "100.5" });
+
+		streamOnceMock
+			.mockImplementationOnce(async () => {
+				// The follow-up lands while the final answer is streaming: no tool
+				// calls remain, but the loop must pick the message up anyway
+				await runRespond(late);
+				return textResult("Server is up.");
+			})
+			.mockResolvedValueOnce(textResult("Database too."));
+
+		await runRespond(harness);
+
+		expect(streamOnceMock).toHaveBeenCalledTimes(2);
+
+		// The second call carries the already-delivered answer and the follow-up
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		const secondText = allText(secondParams.input);
+		expect(secondText).toContain("Server is up.");
+		expect(secondText).toContain("And the database?");
+
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		const storedText = allText(getConversation(key));
+		expect(storedText).toContain("And the database?");
+		expect(storedText).toContain("Database too.");
+	});
+
+	it("re-dispatches a mid-run message from a different user as its own run", async () => {
+		const harness = makeHarness({ text: "Hi from U1.", ts: "100.2" });
+		const other = makeHarness({ text: "Hi from U2.", ts: "100.4" });
+		other.context = { ...other.context, userId: "U2" };
+		other.message.user = "U2";
+
+		streamOnceMock
+			.mockImplementationOnce(async () => {
+				// Another user chimes in mid-run: per-user gating differs, so their
+				// message must NOT be injected into U1's run
+				await runRespond(other);
+				return textResult("Answer for U1.");
+			})
+			.mockResolvedValueOnce(textResult("Answer for U2."));
+
+		await runRespond(harness);
+
+		expect(streamOnceMock).toHaveBeenCalledTimes(2);
+
+		// U1's turn never saw U2's message
+		const [firstParams] = streamOnceMock.mock.calls[0];
+		expect(allText(firstParams.input)).not.toContain("Hi from U2.");
+
+		// U2's message ran afterwards as its own run, with its own context note
+		const [secondParams] = streamOnceMock.mock.calls[1];
+		const secondText = allText(secondParams.input);
+		expect(secondText).toContain("Hi from U2.");
+		expect(secondText).toContain("<@U2>");
+		expect(secondText).not.toContain("additional message(s)");
+
+		// Both exchanges are persisted in the shared thread conversation
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		const storedText = allText(getConversation(key));
+		expect(storedText).toContain("Answer for U1.");
+		expect(storedText).toContain("Answer for U2.");
+	});
+
+	it("resets the iteration budget when a message is injected mid-run", async () => {
+		// The first message burns most of the tool budget; the injected message
+		// must get a fresh budget instead of hitting the forced wrap-up early
+		const harness = makeHarness({ text: "Deep dive please.", ts: "100.2" });
+		const late = makeHarness({ text: "One more thing!", ts: "100.6" });
+
+		let calls = 0;
+		streamOnceMock.mockImplementation(async () => {
+			calls += 1;
+			if (calls === MAX_AGENT_ITERATIONS - 1) {
+				// Just before the cap, the user sends a follow-up
+				await runRespond(late);
+			}
+			if (calls <= MAX_AGENT_ITERATIONS) {
+				return functionCallResult([
+					{
+						type: "function_call",
+						call_id: `call_${calls}`,
+						name: "search_knowledge_base",
+						arguments: '{"query":"ecs"}',
+					},
+				]);
+			}
+			return textResult("Everything, including the one more thing.");
+		});
+
+		await runRespond(harness);
+
+		// The run went past the original cap (fresh budget) and finished normally
+		expect(streamOnceMock.mock.calls.length).toBe(MAX_AGENT_ITERATIONS + 1);
+		expect(harness.say).not.toHaveBeenCalledWith(
+			expect.objectContaining({ text: expect.stringContaining("circles") })
+		);
+		const key = conversationKey({ teamId: "T1", channel: "C1", threadTs: "100.1" });
+		expect(allText(getConversation(key))).toContain("One more thing!");
 	});
 
 	it("keeps a deliberately long conversation under the context budget", async () => {

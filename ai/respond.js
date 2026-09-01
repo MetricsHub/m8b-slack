@@ -57,6 +57,14 @@ import {
 	uploadOutputFilesToSlack,
 } from "./services/slack-files.js";
 import { streamOnce } from "./services/streaming.js";
+import {
+	beginRun,
+	endRun,
+	enqueueIfActive,
+	hasPending,
+	takePending,
+	threadRunKey,
+} from "./services/thread-inbox.js";
 import { buildToolsArray, logToolWarnings } from "./tools/index.js";
 import {
 	estimateTokenCount,
@@ -124,11 +132,90 @@ function isSlackApiError(error) {
 }
 
 /**
+ * One-shot system note preceding user messages injected into a running turn.
+ * Persisted with the conversation in stateless mode, so it is worded to stay
+ * accurate when replayed as history on later turns.
+ */
+function buildInjectedMessagesNudge() {
+	return {
+		role: "system",
+		content: [
+			{
+				type: "input_text",
+				text: "The user sent the additional message(s) below while you were still handling their earlier request. Anything you already posted was delivered — do not repeat it. Fold the new message(s) into your work: adjust course if they change the task, and make sure your final answer addresses them.",
+			},
+		],
+	};
+}
+
+/**
  * Main response handler for Slack messages.
+ *
+ * One run owns a Slack thread at a time. A message that lands while a run is
+ * already in flight is queued in the thread inbox: the active run injects it
+ * between model turns when it comes from the same requester, and anything
+ * still queued when the run ends (posted during the final stream, left by an
+ * error, or sent by a different user) is re-dispatched here as its own run.
  *
  * @param {Object} params - Handler parameters from Slack Bolt
  */
-export async function respond({
+export async function respond(params) {
+	const { client, logger, message } = params;
+
+	// Skip incomplete messages. A message may carry no text at all when the
+	// user posts a bare attachment (screenshot without a caption): the files
+	// are the content, so they count as a processable message.
+	const messageHasFiles = Array.isArray(message.files) && message.files.length > 0;
+	if (!("thread_ts" in message) || !message.thread_ts || (!message.text && !messageHasFiles)) {
+		return;
+	}
+
+	// The enqueue check and the registration are one synchronous block, so two
+	// Bolt events for the same thread can never both start a run
+	const inboxKey = threadRunKey({ channel: message.channel, threadTs: message.thread_ts });
+	if (enqueueIfActive(inboxKey, { message, slackAppContext: params.slackAppContext })) {
+		logger.info(
+			`Run already in flight for thread ${message.thread_ts}; queued message ${message.ts}`
+		);
+		// Best-effort acknowledgment so the user knows the message was seen
+		try {
+			await client.reactions.add({ channel: message.channel, timestamp: message.ts, name: "eyes" });
+		} catch {
+			/* cosmetic */
+		}
+		return;
+	}
+	beginRun(inboxKey);
+
+	try {
+		await respondCore(params);
+	} finally {
+		for (const entry of endRun(inboxKey)) {
+			try {
+				await respond({
+					...params,
+					message: entry.message,
+					slackAppContext: entry.slackAppContext,
+					context: { ...params.context, userId: entry.message?.user || params.context?.userId },
+				});
+			} catch (redispatchError) {
+				logger.error("Failed to process a message queued behind the previous run", {
+					message: redispatchError?.message,
+					ts: entry.message?.ts,
+				});
+			}
+		}
+	}
+}
+
+/**
+ * The actual response pipeline for one Slack message (plus any messages the
+ * thread inbox injects along the way). Only called by respond(), which owns
+ * the thread-inbox registration around it.
+ *
+ * @param {Object} params - Handler parameters from Slack Bolt
+ */
+async function respondCore({
 	client,
 	context,
 	logger,
@@ -140,15 +227,8 @@ export async function respond({
 	setStatus,
 	slackAppContext,
 }) {
-	// Skip incomplete messages. A message may carry no text at all when the
-	// user posts a bare attachment (screenshot without a caption): the files
-	// are the content, so they count as a processable message.
-	const messageHasFiles = Array.isArray(message.files) && message.files.length > 0;
-	if (!("thread_ts" in message) || !message.thread_ts || (!message.text && !messageHasFiles)) {
-		return;
-	}
-
 	const { channel, thread_ts } = message;
+	const inboxKey = threadRunKey({ channel, threadTs: thread_ts });
 
 	// Safely extract userId and teamId from either context, message, event, or body
 	// App_mention wrapper passes them in context, but standard Bolt passes them differently
@@ -372,6 +452,12 @@ export async function respond({
 		// resent history then matches the previous request token-for-token, so
 		// the server's prefix cache covers the whole previous turn instead of
 		// being invalidated right before the previous user message.
+		const configAdminNote =
+			getMcpServerCount() > 0
+				? configEditingAllowed
+					? "MetricsHub configuration changes: this user IS an authorized admin (config-editing tools are available)."
+					: "MetricsHub configuration changes: this user is NOT authorized; the config-editing tools are disabled for this conversation. If they ask for a configuration change, refuse and point them to an authorized admin."
+				: null;
 		const appendedCurrentItems = await appendCurrentMessage({
 			input,
 			message,
@@ -381,13 +467,13 @@ export async function respond({
 			slackAppContext,
 			filesUnsupported: fileManager.disabled === true,
 			priorHistory: stateless ? statelessHistory : null,
-			configAdminNote:
-				getMcpServerCount() > 0
-					? configEditingAllowed
-						? "MetricsHub configuration changes: this user IS an authorized admin (config-editing tools are available)."
-						: "MetricsHub configuration changes: this user is NOT authorized; the config-editing tools are disabled for this conversation. If they ask for a configuration change, refuse and point them to an authorized admin."
-					: null,
+			configAdminNote,
 		});
+
+		// Everything appended for this run's user messages (context notes + the
+		// messages themselves), including injected ones: the context-note dedup
+		// in appendCurrentMessage checks it so notes are never repeated
+		const appendedThisRun = [...appendedCurrentItems];
 
 		// Pre-flight context check
 		let contextSummarized = false;
@@ -430,10 +516,60 @@ export async function respond({
 		const turnItems = [];
 		let transientItems = [];
 
+		// Only the requesting user's late messages are injected into this run:
+		// per-user gating (config admin rights, context notes) differs for anyone
+		// else, so their messages wait for their own run after this one
+		const isFromRequester = (entry) => entry?.message?.user === userId;
+
 		// Main conversation loop (the agent loop)
 		do {
 			loopIteration += 1;
 			continueLoop = false;
+
+			// Fold in messages the requester sent while this run was working, so
+			// the next model call sees them alongside the pending tool results
+			const injectedEntries = takePending(inboxKey, isFromRequester);
+			if (injectedEntries.length > 0) {
+				logger.info?.(`[LOOP] Injecting ${injectedEntries.length} queued message(s) into run`, {
+					iteration: loopIteration,
+					ts: injectedEntries.map((entry) => entry.message?.ts),
+				});
+
+				// New user input restarts the work budget and lifts any forced
+				// text-only wrap-up: the model may need tools for the new ask
+				loopIteration = 1;
+				truncationRetries = 0;
+				forceToolChoiceNext = undefined;
+
+				const injectionTarget = stateless ? turnItems : input;
+				injectionTarget.push(buildInjectedMessagesNudge());
+				for (const entry of injectedEntries) {
+					const appended = await appendCurrentMessage({
+						input: injectionTarget,
+						message: entry.message,
+						userProfile,
+						userDisplayName: `<@${userId}>`,
+						uploadOnce: fileManager.uploadOnce,
+						slackAppContext: entry.slackAppContext,
+						filesUnsupported: fileManager.disabled === true,
+						priorHistory: stateless ? [...statelessHistory, ...appendedThisRun] : appendedThisRun,
+						configAdminNote,
+					});
+					appendedThisRun.push(...appended);
+				}
+
+				// Injected attachments may have added code_interpreter files
+				// (OpenAI): refresh the tools array before this model call
+				if (fileManager.codeFileIds.size > 0) {
+					tools = buildToolsArray({
+						vectorStoreIds,
+						codeFileIds: fileManager.codeFileIds,
+						provider,
+						knowledgeBaseAvailable,
+						configEditingAllowed,
+					});
+				}
+			}
 
 			if (loopIteration > MAX_AGENT_ITERATIONS) {
 				hitIterationLimit = true;
@@ -766,6 +902,14 @@ export async function respond({
 
 			if (!stateless) {
 				continueLoop = input.length > 0;
+			}
+
+			// A requester message that arrived during this turn (typically while
+			// the final answer was streaming) keeps the run alive: the next
+			// iteration injects it and the model addresses it in this thread run
+			if (!continueLoop && hasPending(inboxKey, isFromRequester)) {
+				logger.info?.("[LOOP] Queued message(s) from the requester; continuing the run");
+				continueLoop = true;
 			}
 		} while (continueLoop);
 
