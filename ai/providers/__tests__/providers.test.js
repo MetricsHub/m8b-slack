@@ -983,7 +983,28 @@ describe("openai-compatible provider (generic)", () => {
 			expect(health.ok).toBe(true);
 			expect(health.detail).toContain("unverified");
 			expect(health.warning).toContain(`HTTP ${status}`);
+			// The remaining checks still run: the unconfigured context is flagged
+			expect(health.detail).toContain("DEFAULT");
+			expect(health.warning).toContain("AI_CONTEXT_LENGTH");
 		}
+	});
+
+	it("still probes embeddings and trusts AI_CONTEXT_LENGTH when the model is unverified", async () => {
+		process.env.AI_CONTEXT_LENGTH = "131072";
+		process.env.AI_EMBEDDING_MODEL = "embed-qa-4";
+		resetProviderCache();
+		mockModelsEndpoint({ status: 404, embeddings: "fail" });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(true);
+		expect(provider.contextWindow).toBe(131072);
+		expect(health.detail).toContain("unverified");
+		expect(health.detail).toContain('embeddings "embed-qa-4" FAILING');
+		expect(health.warning).toContain("HTTP 404");
+		expect(health.warning).toContain("HTTP 502");
+		expect(health.warning).not.toContain("AI_CONTEXT_LENGTH");
 	});
 
 	it("fails the health check on authentication, rate-limit and server errors", async () => {

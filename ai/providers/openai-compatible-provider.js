@@ -267,6 +267,11 @@ export function createOpenAiCompatibleProvider(options) {
 				});
 
 				const warnings = [];
+				// The /v1/models entry for the active model (null when the route is
+				// not implemented: the model is then taken on faith and the context
+				// and embedding checks below still run)
+				let served = null;
+				let modelDetail;
 
 				if (!response.ok) {
 					// A gateway may simply not implement the model list (404/405/501).
@@ -276,47 +281,44 @@ export function createOpenAiCompatibleProvider(options) {
 					const routeMissing = [404, 405, 501].includes(response.status);
 					if (routeMissing && provider.model) {
 						warnings.push(
-							`${label} answered HTTP ${response.status} on ${baseUrl}/models: model "${provider.model}" and context length could not be verified.`
+							`${label} answered HTTP ${response.status} on ${baseUrl}/models: model "${provider.model}" could not be verified.`
 						);
-						return {
-							ok: true,
-							detail: `model "${provider.model}" (unverified), context ${provider.contextWindow} (configured)`,
-							warning: warnings.join(" "),
-						};
-					}
-					if (routeMissing) {
+						modelDetail = `model "${provider.model}" (unverified)`;
+					} else if (routeMissing) {
 						return {
 							ok: false,
 							error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models; set ${envNames.model} explicitly.`,
 						};
-					}
-					const hint =
-						response.status === 401 || response.status === 403 ? " Check the API key." : "";
-					return {
-						ok: false,
-						error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models.${hint}`,
-					};
-				}
-
-				const body = await response.json();
-				const models = Array.isArray(body?.data) ? body.data : [];
-				const modelIds = models.map((m) => m?.id).filter(Boolean);
-
-				let served = models.find((m) => m?.id === provider.model);
-				if (!provider.model) {
-					if (!adoptSingleServedModel || models.length !== 1) {
+					} else {
+						const hint =
+							response.status === 401 || response.status === 403 ? " Check the API key." : "";
 						return {
 							ok: false,
-							error: `${envNames.model} is not set and ${baseUrl} serves ${models.length} models (${modelIds.join(", ") || "none"}); set ${envNames.model} explicitly.`,
+							error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models.${hint}`,
 						};
 					}
-					served = models[0];
-					provider.model = served.id;
-				} else if (!served) {
-					return {
-						ok: false,
-						error: `Model "${provider.model}" not found on ${baseUrl}. Available: ${modelIds.join(", ") || "(none)"}.`,
-					};
+				} else {
+					const body = await response.json();
+					const models = Array.isArray(body?.data) ? body.data : [];
+					const modelIds = models.map((m) => m?.id).filter(Boolean);
+
+					served = models.find((m) => m?.id === provider.model) ?? null;
+					if (!provider.model) {
+						if (!adoptSingleServedModel || models.length !== 1) {
+							return {
+								ok: false,
+								error: `${envNames.model} is not set and ${baseUrl} serves ${models.length} models (${modelIds.join(", ") || "none"}); set ${envNames.model} explicitly.`,
+							};
+						}
+						served = models[0];
+						provider.model = served.id;
+					} else if (!served) {
+						return {
+							ok: false,
+							error: `Model "${provider.model}" not found on ${baseUrl}. Available: ${modelIds.join(", ") || "(none)"}.`,
+						};
+					}
+					modelDetail = `model "${provider.model}" available`;
 				}
 
 				// Reconcile the context window with the server's reported value.
@@ -391,7 +393,7 @@ export function createOpenAiCompatibleProvider(options) {
 
 				return {
 					ok: true,
-					detail: `model "${provider.model}" available, ${contextDetail}${mediaDetail}${embeddingDetail}`,
+					detail: `${modelDetail}, ${contextDetail}${mediaDetail}${embeddingDetail}`,
 					warning: warnings.join(" ") || undefined,
 				};
 			} catch (e) {
