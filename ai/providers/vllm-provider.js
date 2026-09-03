@@ -43,6 +43,12 @@ export function createVllmProvider() {
 		imageInput: true,
 		strictInput: true,
 		adoptSingleServedModel: true,
-		envNames: { model: "VLLM_MODEL", contextLength: "VLLM_CONTEXT_LENGTH" },
+		// vLLM always serves /v1/models: any failure there is a real failure
+		tolerateMissingModelList: false,
+		envNames: {
+			model: "VLLM_MODEL",
+			contextLength: "VLLM_CONTEXT_LENGTH",
+			maxOutputTokens: "VLLM_MAX_OUTPUT_TOKENS",
+		},
 	});
 }

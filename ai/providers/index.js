@@ -71,7 +71,13 @@ function createGenericProvider() {
 		imageInput: config.imageInput,
 		strictInput: config.strictInput,
 		adoptSingleServedModel: false,
-		envNames: { model: "AI_MODEL", contextLength: "AI_CONTEXT_LENGTH" },
+		// Gateways may not implement /v1/models at all
+		tolerateMissingModelList: true,
+		envNames: {
+			model: "AI_MODEL",
+			contextLength: "AI_CONTEXT_LENGTH",
+			maxOutputTokens: "AI_MAX_OUTPUT_TOKENS",
+		},
 	});
 }
 

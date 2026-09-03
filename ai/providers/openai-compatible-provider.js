@@ -23,7 +23,18 @@
  *   assistant history as plain strings) - see conformInputItems()
  * - `adoptSingleServedModel`: when the model is unset and the server lists
  *   exactly one model, adopt it (vLLM serves one model per instance)
+ * - `tolerateMissingModelList`: a gateway may not implement /v1/models at
+ *   all; with an explicit model the health check then degrades to a warning
+ *   instead of failing (never for vLLM, which always serves the route)
  */
+
+/**
+ * Minimum number of tokens the prompt side (system prompt, tool schemas, the
+ * conversation) must keep once the output reservation is subtracted from the
+ * context window. Below this the deterministic trimmer cannot do its job and
+ * the server rejects requests as the thread grows.
+ */
+const MIN_PROMPT_BUDGET_TOKENS = 8000;
 
 import { OpenAI } from "openai";
 import {
@@ -186,7 +197,10 @@ async function probeEmbeddings(backend) {
  * @param {boolean} [options.imageInput=false] - Model reads images natively (input_image items)
  * @param {boolean} [options.strictInput=false] - Apply conformInputItems() to every request
  * @param {boolean} [options.adoptSingleServedModel=false] - Adopt the only served model when unset
- * @param {{model: string, contextLength: string}} options.envNames - Variable names quoted in messages
+ * @param {boolean} [options.tolerateMissingModelList=false] - Degrade (warn) instead of failing
+ *   when /v1/models answers 404/405/501 and the model is explicit
+ * @param {{model: string, contextLength: string, maxOutputTokens: string}} options.envNames -
+ *   Variable names quoted in messages
  * @returns {import("./index.js").AiProvider}
  */
 export function createOpenAiCompatibleProvider(options) {
@@ -205,6 +219,7 @@ export function createOpenAiCompatibleProvider(options) {
 		imageInput = false,
 		strictInput = false,
 		adoptSingleServedModel = false,
+		tolerateMissingModelList = false,
 		envNames,
 	} = options;
 
@@ -275,23 +290,22 @@ export function createOpenAiCompatibleProvider(options) {
 
 				if (!response.ok) {
 					// A gateway may simply not implement the model list (404/405/501).
-					// With an explicit model that is a degraded check, not a failure;
-					// without one it is fatal. Any other status (401/403 bad key, 429,
-					// 5xx) means the backend itself is unusable: fail.
+					// Where that is tolerated and the model is explicit, degrade to a
+					// warning; otherwise (vLLM always serves the route; 401/403 bad
+					// key; 429; 5xx) the backend is unusable as configured: fail.
 					const routeMissing = [404, 405, 501].includes(response.status);
-					if (routeMissing && provider.model) {
+					if (routeMissing && tolerateMissingModelList && provider.model) {
 						warnings.push(
 							`${label} answered HTTP ${response.status} on ${baseUrl}/models: model "${provider.model}" could not be verified.`
 						);
 						modelDetail = `model "${provider.model}" (unverified)`;
-					} else if (routeMissing) {
-						return {
-							ok: false,
-							error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models; set ${envNames.model} explicitly.`,
-						};
 					} else {
-						const hint =
-							response.status === 401 || response.status === 403 ? " Check the API key." : "";
+						let hint = "";
+						if (response.status === 401 || response.status === 403) {
+							hint = " Check the API key.";
+						} else if (routeMissing && !provider.model) {
+							hint = ` Set ${envNames.model} explicitly.`;
+						}
 						return {
 							ok: false,
 							error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models.${hint}`,
@@ -360,6 +374,17 @@ export function createOpenAiCompatibleProvider(options) {
 							maxOutputTokens
 						);
 					}
+				}
+
+				// The output reservation is configured independently of the context
+				// window: on a small window it can leave the prompt side (system
+				// prompt, tool schemas, conversation) with no room, and the trimmer
+				// then has nothing to work with
+				const promptBudget = provider.contextWindow - maxOutputTokens;
+				if (promptBudget < MIN_PROMPT_BUDGET_TOKENS) {
+					warnings.push(
+						`${envNames.maxOutputTokens} (${maxOutputTokens}) leaves only ${Math.max(promptBudget, 0)} of the ${provider.contextWindow}-token context window for the prompt; requests will be rejected as conversations grow. Lower ${envNames.maxOutputTokens} or use a model with a larger context.`
+					);
 				}
 
 				// Native vision works either way; without the media store the

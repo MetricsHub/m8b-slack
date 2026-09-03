@@ -678,6 +678,17 @@ describe("vLLM provider", () => {
 		expect(health.error).toContain("some-other-model");
 	});
 
+	it("keeps a failing /v1/models fatal (vLLM always serves the route)", async () => {
+		for (const status of [404, 500]) {
+			resetProviderCache();
+			global.fetch = jest.fn(async () => ({ ok: false, status, json: async () => ({}) }));
+
+			const health = await getProvider().healthCheck();
+			expect(health.ok).toBe(false);
+			expect(health.error).toContain(`HTTP ${status}`);
+		}
+	});
+
 	it("warns when the media store is not configured (base64 fallback)", async () => {
 		mockModelsEndpoint();
 
@@ -1005,6 +1016,24 @@ describe("openai-compatible provider (generic)", () => {
 		expect(health.warning).toContain("HTTP 404");
 		expect(health.warning).toContain("HTTP 502");
 		expect(health.warning).not.toContain("AI_CONTEXT_LENGTH");
+	});
+
+	it("warns when the output reservation leaves no room in a small context window", async () => {
+		mockModelsEndpoint({ models: [{ id: "llama-3.3-70b", context_length: 4096 }] });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(true);
+		expect(provider.contextWindow).toBe(4096);
+		expect(health.warning).toContain("AI_MAX_OUTPUT_TOKENS");
+		expect(health.warning).toContain("4096-token context window");
+
+		// A reservation that leaves a workable prompt budget is fine
+		process.env.AI_MAX_OUTPUT_TOKENS = "1000";
+		resetProviderCache();
+		mockModelsEndpoint({ models: [{ id: "llama-3.3-70b", context_length: 16384 }] });
+		expect((await getProvider().healthCheck()).warning).toBeUndefined();
 	});
 
 	it("fails the health check on authentication, rate-limit and server errors", async () => {

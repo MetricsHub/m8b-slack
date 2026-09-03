@@ -269,7 +269,9 @@ and a reported `max_model_len` / `context_length` sizes the context window as in
 gateways do not report it: set `AI_CONTEXT_LENGTH` to the served model's real window, otherwise
 the bot runs on a 32k default and warns at startup. A gateway that does not expose `/v1/models`
 passes the check with a warning (model unverified); authentication or server errors on that
-endpoint fail it. A missing `AI_MODEL` stops the bot at startup. When `AI_EMBEDDING_MODEL` is set, the health
+endpoint fail it, and so does any `/v1/models` failure in vLLM mode. A missing `AI_MODEL` stops
+the bot at startup, and an `AI_MAX_OUTPUT_TOKENS` that leaves the prompt fewer than 8k tokens of
+the context window is flagged. When `AI_EMBEDDING_MODEL` is set, the health
 check also sends one test embedding request and warns if it fails; at runtime an embedding
 failure makes `search_knowledge_base` report the knowledge base as unavailable for that call,
 nothing else breaks.
