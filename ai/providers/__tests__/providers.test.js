@@ -963,32 +963,42 @@ describe("openai-compatible provider (generic)", () => {
 		expect(health.error).toContain("nemotron-super");
 	});
 
-	it("never guesses the model: AI_MODEL is required even when one model is served", async () => {
+	it("refuses to start without AI_MODEL (never guesses a gateway's model)", () => {
 		delete process.env.AI_MODEL;
 		resetProviderCache();
-		mockModelsEndpoint({ models: [{ id: "only-one" }] });
 
-		const provider = getProvider();
-		const health = await provider.healthCheck();
+		expect(() => getProvider()).toThrow(/AI_MODEL/);
 
-		expect(health.ok).toBe(false);
-		expect(health.error).toContain("AI_MODEL");
-		expect(provider.model).toBe("");
+		process.env.AI_MODEL = "   ";
+		resetProviderCache();
+		expect(() => getProvider()).toThrow(/AI_MODEL/);
 	});
 
-	it("degrades to an unverified health check when /v1/models is unavailable", async () => {
-		mockModelsEndpoint({ status: 404 });
+	it("degrades to an unverified health check when /v1/models is not implemented", async () => {
+		for (const status of [404, 405, 501]) {
+			resetProviderCache();
+			mockModelsEndpoint({ status });
 
-		const health = await getProvider().healthCheck();
-		expect(health.ok).toBe(true);
-		expect(health.detail).toContain("unverified");
-		expect(health.warning).toContain("HTTP 404");
+			const health = await getProvider().healthCheck();
+			expect(health.ok).toBe(true);
+			expect(health.detail).toContain("unverified");
+			expect(health.warning).toContain(`HTTP ${status}`);
+		}
+	});
 
-		delete process.env.AI_MODEL;
+	it("fails the health check on authentication, rate-limit and server errors", async () => {
+		for (const status of [401, 403, 429, 500, 503]) {
+			resetProviderCache();
+			mockModelsEndpoint({ status });
+
+			const health = await getProvider().healthCheck();
+			expect(health.ok).toBe(false);
+			expect(health.error).toContain(`HTTP ${status}`);
+		}
+
 		resetProviderCache();
-		const noModel = await getProvider().healthCheck();
-		expect(noModel.ok).toBe(false);
-		expect(noModel.error).toContain("AI_MODEL");
+		mockModelsEndpoint({ status: 401 });
+		expect((await getProvider().healthCheck()).error).toContain("API key");
 	});
 
 	it("warns about the media store only when image input is enabled", async () => {

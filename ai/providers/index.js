@@ -48,6 +48,14 @@ import { createVllmProvider } from "./vllm-provider.js";
  */
 function createGenericProvider() {
 	const config = getOpenAiCompatibleConfig();
+	// A gateway usually fronts many models, so the bot never guesses one. The
+	// health check would report the gap, but app.js only logs that result and
+	// starts anyway: reject the unusable configuration before anything runs.
+	if (!config.model) {
+		throw new Error(
+			`AI_PROVIDER=openai-compatible requires AI_MODEL (the served model to use; GET ${config.baseUrl}/models lists the available IDs)`
+		);
+	}
 	return createOpenAiCompatibleProvider({
 		name: PROVIDER_OPENAI_COMPATIBLE,
 		label: "AI backend",
@@ -62,7 +70,6 @@ function createGenericProvider() {
 		requestTimeoutMs: config.requestTimeoutMs,
 		imageInput: config.imageInput,
 		strictInput: config.strictInput,
-		// A gateway usually fronts many models: never guess, require AI_MODEL
 		adoptSingleServedModel: false,
 		envNames: { model: "AI_MODEL", contextLength: "AI_CONTEXT_LENGTH" },
 	});

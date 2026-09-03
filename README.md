@@ -268,7 +268,8 @@ alone is not enough. The health check calls `GET /v1/models`: `AI_MODEL` must be
 and a reported `max_model_len` / `context_length` sizes the context window as in vLLM mode. Most
 gateways do not report it: set `AI_CONTEXT_LENGTH` to the served model's real window, otherwise
 the bot runs on a 32k default and warns at startup. A gateway that does not expose `/v1/models`
-passes the check with a warning (model unverified). When `AI_EMBEDDING_MODEL` is set, the health
+passes the check with a warning (model unverified); authentication or server errors on that
+endpoint fail it. A missing `AI_MODEL` stops the bot at startup. When `AI_EMBEDDING_MODEL` is set, the health
 check also sends one test embedding request and warns if it fails; at runtime an embedding
 failure makes `search_knowledge_base` report the knowledge base as unavailable for that call,
 nothing else breaks.

@@ -269,9 +269,12 @@ export function createOpenAiCompatibleProvider(options) {
 				const warnings = [];
 
 				if (!response.ok) {
-					// A gateway may not expose the model list. With an explicit model
-					// that is a degraded check, not a failure; without one it is fatal.
-					if (provider.model) {
+					// A gateway may simply not implement the model list (404/405/501).
+					// With an explicit model that is a degraded check, not a failure;
+					// without one it is fatal. Any other status (401/403 bad key, 429,
+					// 5xx) means the backend itself is unusable: fail.
+					const routeMissing = [404, 405, 501].includes(response.status);
+					if (routeMissing && provider.model) {
 						warnings.push(
 							`${label} answered HTTP ${response.status} on ${baseUrl}/models: model "${provider.model}" and context length could not be verified.`
 						);
@@ -281,9 +284,17 @@ export function createOpenAiCompatibleProvider(options) {
 							warning: warnings.join(" "),
 						};
 					}
+					if (routeMissing) {
+						return {
+							ok: false,
+							error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models; set ${envNames.model} explicitly.`,
+						};
+					}
+					const hint =
+						response.status === 401 || response.status === 403 ? " Check the API key." : "";
 					return {
 						ok: false,
-						error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models; set ${envNames.model} explicitly.`,
+						error: `${label} responded with HTTP ${response.status} on ${baseUrl}/models.${hint}`,
 					};
 				}
 
