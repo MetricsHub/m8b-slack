@@ -258,9 +258,11 @@ AI_CONTEXT_LENGTH=131072              # the model's context window; gateways rar
 # AI_REQUEST_TIMEOUT_MS=300000
 # AI_IMAGE_INPUT=true                 # the model reads images natively (then configure M8B_MEDIA_*)
 # AI_STRICT_INPUT=true                # single leading system message, string assistant history
-# AI_EMBEDDING_MODEL=nv-embedqa-e5-v5 # unset = knowledge base disabled
+# AI_EMBEDDING_MODEL=nvidia/nv-embedqa-e5-v5 # unset = knowledge base disabled
 # AI_EMBEDDING_BASE_URL=              # defaults to AI_BASE_URL
 # AI_EMBEDDING_API_KEY=               # defaults to AI_API_KEY
+# AI_EMBEDDING_QUERY_INPUT_TYPE=      # per-request input_type; auto "query"/"passage" for nv-embed* models
+# AI_EMBEDDING_DOCUMENT_INPUT_TYPE=
 ```
 
 The endpoint must implement `/v1/responses` (streaming, `function` tools); `/v1/chat/completions`
@@ -274,7 +276,11 @@ the bot at startup, and an `AI_MAX_OUTPUT_TOKENS` that leaves the prompt fewer t
 the context window is flagged. When `AI_EMBEDDING_MODEL` is set, the health
 check also sends one test embedding request and warns if it fails; at runtime an embedding
 failure makes `search_knowledge_base` report the knowledge base as unavailable for that call,
-nothing else breaks.
+nothing else breaks. Without an embedding model, neither `search_knowledge_base` nor
+`update_knowledge` is offered to the model. Embedding APIs that require a per-request
+`input_type` (NVIDIA NIM retrieval models) are handled: `query` when searching, `passage` when
+indexing, detected from the model name or set with `AI_EMBEDDING_QUERY_INPUT_TYPE` /
+`AI_EMBEDDING_DOCUMENT_INPUT_TYPE`.
 Only universally supported request fields are sent (`model`, `input`, `tools`, `stream`,
 `max_output_tokens`); OpenAI-only fields (`reasoning`, `text`, `previous_response_id`,
 `safety_identifier`, hosted tool types) never are. Enable `AI_STRICT_INPUT` when the server rejects

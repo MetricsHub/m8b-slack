@@ -332,6 +332,46 @@ describe("local knowledge base", () => {
 		expect(dockerChunks).toHaveLength(1);
 	});
 
+	it("is writable with an embedding backend even before any index exists", async () => {
+		const kb = createLocalKnowledgeBase({ dir });
+		expect(await kb.isAvailable()).toBe(false);
+		expect(kb.isWritable()).toBe(true);
+
+		delete process.env.OLLAMA_EMBEDDING_MODEL;
+		process.env.AI_PROVIDER = "openai";
+		expect(createLocalKnowledgeBase({ dir }).isWritable()).toBe(false);
+	});
+
+	it("sends input_type per task for embedding APIs that require it (NVIDIA NIM)", async () => {
+		const saved = {};
+		const keys = ["AI_BASE_URL", "AI_API_KEY", "AI_MODEL", "AI_EMBEDDING_MODEL"];
+		for (const key of keys) saved[key] = process.env[key];
+		process.env.AI_PROVIDER = "openai-compatible";
+		process.env.AI_BASE_URL = "https://inference.example.com/v1";
+		process.env.AI_API_KEY = "token";
+		process.env.AI_MODEL = "llama-3.3-70b";
+		process.env.AI_EMBEDDING_MODEL = "nvidia/nv-embedqa-e5-v5";
+
+		try {
+			const kb = createLocalKnowledgeBase({ dir });
+			await kb.addDocument({ title: "Docker note", content: "docker things" });
+			const indexBodies = global.fetch.mock.calls.map(([, init]) => JSON.parse(init.body));
+			expect(indexBodies.length).toBeGreaterThan(0);
+			expect(indexBodies.every((b) => b.input_type === "passage")).toBe(true);
+			expect(indexBodies[0].model).toBe("nvidia/nv-embedqa-e5-v5");
+
+			global.fetch.mockClear();
+			const result = await kb.search("docker");
+			expect(result.ok).toBe(true);
+			expect(JSON.parse(global.fetch.mock.calls[0][1].body).input_type).toBe("query");
+		} finally {
+			for (const key of keys) {
+				if (saved[key] === undefined) delete process.env[key];
+				else process.env[key] = saved[key];
+			}
+		}
+	});
+
 	it("reports a missing file cleanly in indexFile", async () => {
 		const kb = createLocalKnowledgeBase({ dir });
 		const result = await kb.indexFile("nope.md");

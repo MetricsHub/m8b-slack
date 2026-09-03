@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals
 import {
 	getAiProviderName,
 	getEmbeddingBackendConfig,
+	getEmbeddingInputTypes,
 	getOllamaConfig,
 	getOpenAiCompatibleConfig,
 	getVllmConfig,
@@ -44,6 +45,8 @@ const ENV_KEYS = [
 	"AI_EMBEDDING_BASE_URL",
 	"AI_EMBEDDING_MODEL",
 	"AI_EMBEDDING_API_KEY",
+	"AI_EMBEDDING_QUERY_INPUT_TYPE",
+	"AI_EMBEDDING_DOCUMENT_INPUT_TYPE",
 ];
 
 describe("provider selection", () => {
@@ -1036,6 +1039,60 @@ describe("openai-compatible provider (generic)", () => {
 		expect((await getProvider().healthCheck()).warning).toBeUndefined();
 	});
 
+	it("treats an invalid AI_CONTEXT_LENGTH as unset, not as an explicit choice", async () => {
+		process.env.AI_CONTEXT_LENGTH = "oops";
+		process.env.AI_MAX_TOOL_OUTPUT_CHARS = "0";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const provider = getProvider();
+		expect(getOpenAiCompatibleConfig().contextLengthExplicit).toBe(false);
+		expect(getOpenAiCompatibleConfig().maxToolOutputCharsExplicit).toBe(false);
+		const defaultCap = provider.maxToolOutputChars;
+
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(true);
+		// The reported window is adopted and the tool-output cap re-derived from it
+		expect(provider.contextWindow).toBe(131072);
+		expect(provider.maxToolOutputChars).toBeGreaterThan(defaultCap);
+
+		// And when nothing is reported, the default is flagged as such
+		resetProviderCache();
+		mockModelsEndpoint({ models: [{ id: "llama-3.3-70b" }] });
+		expect((await getProvider().healthCheck()).warning).toContain("AI_CONTEXT_LENGTH");
+	});
+
+	it("resolves input_type requirements from the embedding model name, with overrides", () => {
+		expect(getEmbeddingInputTypes("nvidia/nv-embedqa-e5-v5")).toEqual({
+			query: "query",
+			document: "passage",
+		});
+		expect(getEmbeddingInputTypes("nvidia/llama-3.2-nv-embedqa-1b-v2").document).toBe("passage");
+		expect(getEmbeddingInputTypes("bge-m3")).toEqual({ query: "", document: "" });
+
+		process.env.AI_EMBEDDING_MODEL = "nvidia/nv-embedqa-e5-v5";
+		expect(getEmbeddingBackendConfig().inputTypes).toEqual({ query: "query", document: "passage" });
+
+		process.env.AI_EMBEDDING_QUERY_INPUT_TYPE = "";
+		process.env.AI_EMBEDDING_DOCUMENT_INPUT_TYPE = "";
+		expect(getEmbeddingBackendConfig().inputTypes).toEqual({ query: "", document: "" });
+	});
+
+	it("sends input_type on the startup embedding probe when the model requires it", async () => {
+		process.env.AI_EMBEDDING_MODEL = "nvidia/nv-embedqa-e5-v5";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS, embeddings: "ok" });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		const probe = global.fetch.mock.calls.find(([url]) => String(url).endsWith("/embeddings"));
+		expect(JSON.parse(probe[1].body)).toEqual({
+			model: "nvidia/nv-embedqa-e5-v5",
+			input: ["health check"],
+			input_type: "query",
+		});
+	});
+
 	it("fails the health check on authentication, rate-limit and server errors", async () => {
 		for (const status of [401, 403, 429, 500, 503]) {
 			resetProviderCache();
@@ -1083,11 +1140,13 @@ describe("openai-compatible provider (generic)", () => {
 			baseUrl: "https://inference.example.com/v1",
 			apiKey: "gateway-token",
 			model: "embed-qa-4",
+			// Not an NVIDIA retrieval model: no input_type field
+			inputTypes: { query: "", document: "" },
 		});
 
 		process.env.AI_EMBEDDING_BASE_URL = "http://embeddings.internal:8001/v1/";
 		process.env.AI_EMBEDDING_API_KEY = "embed-token";
-		expect(getEmbeddingBackendConfig()).toEqual({
+		expect(getEmbeddingBackendConfig()).toMatchObject({
 			baseUrl: "http://embeddings.internal:8001/v1",
 			apiKey: "embed-token",
 			model: "embed-qa-4",

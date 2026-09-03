@@ -152,6 +152,29 @@ describe("buildToolsArray", () => {
 		});
 
 		expect(tools.map((t) => t.name)).not.toContain("search_knowledge_base");
+		// Writable defaults to available: no embedding backend, no writes either
+		expect(tools.map((t) => t.name)).not.toContain("update_knowledge");
+	});
+
+	it("offers knowledge writes on an empty but writable knowledge base", () => {
+		const names = buildToolsArray({
+			provider: ollamaProvider,
+			knowledgeBaseAvailable: false,
+			knowledgeBaseWritable: true,
+		}).map((t) => t.name);
+
+		expect(names).not.toContain("search_knowledge_base");
+		expect(names).toContain("update_knowledge");
+	});
+
+	it("hides knowledge writes when no embedding backend is configured", () => {
+		const names = buildToolsArray({
+			provider: ollamaProvider,
+			knowledgeBaseAvailable: false,
+			knowledgeBaseWritable: false,
+		}).map((t) => t.name);
+
+		expect(names).not.toContain("update_knowledge");
 	});
 
 	it("exposes web_search as a function tool only when a backend is configured", () => {

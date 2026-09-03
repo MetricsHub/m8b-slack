@@ -134,12 +134,15 @@ export const RUN_PYTHON_TOOL = {
  *
  * @param {Object} options - Tool configuration options
  * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base indexed and usable
+ * @param {boolean} [options.knowledgeBaseWritable] - Knowledge can be written (an embedding
+ *   backend is configured; the index may still be empty). Defaults to knowledgeBaseAvailable.
  * @param {boolean} [options.codeSandboxAvailable] - Local Python sandbox (run_python) enabled
  * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of plain function tool definitions
  */
 export function buildFunctionToolsArray({
 	knowledgeBaseAvailable = false,
+	knowledgeBaseWritable = knowledgeBaseAvailable,
 	codeSandboxAvailable = false,
 	configEditingAllowed = false,
 } = {}) {
@@ -161,28 +164,32 @@ export function buildFunctionToolsArray({
 		tools.push(promqlTool);
 	}
 
-	// Local knowledge base: retrieval + writes
+	// Local knowledge base: retrieval (needs an index) + writes (need only an
+	// embedding backend; without one the write is guaranteed to fail, so the
+	// tool is not offered at all)
 	if (knowledgeBaseAvailable) {
 		tools.push(SEARCH_KNOWLEDGE_TOOL);
 	}
-	tools.push({
-		...KNOWLEDGE_TOOL,
-		description: KNOWLEDGE_TOOL.description.replace(
-			"retrievable via file_search",
-			"retrievable via search_knowledge_base"
-		),
-		parameters: {
-			...KNOWLEDGE_TOOL.parameters,
-			properties: {
-				...KNOWLEDGE_TOOL.parameters.properties,
-				fileId: {
-					type: "string",
-					description:
-						"Optional. The docId of an existing knowledge article to replace (as returned in search_knowledge_base results). If not provided, a new knowledge entry will be created.",
+	if (knowledgeBaseWritable) {
+		tools.push({
+			...KNOWLEDGE_TOOL,
+			description: KNOWLEDGE_TOOL.description.replace(
+				"retrievable via file_search",
+				"retrievable via search_knowledge_base"
+			),
+			parameters: {
+				...KNOWLEDGE_TOOL.parameters,
+				properties: {
+					...KNOWLEDGE_TOOL.parameters.properties,
+					fileId: {
+						type: "string",
+						description:
+							"Optional. The docId of an existing knowledge article to replace (as returned in search_knowledge_base results). If not provided, a new knowledge entry will be created.",
+					},
 				},
 			},
-		},
-	});
+		});
+	}
 
 	// Application-side web search (only when a search backend is configured)
 	const webSearchTool = getWebSearchTool();
@@ -213,6 +220,8 @@ export function buildFunctionToolsArray({
  * @param {Set<string>} options.codeFileIds - File IDs for code interpreter
  * @param {import("../providers/index.js").AiProvider} [options.provider] - Active AI provider
  * @param {boolean} [options.knowledgeBaseAvailable] - Local knowledge base usable (Ollama mode)
+ * @param {boolean} [options.knowledgeBaseWritable] - Local knowledge base accepts writes
+ *   (defaults to knowledgeBaseAvailable)
  * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of tool definitions
  */
@@ -221,11 +230,13 @@ export function buildToolsArray({
 	codeFileIds = new Set(),
 	provider,
 	knowledgeBaseAvailable = false,
+	knowledgeBaseWritable = knowledgeBaseAvailable,
 	configEditingAllowed = false,
 }) {
 	if (provider && !provider.capabilities.toolNamespaces) {
 		return buildFunctionToolsArray({
 			knowledgeBaseAvailable,
+			knowledgeBaseWritable,
 			codeSandboxAvailable: provider.capabilities.localCodeInterpreter === true,
 			configEditingAllowed,
 		});

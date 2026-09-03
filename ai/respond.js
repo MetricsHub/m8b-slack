@@ -279,6 +279,8 @@ async function respondCore({
 			? null
 			: createLocalKnowledgeBase({ logger });
 		const knowledgeBaseAvailable = knowledgeBase ? await knowledgeBase.isAvailable() : false;
+		// Writes only need an embedding backend (the first write creates the index)
+		const knowledgeBaseWritable = knowledgeBase ? knowledgeBase.isWritable() : false;
 
 		// Set initial status (cosmetic: a transient Slack error here must not
 		// abort the whole turn)
@@ -374,6 +376,7 @@ async function respondCore({
 			codeFileIds: fileManager.codeFileIds,
 			provider,
 			knowledgeBaseAvailable,
+			knowledgeBaseWritable,
 			configEditingAllowed,
 		});
 
@@ -566,6 +569,7 @@ async function respondCore({
 						codeFileIds: fileManager.codeFileIds,
 						provider,
 						knowledgeBaseAvailable,
+						knowledgeBaseWritable,
 						configEditingAllowed,
 					});
 				}
@@ -892,6 +896,7 @@ async function respondCore({
 					codeFileIds: fileManager.codeFileIds,
 					provider,
 					knowledgeBaseAvailable,
+					knowledgeBaseWritable,
 					configEditingAllowed,
 				});
 				logger.debug?.("Rebuilt tools array with updated code_interpreter files", {

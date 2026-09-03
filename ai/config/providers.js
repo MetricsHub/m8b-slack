@@ -32,6 +32,19 @@ function parsePositiveInt(value, fallback) {
 }
 
 /**
+ * Whether an environment value is a valid positive integer, i.e. whether
+ * parsePositiveInt() would honor it rather than fall back to the default.
+ * Providers use this to decide if a setting was EXPLICITLY configured
+ * ("AI_CONTEXT_LENGTH=oops" is not).
+ *
+ * @param {string|undefined} value - Raw environment value
+ * @returns {boolean}
+ */
+function isPositiveInt(value) {
+	return parsePositiveInt(value, null) !== null;
+}
+
+/**
  * Get the configured AI provider name.
  *
  * @returns {string} "openai", "ollama", "vllm", or "openai-compatible"
@@ -173,7 +186,8 @@ export function getOllamaConfig() {
  * /v1/models (an explicit smaller value still wins as a tighter budget).
  *
  * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
- *   maxOutputTokens: number, requestTimeoutMs: number, maxToolOutputChars: number}}
+ *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
+ *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean}}
  */
 export function getVllmConfig() {
 	const contextWindow = parsePositiveInt(process.env.VLLM_CONTEXT_LENGTH, 32768);
@@ -184,12 +198,16 @@ export function getVllmConfig() {
 		apiKey: process.env.VLLM_API_KEY || "vllm",
 		model: (process.env.VLLM_MODEL || "").trim(),
 		contextWindow,
+		// "Explicit" means a VALID value: an invalid one falls back to the default
+		// and must not be treated as an operator decision
+		contextLengthExplicit: isPositiveInt(process.env.VLLM_CONTEXT_LENGTH),
 		maxOutputTokens,
 		requestTimeoutMs: parsePositiveInt(process.env.VLLM_REQUEST_TIMEOUT_MS, 300000),
 		maxToolOutputChars: parsePositiveInt(
 			process.env.VLLM_MAX_TOOL_OUTPUT_CHARS,
 			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
+		maxToolOutputCharsExplicit: isPositiveInt(process.env.VLLM_MAX_TOOL_OUTPUT_CHARS),
 	};
 }
 
@@ -206,7 +224,8 @@ export function getVllmConfig() {
  * same base URL).
  *
  * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
- *   maxOutputTokens: number, requestTimeoutMs: number, maxToolOutputChars: number,
+ *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
+ *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean,
  *   imageInput: boolean, strictInput: boolean}}
  */
 export function getOpenAiCompatibleConfig() {
@@ -219,15 +238,39 @@ export function getOpenAiCompatibleConfig() {
 		apiKey: process.env.AI_API_KEY || "none",
 		model: (process.env.AI_MODEL || "").trim(),
 		contextWindow,
+		// "Explicit" means a VALID value: an invalid one falls back to the default
+		// and must not be treated as an operator decision
+		contextLengthExplicit: isPositiveInt(process.env.AI_CONTEXT_LENGTH),
 		maxOutputTokens,
 		requestTimeoutMs: parsePositiveInt(process.env.AI_REQUEST_TIMEOUT_MS, 300000),
 		maxToolOutputChars: parsePositiveInt(
 			process.env.AI_MAX_TOOL_OUTPUT_CHARS,
 			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
+		maxToolOutputCharsExplicit: isPositiveInt(process.env.AI_MAX_TOOL_OUTPUT_CHARS),
 		imageInput: parseBooleanFlag(process.env.AI_IMAGE_INPUT, false),
 		strictInput: parseBooleanFlag(process.env.AI_STRICT_INPUT, false),
 	};
+}
+
+/**
+ * Per-task `input_type` values an embedding API requires, if any.
+ *
+ * @param {string} model - Embedding model name
+ * @returns {{query: string, document: string}} Empty strings = field not sent
+ */
+export function getEmbeddingInputTypes(model) {
+	const queryOverride = process.env.AI_EMBEDDING_QUERY_INPUT_TYPE;
+	const documentOverride = process.env.AI_EMBEDDING_DOCUMENT_INPUT_TYPE;
+	if (queryOverride !== undefined || documentOverride !== undefined) {
+		return { query: (queryOverride || "").trim(), document: (documentOverride || "").trim() };
+	}
+	// NVIDIA retrieval embedders (nv-embedqa-e5-v5, llama-3.2-nv-embedqa-1b-v2,
+	// nv-embed-v1, ...) reject requests without input_type
+	if (/nv-embed|embedqa/i.test(model)) {
+		return { query: "query", document: "passage" };
+	}
+	return { query: "", document: "" };
 }
 
 /**
@@ -238,8 +281,16 @@ export function getOpenAiCompatibleConfig() {
  * the generic openai-compatible mode needs AI_EMBEDDING_MODEL, served from
  * AI_EMBEDDING_BASE_URL or the chat base URL).
  *
+ * The openai-compatible entry may carry `inputTypes`: some embedding APIs
+ * (NVIDIA NIM's nv-embedqa / nv-embed models) require a per-request
+ * `input_type` of "query" or "passage" instead of, or in addition to, the text
+ * prefixes other models use. Detected from the model name, overridable with
+ * AI_EMBEDDING_QUERY_INPUT_TYPE / AI_EMBEDDING_DOCUMENT_INPUT_TYPE (set both
+ * empty to send none).
+ *
  * @param {string} [providerName] - Provider name (defaults to the active one)
- * @returns {{baseUrl: string, apiKey: string, model: string}|null}
+ * @returns {{baseUrl: string, apiKey: string, model: string,
+ *   inputTypes?: {query: string, document: string}}|null}
  */
 export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
 	if (providerName === PROVIDER_OLLAMA) {
@@ -267,6 +318,7 @@ export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
 			baseUrl: baseUrl || chat.baseUrl,
 			apiKey: process.env.AI_EMBEDDING_API_KEY || chat.apiKey,
 			model,
+			inputTypes: getEmbeddingInputTypes(model),
 		};
 	}
 

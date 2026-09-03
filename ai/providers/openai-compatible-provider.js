@@ -152,7 +152,8 @@ function readServedContextLength(served) {
  * warning-level check: a failure never blocks startup, and search_knowledge_base
  * already degrades to an error result at query time.
  *
- * @param {{baseUrl: string, apiKey: string, model: string}} backend
+ * @param {{baseUrl: string, apiKey: string, model: string,
+ *   inputTypes?: {query: string, document: string}}} backend
  * @returns {Promise<{ok: boolean, error?: string}>}
  */
 async function probeEmbeddings(backend) {
@@ -163,7 +164,12 @@ async function probeEmbeddings(backend) {
 				Authorization: `Bearer ${backend.apiKey}`,
 				"Content-Type": "application/json",
 			},
-			body: JSON.stringify({ model: backend.model, input: ["health check"] }),
+			body: JSON.stringify({
+				model: backend.model,
+				input: ["health check"],
+				// Same request shape as a real search query (some APIs require input_type)
+				...(backend.inputTypes?.query ? { input_type: backend.inputTypes.query } : {}),
+			}),
 			signal: AbortSignal.timeout(10000),
 		});
 		if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
