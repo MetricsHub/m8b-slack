@@ -34,19 +34,20 @@
  *                  respond-live harness skips the scenario on any other provider
  */
 
+import { getProvider } from "../ai/providers/index.js";
+
 /**
  * Whether the active provider can see image attachments (used to skip the
- * screenshot scenarios where they cannot pass).
+ * screenshot scenarios where they cannot pass). Read from the instantiated
+ * provider's capability flags, never from provider names: OpenAI reads images
+ * through its Files API, vLLM/openai-compatible natively (imageInput), Ollama
+ * through a sidecar vision model (imageDescriptions).
  *
  * @returns {boolean}
  */
 function visionAvailable() {
-	const provider = (process.env.AI_PROVIDER || "openai").trim().toLowerCase();
-	if (provider === "ollama") return Boolean(process.env.OLLAMA_VISION_MODEL);
-	if (provider === "openai-compatible") {
-		return ["true", "1", "yes"].includes((process.env.AI_IMAGE_INPUT || "").trim().toLowerCase());
-	}
-	return true;
+	const { imageInput, imageDescriptions, providerFileUploads } = getProvider().capabilities;
+	return Boolean(imageInput || imageDescriptions || providerFileUploads);
 }
 
 /**
