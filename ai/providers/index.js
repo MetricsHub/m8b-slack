@@ -5,8 +5,9 @@
  * AI_PROVIDER directly. A provider exposes:
  *
  * @typedef {Object} AiProvider
- * @property {string} name - "openai", "ollama", or "vllm"
- * @property {boolean} [isLocal] - Local backend (Ollama/vLLM): friendly local error messages apply
+ * @property {string} name - "openai", "ollama", "vllm", or "openai-compatible"
+ * @property {boolean} [isLocal] - Self-hosted backend (anything but OpenAI): nothing is ever
+ *   sent to OpenAI, and the friendly local error messages apply
  * @property {string} model - Active chat model
  * @property {string} endpoint - Base URL used for the Responses API (for logging)
  * @property {Object} client - OpenAI SDK client bound to the provider endpoint
@@ -28,10 +29,44 @@
  * @property {Function} healthCheck - Async health check: {ok, detail?, error?}
  */
 
-import { getAiProviderName, PROVIDER_OLLAMA, PROVIDER_VLLM } from "../config/providers.js";
+import {
+	getAiProviderName,
+	getOpenAiCompatibleConfig,
+	PROVIDER_OLLAMA,
+	PROVIDER_OPENAI_COMPATIBLE,
+	PROVIDER_VLLM,
+} from "../config/providers.js";
 import { createOllamaProvider } from "./ollama-provider.js";
+import { createOpenAiCompatibleProvider } from "./openai-compatible-provider.js";
 import { createOpenAiProvider } from "./openai-provider.js";
 import { createVllmProvider } from "./vllm-provider.js";
+
+/**
+ * Build the generic OpenAI-compatible provider from the AI_* environment.
+ *
+ * @returns {AiProvider}
+ */
+function createGenericProvider() {
+	const config = getOpenAiCompatibleConfig();
+	return createOpenAiCompatibleProvider({
+		name: PROVIDER_OPENAI_COMPATIBLE,
+		label: "AI backend",
+		baseUrl: config.baseUrl,
+		apiKey: config.apiKey,
+		model: config.model,
+		contextWindow: config.contextWindow,
+		contextLengthExplicit: Boolean(process.env.AI_CONTEXT_LENGTH),
+		maxOutputTokens: config.maxOutputTokens,
+		maxToolOutputChars: config.maxToolOutputChars,
+		maxToolOutputCharsExplicit: Boolean(process.env.AI_MAX_TOOL_OUTPUT_CHARS),
+		requestTimeoutMs: config.requestTimeoutMs,
+		imageInput: config.imageInput,
+		strictInput: config.strictInput,
+		// A gateway usually fronts many models: never guess, require AI_MODEL
+		adoptSingleServedModel: false,
+		envNames: { model: "AI_MODEL", contextLength: "AI_CONTEXT_LENGTH" },
+	});
+}
 
 let cachedProvider = null;
 
@@ -43,12 +78,19 @@ let cachedProvider = null;
 export function getProvider() {
 	if (!cachedProvider) {
 		const name = getAiProviderName();
-		cachedProvider =
-			name === PROVIDER_OLLAMA
-				? createOllamaProvider()
-				: name === PROVIDER_VLLM
-					? createVllmProvider()
-					: createOpenAiProvider();
+		switch (name) {
+			case PROVIDER_OLLAMA:
+				cachedProvider = createOllamaProvider();
+				break;
+			case PROVIDER_VLLM:
+				cachedProvider = createVllmProvider();
+				break;
+			case PROVIDER_OPENAI_COMPATIBLE:
+				cachedProvider = createGenericProvider();
+				break;
+			default:
+				cachedProvider = createOpenAiProvider();
+		}
 	}
 	return cachedProvider;
 }

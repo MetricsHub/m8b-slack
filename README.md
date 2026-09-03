@@ -135,6 +135,11 @@ The AI backend is selected with `AI_PROVIDER`:
 - `AI_PROVIDER=vllm`: a local model through vLLM's OpenAI-compatible `/v1/responses` API. Same
   local-only guarantees as Ollama mode, with one capability upgrade: the served model is
   multimodal, so screenshots are passed to it natively (no sidecar vision model needed).
+- `AI_PROVIDER=openai-compatible`: any other endpoint serving the OpenAI `/v1/responses` API with
+  streaming and function tools (a corporate inference proxy, an NVIDIA NIM, a LiteLLM gateway,
+  ...). Configured by `AI_BASE_URL`, `AI_API_KEY` and `AI_MODEL`; same local-only guarantees as
+  Ollama/vLLM modes, with model-dependent capabilities switched on by flags (`AI_IMAGE_INPUT`,
+  `AI_STRICT_INPUT`, `AI_EMBEDDING_MODEL`). The `vllm` mode is a preset of this provider.
 
 At startup the bot logs the active backend and runs a health check (backend reachability + model
 presence). In Ollama mode it also reads the server's _effective_ context length from the native
@@ -239,7 +244,41 @@ WEB_SEARCH_PROVIDER=searxng
 SEARXNG_URL=http://searxng.internal:8080
 ```
 
-### Local modes (Ollama/vLLM): conversation state
+### Example OpenAI-compatible configuration
+
+For an endpoint that is neither Ollama nor vLLM (a corporate inference gateway, a NIM, ...):
+
+```bash
+AI_PROVIDER=openai-compatible
+AI_BASE_URL=https://inference.example.com/v1
+AI_API_KEY=...                        # bearer token; any value if the endpoint ignores it
+AI_MODEL=llama-3.3-70b-instruct       # REQUIRED: a gateway serves many models, the bot never guesses
+AI_CONTEXT_LENGTH=131072              # the model's context window; gateways rarely report it (see below)
+# AI_MAX_OUTPUT_TOKENS=4000
+# AI_REQUEST_TIMEOUT_MS=300000
+# AI_IMAGE_INPUT=true                 # the model reads images natively (then configure M8B_MEDIA_*)
+# AI_STRICT_INPUT=true                # single leading system message, string assistant history
+# AI_EMBEDDING_MODEL=nv-embedqa-e5-v5 # unset = knowledge base disabled
+# AI_EMBEDDING_BASE_URL=              # defaults to AI_BASE_URL
+# AI_EMBEDDING_API_KEY=               # defaults to AI_API_KEY
+```
+
+The endpoint must implement `/v1/responses` (streaming, `function` tools); `/v1/chat/completions`
+alone is not enough. The health check calls `GET /v1/models`: `AI_MODEL` must be listed there,
+and a reported `max_model_len` / `context_length` sizes the context window as in vLLM mode. Most
+gateways do not report it: set `AI_CONTEXT_LENGTH` to the served model's real window, otherwise
+the bot runs on a 32k default and warns at startup. A gateway that does not expose `/v1/models`
+passes the check with a warning (model unverified). When `AI_EMBEDDING_MODEL` is set, the health
+check also sends one test embedding request and warns if it fails; at runtime an embedding
+failure makes `search_knowledge_base` report the knowledge base as unavailable for that call,
+nothing else breaks.
+Only universally supported request fields are sent (`model`, `input`, `tools`, `stream`,
+`max_output_tokens`); OpenAI-only fields (`reasoning`, `text`, `previous_response_id`,
+`safety_identifier`, hosted tool types) never are. Enable `AI_STRICT_INPUT` when the server rejects
+requests with `400 System message must be at the beginning` or refuses assistant history items
+carrying `output_text` content (this is what the `vllm` preset does unconditionally).
+
+### Local modes (Ollama/vLLM/openai-compatible): conversation state
 
 Ollama's `/v1/responses` API is **stateless** — it does not implement OpenAI's
 `previous_response_id` or `conversation`. vLLM has a Responses API store, but it is an
@@ -378,6 +417,11 @@ the multimodal model via the media store (no `OLLAMA_VISION_MODEL` sidecar), and
 embeddings need a dedicated endpoint (`VLLM_EMBEDDING_BASE_URL` + `VLLM_EMBEDDING_MODEL`;
 without them the knowledge base is disabled).
 
+**OpenAI-compatible mode** also matches the Ollama column, with the model-dependent rows driven
+by flags: file/image analysis is native (`AI_IMAGE_INPUT=true`, as in vLLM mode) or unavailable
+for images (default; data files are still staged for `run_python`), and the knowledge base is
+enabled by `AI_EMBEDDING_MODEL` (served from `AI_EMBEDDING_BASE_URL`, default `AI_BASE_URL`).
+
 **Code Interpreter in Ollama mode:** the hosted `code_interpreter` is replaced by a local
 `run_python` function tool backed by [Pyodide](https://pyodide.org) (CPython compiled to
 WebAssembly, running in a worker thread). The WASM boundary is the sandbox: the generated code
@@ -396,8 +440,8 @@ bounded by a hard timeout (`CODE_SANDBOX_TIMEOUT_MS`, default 60s) enforced with
 `worker.terminate()`. Set `CODE_SANDBOX_ENABLED=false` to disable the tool entirely; the
 system prompt then tells the model to provide file contents inline instead.
 
-**Privacy note:** in Ollama and vLLM modes, prompts, documents, and tool results never leave
-your network unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends
+**Privacy note:** in Ollama, vLLM and OpenAI-compatible modes, prompts, documents, and tool
+results never go to OpenAI, and never leave your network (beyond your own inference endpoint) unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends
 the search query — not the conversation — to ollama.com).
 
 `NODE_ENV` controls Bolt logging:

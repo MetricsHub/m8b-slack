@@ -1,5 +1,5 @@
 /**
- * Tests for the AI provider abstraction (OpenAI vs Ollama vs vLLM).
+ * Tests for the AI provider abstraction (OpenAI, Ollama, vLLM, generic OpenAI-compatible).
  */
 
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
@@ -7,6 +7,7 @@ import {
 	getAiProviderName,
 	getEmbeddingBackendConfig,
 	getOllamaConfig,
+	getOpenAiCompatibleConfig,
 	getVllmConfig,
 } from "../../config/providers.js";
 import { describeProviderError, getProvider, resetProviderCache } from "../index.js";
@@ -32,6 +33,17 @@ const ENV_KEYS = [
 	"VLLM_EMBEDDING_MODEL",
 	"VLLM_EMBEDDING_API_KEY",
 	"M8B_MEDIA_BASE_URL",
+	"AI_BASE_URL",
+	"AI_API_KEY",
+	"AI_MODEL",
+	"AI_CONTEXT_LENGTH",
+	"AI_MAX_OUTPUT_TOKENS",
+	"AI_MAX_TOOL_OUTPUT_CHARS",
+	"AI_IMAGE_INPUT",
+	"AI_STRICT_INPUT",
+	"AI_EMBEDDING_BASE_URL",
+	"AI_EMBEDDING_MODEL",
+	"AI_EMBEDDING_API_KEY",
 ];
 
 describe("provider selection", () => {
@@ -714,6 +726,312 @@ describe("vLLM provider", () => {
 	it("has no embedding backend in OpenAI mode (hosted file_search)", () => {
 		process.env.AI_PROVIDER = "openai";
 		expect(getEmbeddingBackendConfig()).toBeNull();
+	});
+});
+
+describe("openai-compatible provider (generic)", () => {
+	const savedFetch = global.fetch;
+	const savedEnv = {};
+
+	function mockModelsEndpoint({ models, status = 200, embeddings = null } = {}) {
+		global.fetch = jest.fn(async (url) => {
+			const target = String(url);
+			if (target.endsWith("/models")) {
+				if (status !== 200) return { ok: false, status, json: async () => ({}) };
+				return { ok: true, json: async () => ({ data: models }) };
+			}
+			if (target.endsWith("/embeddings") && embeddings) {
+				if (embeddings === "fail") return { ok: false, status: 502, json: async () => ({}) };
+				return { ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) };
+			}
+			throw new Error(`Unexpected fetch: ${target}`);
+		});
+	}
+
+	const GATEWAY_MODELS = [
+		{ id: "nemotron-super" },
+		{ id: "llama-3.3-70b", context_length: 131072 },
+		{ id: "embed-qa-4" },
+	];
+
+	beforeEach(() => {
+		for (const key of ENV_KEYS) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		process.env.AI_PROVIDER = "openai-compatible";
+		process.env.AI_BASE_URL = "https://inference.example.com/v1/";
+		process.env.AI_API_KEY = "gateway-token";
+		process.env.AI_MODEL = "llama-3.3-70b";
+		resetProviderCache();
+	});
+
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+		global.fetch = savedFetch;
+		resetProviderCache();
+	});
+
+	it("selects the generic provider with AI_* configuration", () => {
+		expect(getAiProviderName()).toBe("openai-compatible");
+
+		const provider = getProvider();
+		expect(provider.name).toBe("openai-compatible");
+		expect(provider.isLocal).toBe(true);
+		expect(provider.model).toBe("llama-3.3-70b");
+		expect(provider.endpoint).toBe("https://inference.example.com/v1");
+		expect(provider.contextWindow).toBe(32768);
+		expect(provider.maxOutputTokens).toBe(4000);
+		expect(provider.capabilities).toEqual({
+			serverSideState: false,
+			hostedFileSearch: false,
+			codeInterpreter: false,
+			localCodeInterpreter: true,
+			hostedWebSearch: false,
+			providerFileUploads: false,
+			imageDescriptions: false,
+			imageInput: false,
+			toolNamespaces: false,
+		});
+	});
+
+	it("uses a dummy API key when none is configured", () => {
+		delete process.env.AI_API_KEY;
+		expect(getOpenAiCompatibleConfig().apiKey).toBe("none");
+	});
+
+	it("opts into native image input with AI_IMAGE_INPUT", () => {
+		process.env.AI_IMAGE_INPUT = "true";
+		resetProviderCache();
+		expect(getProvider().capabilities.imageInput).toBe(true);
+
+		process.env.AI_IMAGE_INPUT = "1";
+		resetProviderCache();
+		expect(getProvider().capabilities.imageInput).toBe(true);
+
+		process.env.AI_IMAGE_INPUT = "no";
+		resetProviderCache();
+		expect(getProvider().capabilities.imageInput).toBe(false);
+	});
+
+	it("only sends universally supported /v1/responses fields", () => {
+		const provider = getProvider();
+		const tools = [{ type: "function", name: "ListHosts", parameters: {} }];
+		const input = [{ role: "user", content: [{ type: "input_text", text: "hi" }] }];
+		const request = provider.buildRequest({
+			input,
+			tools,
+			previous_response_id: "resp_should_not_be_sent",
+			safety_identifier: "hash_should_not_be_sent",
+		});
+
+		expect(request).toEqual({
+			model: "llama-3.3-70b",
+			input,
+			max_output_tokens: 4000,
+			stream: true,
+			tools,
+		});
+		expect(request).not.toHaveProperty("previous_response_id");
+		expect(request).not.toHaveProperty("safety_identifier");
+		expect(request).not.toHaveProperty("reasoning");
+		expect(request).not.toHaveProperty("text");
+	});
+
+	it("passes the input through untouched by default (no strict conforming)", () => {
+		const provider = getProvider();
+		const input = [
+			{ role: "system", content: [{ type: "input_text", text: "base prompt" }] },
+			{ role: "system", content: [{ type: "input_text", text: "attachment guidance" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ role: "system", content: [{ type: "input_text", text: "mid-conversation note" }] },
+			{ role: "assistant", content: [{ type: "output_text", text: "replayed answer" }] },
+		];
+
+		expect(provider.buildRequest({ input, tools: [] }).input).toBe(input);
+	});
+
+	it("applies the strict chat-template conforming with AI_STRICT_INPUT=true", () => {
+		process.env.AI_STRICT_INPUT = "true";
+		resetProviderCache();
+
+		const provider = getProvider();
+		const input = [
+			{ role: "system", content: [{ type: "input_text", text: "base prompt" }] },
+			{ role: "system", content: [{ type: "input_text", text: "attachment guidance" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ role: "system", content: [{ type: "input_text", text: "mid-conversation note" }] },
+			{ role: "assistant", content: [{ type: "output_text", text: "replayed answer" }] },
+		];
+
+		const conformed = provider.buildRequest({ input, tools: [] }).input;
+		expect(conformed.filter((item) => item?.role === "system")).toHaveLength(1);
+		expect(conformed[0].content[0].text).toBe("base prompt\n\nattachment guidance");
+		expect(conformed[2]).toMatchObject({ role: "user" });
+		expect(conformed[2].content[0].text).toBe("[System note] mid-conversation note");
+		expect(conformed[3]).toEqual({ role: "assistant", content: "replayed answer" });
+	});
+
+	it("passes the health check when the configured model is served among many", async () => {
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(true);
+		expect(health.detail).toContain('model "llama-3.3-70b" available');
+		// context_length is honored as an alternative to vLLM's max_model_len
+		expect(provider.contextWindow).toBe(131072);
+		expect(health.detail).toContain("context_length");
+		// No image input: no media-store nagging
+		expect(health.warning).toBeUndefined();
+		expect(health.detail).not.toContain("media store");
+		expect(global.fetch.mock.calls[0][1].headers.Authorization).toBe("Bearer gateway-token");
+	});
+
+	it("warns when the context length is neither reported nor configured", async () => {
+		mockModelsEndpoint({ models: [{ id: "llama-3.3-70b" }] });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(true);
+		expect(provider.contextWindow).toBe(32768);
+		expect(health.detail).toContain("DEFAULT");
+		expect(health.warning).toContain("AI_CONTEXT_LENGTH");
+	});
+
+	it("trusts an explicit AI_CONTEXT_LENGTH when the server reports none", async () => {
+		process.env.AI_CONTEXT_LENGTH = "131072";
+		resetProviderCache();
+		mockModelsEndpoint({ models: [{ id: "llama-3.3-70b" }] });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(true);
+		expect(provider.contextWindow).toBe(131072);
+		expect(health.detail).toContain("server value not reported");
+		expect(health.warning).toBeUndefined();
+	});
+
+	it("probes the embedding endpoint and only warns when it fails", async () => {
+		process.env.AI_EMBEDDING_MODEL = "embed-qa-4";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS, embeddings: "ok" });
+
+		let health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.detail).toContain('embeddings "embed-qa-4" ok');
+		expect(health.warning).toBeUndefined();
+		const probe = global.fetch.mock.calls.find(([url]) => String(url).endsWith("/embeddings"));
+		expect(probe[0]).toBe("https://inference.example.com/v1/embeddings");
+		expect(JSON.parse(probe[1].body)).toMatchObject({ model: "embed-qa-4" });
+
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS, embeddings: "fail" });
+		health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.detail).toContain("FAILING");
+		expect(health.warning).toContain("HTTP 502");
+		expect(health.warning).toContain("knowledge base");
+	});
+
+	it("caps an over-configured AI_CONTEXT_LENGTH with a warning naming the variable", async () => {
+		process.env.AI_CONTEXT_LENGTH = "1000000";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(provider.contextWindow).toBe(131072);
+		expect(health.warning).toContain("AI_CONTEXT_LENGTH");
+	});
+
+	it("fails the health check when the configured model is not served", async () => {
+		process.env.AI_MODEL = "gpt-oss-120b";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("gpt-oss-120b");
+		expect(health.error).toContain("nemotron-super");
+	});
+
+	it("never guesses the model: AI_MODEL is required even when one model is served", async () => {
+		delete process.env.AI_MODEL;
+		resetProviderCache();
+		mockModelsEndpoint({ models: [{ id: "only-one" }] });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("AI_MODEL");
+		expect(provider.model).toBe("");
+	});
+
+	it("degrades to an unverified health check when /v1/models is unavailable", async () => {
+		mockModelsEndpoint({ status: 404 });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.detail).toContain("unverified");
+		expect(health.warning).toContain("HTTP 404");
+
+		delete process.env.AI_MODEL;
+		resetProviderCache();
+		const noModel = await getProvider().healthCheck();
+		expect(noModel.ok).toBe(false);
+		expect(noModel.error).toContain("AI_MODEL");
+	});
+
+	it("warns about the media store only when image input is enabled", async () => {
+		process.env.AI_IMAGE_INPUT = "true";
+		resetProviderCache();
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(true);
+		expect(health.warning).toContain("M8B_MEDIA_BASE_URL");
+	});
+
+	it("reports the backend as unreachable on transport errors", async () => {
+		global.fetch = jest.fn(async () => {
+			throw new Error("connect ECONNREFUSED");
+		});
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("unreachable");
+		expect(describeProviderError(new Error("fetch failed"), provider)).toContain(
+			"local AI backend"
+		);
+	});
+
+	it("enables the knowledge base only with AI_EMBEDDING_MODEL, defaulting to the chat endpoint", () => {
+		expect(getEmbeddingBackendConfig()).toBeNull();
+
+		process.env.AI_EMBEDDING_MODEL = "embed-qa-4";
+		expect(getEmbeddingBackendConfig()).toEqual({
+			baseUrl: "https://inference.example.com/v1",
+			apiKey: "gateway-token",
+			model: "embed-qa-4",
+		});
+
+		process.env.AI_EMBEDDING_BASE_URL = "http://embeddings.internal:8001/v1/";
+		process.env.AI_EMBEDDING_API_KEY = "embed-token";
+		expect(getEmbeddingBackendConfig()).toEqual({
+			baseUrl: "http://embeddings.internal:8001/v1",
+			apiKey: "embed-token",
+			model: "embed-qa-4",
+		});
 	});
 });
 

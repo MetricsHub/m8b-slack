@@ -195,7 +195,7 @@ export async function embedTexts(texts, logger, taskPrefix = "") {
 	const backend = getEmbeddingBackendConfig();
 	if (!backend) {
 		throw new Error(
-			"No embedding backend is configured for this AI provider (vLLM mode needs VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL)"
+			"No embedding backend is configured for this AI provider (vLLM mode needs VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL; openai-compatible mode needs AI_EMBEDDING_MODEL)"
 		);
 	}
 	const { baseUrl, apiKey, model: embeddingModel } = backend;
@@ -326,7 +326,7 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 			return {
 				ok: false,
 				error:
-					"No embedding backend is configured for this AI provider (vLLM mode needs VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL).",
+					"No embedding backend is configured for this AI provider (vLLM mode needs VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL; openai-compatible mode needs AI_EMBEDDING_MODEL).",
 			};
 		}
 		if (index.model && index.model !== embeddingModel) {
