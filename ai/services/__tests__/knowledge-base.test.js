@@ -364,6 +364,25 @@ describe("local knowledge base", () => {
 			const result = await kb.search("docker");
 			expect(result.ok).toBe(true);
 			expect(JSON.parse(global.fetch.mock.calls[0][1].body).input_type).toBe("query");
+
+			// The effective input_type is persisted; changing it without a rebuild
+			// is rejected for both reads and writes (a different embedding space)
+			const index = JSON.parse(await fsp.readFile(path.join(dir, "index.json"), "utf8"));
+			expect(index.documentInputType).toBe("passage");
+			process.env.AI_EMBEDDING_QUERY_INPUT_TYPE = "";
+			process.env.AI_EMBEDDING_DOCUMENT_INPUT_TYPE = "";
+			try {
+				const stale = createLocalKnowledgeBase({ dir });
+				const mismatchedSearch = await stale.search("docker");
+				expect(mismatchedSearch.ok).toBe(false);
+				expect(mismatchedSearch.error).toContain("input_type");
+				const mismatchedWrite = await stale.addDocument({ title: "x", content: "docker again" });
+				expect(mismatchedWrite.ok).toBe(false);
+				expect(mismatchedWrite.error).toContain("kb:index");
+			} finally {
+				delete process.env.AI_EMBEDDING_QUERY_INPUT_TYPE;
+				delete process.env.AI_EMBEDDING_DOCUMENT_INPUT_TYPE;
+			}
 		} finally {
 			for (const key of keys) {
 				if (saved[key] === undefined) delete process.env[key];

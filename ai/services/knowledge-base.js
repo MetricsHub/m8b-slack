@@ -255,6 +255,17 @@ export async function embedTexts(texts, logger, taskPrefix = "", task = undefine
 	return embeddings;
 }
 
+/**
+ * The `input_type` value documents are embedded with under the current
+ * configuration ("" when the API takes none). Persisted in the index like the
+ * document prefix: a change alters the embedding space and requires a rebuild.
+ *
+ * @returns {string}
+ */
+function currentDocumentInputType() {
+	return getEmbeddingBackendConfig()?.inputTypes?.document || "";
+}
+
 function slugify(title) {
 	return (
 		String(title || "knowledge-entry")
@@ -361,6 +372,14 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 					"Knowledge base index was built with a different embedding task prefix. Rebuild it with: npm run kb:index",
 			};
 		}
+		// Indexes predating this field were embedded without input_type ("")
+		if ((index.documentInputType || "") !== currentDocumentInputType()) {
+			return {
+				ok: false,
+				error:
+					"Knowledge base index was built with a different embedding input_type. Rebuild it with: npm run kb:index",
+			};
+		}
 
 		let queryEmbedding;
 		try {
@@ -420,15 +439,29 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 
 		const embeddingModel = getEmbeddingBackendConfig()?.model || "";
 		const documentPrefix = getEmbeddingPrefixes(embeddingModel).document;
-		const index = (await loadIndex()) || { model: embeddingModel, documentPrefix, chunks: [] };
+		const documentInputType = currentDocumentInputType();
+		const index = (await loadIndex()) || {
+			model: embeddingModel,
+			documentPrefix,
+			documentInputType,
+			chunks: [],
+		};
 		index.model = index.model || embeddingModel;
 		if (index.documentPrefix === undefined) index.documentPrefix = documentPrefix;
+		// Indexes predating this field were embedded without input_type ("")
+		if (index.documentInputType === undefined) index.documentInputType = "";
 
 		// Never mix vectors from different embedding configurations in one index
 		if (index.model !== embeddingModel || index.documentPrefix !== documentPrefix) {
 			return {
 				ok: false,
 				error: `Knowledge base index was built with embedding model "${index.model}" but "${embeddingModel}" is configured. Rebuild it with: npm run kb:index`,
+			};
+		}
+		if (index.documentInputType !== documentInputType) {
+			return {
+				ok: false,
+				error: `Knowledge base index was built with embedding input_type "${index.documentInputType || "(none)"}" but "${documentInputType || "(none)"}" is configured. Rebuild it with: npm run kb:index`,
 			};
 		}
 
@@ -507,15 +540,29 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 
 		const embeddingModel = getEmbeddingBackendConfig()?.model || "";
 		const documentPrefix = getEmbeddingPrefixes(embeddingModel).document;
-		const index = (await loadIndex()) || { model: embeddingModel, documentPrefix, chunks: [] };
+		const documentInputType = currentDocumentInputType();
+		const index = (await loadIndex()) || {
+			model: embeddingModel,
+			documentPrefix,
+			documentInputType,
+			chunks: [],
+		};
 		index.model = index.model || embeddingModel;
 		if (index.documentPrefix === undefined) index.documentPrefix = documentPrefix;
+		// Indexes predating this field were embedded without input_type ("")
+		if (index.documentInputType === undefined) index.documentInputType = "";
 
 		// Never mix vectors from different embedding configurations in one index
 		if (index.model !== embeddingModel || index.documentPrefix !== documentPrefix) {
 			return {
 				ok: false,
 				error: `Knowledge base index was built with embedding model "${index.model}" but "${embeddingModel}" is configured. Rebuild it with: npm run kb:index`,
+			};
+		}
+		if (index.documentInputType !== documentInputType) {
+			return {
+				ok: false,
+				error: `Knowledge base index was built with embedding input_type "${index.documentInputType || "(none)"}" but "${documentInputType || "(none)"}" is configured. Rebuild it with: npm run kb:index`,
 			};
 		}
 
@@ -579,7 +626,12 @@ export function createLocalKnowledgeBase({ dir = getKnowledgeBaseDir(), logger }
 
 		const embeddingModel = getEmbeddingBackendConfig()?.model || "";
 		const documentPrefix = getEmbeddingPrefixes(embeddingModel).document;
-		const index = { model: embeddingModel, documentPrefix, chunks: [] };
+		const index = {
+			model: embeddingModel,
+			documentPrefix,
+			documentInputType: currentDocumentInputType(),
+			chunks: [],
+		};
 
 		for (const fileName of markdownFiles) {
 			const content = await fsp.readFile(path.join(docsDir, fileName), "utf8");
