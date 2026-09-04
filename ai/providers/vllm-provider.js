@@ -13,8 +13,11 @@
  *   when M8B_MEDIA_BASE_URL is configured.
  * - Strict input conforming: the stock Qwen chat template accepts a single
  *   leading system message and rejects the output_text-list assistant shape.
- * - One model per instance: the served model is adopted when VLLM_MODEL is
+ * - One model per instance: the served model is adopted when AI_MODEL is
  *   unset, and max_model_len from /v1/models sizes the context window.
+ *
+ * Configured by the common AI_* variables (VLLM_* names are accepted as
+ * deprecated aliases); see ai/config/providers.js.
  */
 
 import { getVllmConfig } from "../config/providers.js";
@@ -45,10 +48,7 @@ export function createVllmProvider() {
 		adoptSingleServedModel: true,
 		// vLLM always serves /v1/models: any failure there is a real failure
 		tolerateMissingModelList: false,
-		envNames: {
-			model: "VLLM_MODEL",
-			contextLength: "VLLM_CONTEXT_LENGTH",
-			maxOutputTokens: "VLLM_MAX_OUTPUT_TOKENS",
-		},
+		// The alias actually in use (VLLM_*) or the canonical AI_* name
+		envNames: config.envNames,
 	});
 }

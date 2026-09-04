@@ -5,6 +5,26 @@
  * exposing the OpenAI-compatible /v1/responses API (Ollama or vLLM), or any
  * other OpenAI-compatible endpoint (a corporate inference proxy, a NIM, a
  * LiteLLM gateway, ...) through the generic "openai-compatible" provider.
+ *
+ * Every self-hosted mode (ollama / vllm / openai-compatible) reads ONE common
+ * vocabulary of variables, AI_*, documented in .env.example:
+ *
+ *   AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_CONTEXT_LENGTH, AI_MAX_OUTPUT_TOKENS,
+ *   AI_REQUEST_TIMEOUT_MS, AI_MAX_TOOL_OUTPUT_CHARS, AI_EMBEDDING_MODEL,
+ *   AI_EMBEDDING_BASE_URL, AI_EMBEDDING_API_KEY, AI_EMBEDDING_QUERY_PREFIX,
+ *   AI_EMBEDDING_DOCUMENT_PREFIX
+ *
+ * AI_PROVIDER is a preset selector: it fixes the defaults (Ollama's port,
+ * vLLM's dummy key, ...) and the backend quirks (sidecar vision, strict input,
+ * single-model adoption). Vendor-prefixed names (OLLAMA_MODEL, VLLM_BASE_URL,
+ * ...) are accepted as DEPRECATED aliases of the AI_* names for the active
+ * preset, and take precedence over them so existing deployments keep working
+ * unchanged; getDeprecatedAiVariables() lists the ones in use for a startup
+ * warning. Only genuinely vendor-specific settings keep a vendor prefix:
+ * OLLAMA_VISION_MODEL / OLLAMA_VISION_MAX_OUTPUT_TOKENS (the sidecar vision
+ * path through Ollama's chat endpoint) and OLLAMA_CONTEXT_LENGTH, a permanent
+ * alias named after Ollama's own server variable so the same line works on
+ * both sides.
  */
 
 import { PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
@@ -131,127 +151,236 @@ export function getCodeSandboxConfig() {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Common AI_* settings and their deprecated vendor-prefixed aliases
+// ---------------------------------------------------------------------------
+
 /**
- * Get the Ollama backend configuration from environment variables.
- *
- * OLLAMA_API_KEY is a dummy value required by the OpenAI SDK; the local
- * Ollama server does not check it.
- *
- * @returns {{baseUrl: string, apiKey: string, model: string, embeddingModel: string,
- *   visionModel: string, visionMaxOutputTokens: number,
- *   contextWindow: number, maxOutputTokens: number, requestTimeoutMs: number,
- *   maxToolOutputChars: number}}
+ * Settings shared by every self-hosted preset, as the suffix after "AI_".
  */
-export function getOllamaConfig() {
-	// Named like Ollama's own server-side variable so the same value/line can
-	// be used on both sides; they must match Ollama's effective num_ctx.
-	// OLLAMA_CONTEXT_WINDOW is the deprecated former name, kept as fallback.
-	const contextWindow = parsePositiveInt(
-		process.env.OLLAMA_CONTEXT_LENGTH || process.env.OLLAMA_CONTEXT_WINDOW,
-		32768
-	);
-	const maxOutputTokens = parsePositiveInt(process.env.OLLAMA_MAX_OUTPUT_TOKENS, 4000);
+const COMMON_SETTINGS = [
+	"BASE_URL",
+	"API_KEY",
+	"MODEL",
+	"CONTEXT_LENGTH",
+	"MAX_OUTPUT_TOKENS",
+	"REQUEST_TIMEOUT_MS",
+	"MAX_TOOL_OUTPUT_CHARS",
+	"EMBEDDING_MODEL",
+	"EMBEDDING_BASE_URL",
+	"EMBEDDING_API_KEY",
+	"EMBEDDING_QUERY_PREFIX",
+	"EMBEDDING_DOCUMENT_PREFIX",
+];
 
-	// Inline cap for a single tool result: scales with the context window so
-	// raising OLLAMA_CONTEXT_LENGTH automatically allows bigger tool outputs
+/**
+ * Vendor prefix whose `<PREFIX>_<SETTING>` names are accepted as aliases of
+ * `AI_<SETTING>` for a preset. The generic preset has none.
+ */
+const ALIAS_PREFIX = {
+	[PROVIDER_OLLAMA]: "OLLAMA",
+	[PROVIDER_VLLM]: "VLLM",
+};
 
-	return {
-		baseUrl: (process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1").replace(/\/+$/, ""),
-		apiKey: process.env.OLLAMA_API_KEY || "ollama",
-		model: process.env.OLLAMA_MODEL || "qwen3.8:27b",
-		embeddingModel: process.env.OLLAMA_EMBEDDING_MODEL || "nomic-embed-text",
-		// Optional sidecar vision model used to describe image attachments as text
-		// (e.g. qwen3-vl:8b-instruct-8k). Empty = image descriptions disabled.
-		// Called through /v1/chat/completions: Ollama's /v1/responses has no image input.
-		// Vision models often enforce a small context (8k), so the description
-		// output cap must stay modest to leave room for the image tokens.
-		visionModel: (process.env.OLLAMA_VISION_MODEL || "").trim(),
-		visionMaxOutputTokens: parsePositiveInt(process.env.OLLAMA_VISION_MAX_OUTPUT_TOKENS, 600),
-		contextWindow,
-		maxOutputTokens,
-		requestTimeoutMs: parsePositiveInt(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 300000),
-		maxToolOutputChars: parsePositiveInt(
-			process.env.OLLAMA_MAX_TOOL_OUTPUT_CHARS,
-			defaultToolOutputChars(contextWindow, maxOutputTokens)
-		),
-	};
+/**
+ * Aliases that are NOT deprecated. OLLAMA_CONTEXT_LENGTH is deliberately named
+ * after Ollama's own server-side variable so the identical line can configure
+ * both the server (num_ctx) and the bot.
+ */
+const PERMANENT_ALIASES = new Set(["OLLAMA_CONTEXT_LENGTH"]);
+
+/**
+ * Former names that are no longer read at all, with their replacement (they
+ * are still reported by getDeprecatedAiVariables so operators notice).
+ */
+const REMOVED_VARIABLES = {
+	[PROVIDER_OLLAMA]: { OLLAMA_CONTEXT_WINDOW: "AI_CONTEXT_LENGTH" },
+};
+
+/**
+ * Read one common setting for a preset: the vendor alias wins over the AI_*
+ * name, which wins over the caller's default. Empty values count as unset
+ * unless `allowEmpty` is given (task prefixes: an empty override means "no
+ * prefix").
+ *
+ * @param {string} providerName - Preset ("ollama", "vllm", "openai-compatible")
+ * @param {string} setting - Suffix after "AI_" (e.g. "MODEL")
+ * @param {{allowEmpty?: boolean}} [options]
+ * @returns {{value: string|undefined, source: string}} The raw value and the
+ *   variable it came from; `source` is the canonical AI_* name when unset
+ */
+export function readAiSetting(providerName, setting, { allowEmpty = false } = {}) {
+	const canonical = `AI_${setting}`;
+	const prefix = ALIAS_PREFIX[providerName];
+	const candidates = prefix ? [`${prefix}_${setting}`, canonical] : [canonical];
+	for (const name of candidates) {
+		const raw = process.env[name];
+		if (raw === undefined) continue;
+		if (raw === "" && !allowEmpty) continue;
+		return { value: raw, source: name };
+	}
+	return { value: undefined, source: canonical };
 }
 
 /**
- * Get the vLLM backend configuration from environment variables.
+ * Deprecated vendor-prefixed variables currently set for a preset, with the
+ * AI_* name to use instead. Logged once at startup; the aliases keep working.
  *
- * VLLM_MODEL may be left unset: vLLM serves a single model per instance, so
- * the health check adopts the served model automatically. VLLM_CONTEXT_LENGTH
- * may also be left unset: the health check detects max_model_len via
- * /v1/models (an explicit smaller value still wins as a tighter budget).
- *
- * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
- *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
- *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean}}
+ * @param {string} [providerName] - Preset (defaults to the active one)
+ * @returns {Array<{name: string, replacement: string, removed: boolean}>}
  */
-export function getVllmConfig() {
-	const contextWindow = parsePositiveInt(process.env.VLLM_CONTEXT_LENGTH, 32768);
-	const maxOutputTokens = parsePositiveInt(process.env.VLLM_MAX_OUTPUT_TOKENS, 4000);
-
-	return {
-		baseUrl: (process.env.VLLM_BASE_URL || "http://localhost:8000/v1").replace(/\/+$/, ""),
-		apiKey: process.env.VLLM_API_KEY || "vllm",
-		model: (process.env.VLLM_MODEL || "").trim(),
-		contextWindow,
-		// "Explicit" means a VALID value: an invalid one falls back to the default
-		// and must not be treated as an operator decision
-		contextLengthExplicit: isPositiveInt(process.env.VLLM_CONTEXT_LENGTH),
-		maxOutputTokens,
-		requestTimeoutMs: parsePositiveInt(process.env.VLLM_REQUEST_TIMEOUT_MS, 300000),
-		maxToolOutputChars: parsePositiveInt(
-			process.env.VLLM_MAX_TOOL_OUTPUT_CHARS,
-			defaultToolOutputChars(contextWindow, maxOutputTokens)
-		),
-		maxToolOutputCharsExplicit: isPositiveInt(process.env.VLLM_MAX_TOOL_OUTPUT_CHARS),
-	};
+export function getDeprecatedAiVariables(providerName = getAiProviderName()) {
+	const found = [];
+	const prefix = ALIAS_PREFIX[providerName];
+	if (prefix) {
+		for (const setting of COMMON_SETTINGS) {
+			const alias = `${prefix}_${setting}`;
+			if (process.env[alias] !== undefined && !PERMANENT_ALIASES.has(alias)) {
+				found.push({ name: alias, replacement: `AI_${setting}`, removed: false });
+			}
+		}
+	}
+	for (const [name, replacement] of Object.entries(REMOVED_VARIABLES[providerName] || {})) {
+		if (process.env[name] !== undefined) {
+			found.push({ name, replacement, removed: true });
+		}
+	}
+	return found;
 }
 
 /**
- * Get the generic OpenAI-compatible backend configuration from environment
- * variables (AI_PROVIDER=openai-compatible).
+ * Build the common part of a self-hosted preset's configuration.
  *
- * This provider makes no assumption about the server beyond the OpenAI
- * Responses API surface: AI_MODEL is therefore required (a gateway typically
- * serves many models), image input is opt-in (AI_IMAGE_INPUT), the strict
- * chat-template conforming that vLLM needs is opt-in (AI_STRICT_INPUT), and
- * the knowledge base is enabled only when an embedding model is configured
- * (AI_EMBEDDING_MODEL, served from AI_EMBEDDING_BASE_URL or, by default, the
- * same base URL).
- *
+ * @param {string} providerName - Preset
+ * @param {{baseUrl: string, apiKey: string, model: string}} defaults - Preset defaults
  * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
  *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
  *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean,
- *   imageInput: boolean, strictInput: boolean}}
+ *   envNames: {model: string, contextLength: string, maxOutputTokens: string}}}
  */
-export function getOpenAiCompatibleConfig() {
-	const contextWindow = parsePositiveInt(process.env.AI_CONTEXT_LENGTH, 32768);
-	const maxOutputTokens = parsePositiveInt(process.env.AI_MAX_OUTPUT_TOKENS, 4000);
+function getCommonConfig(providerName, defaults) {
+	const read = (setting) => readAiSetting(providerName, setting);
+
+	const contextLength = read("CONTEXT_LENGTH");
+	const contextWindow = parsePositiveInt(contextLength.value, 32768);
+	const maxOutput = read("MAX_OUTPUT_TOKENS");
+	const maxOutputTokens = parsePositiveInt(maxOutput.value, 4000);
+	const maxToolOutput = read("MAX_TOOL_OUTPUT_CHARS");
 
 	return {
-		baseUrl: (process.env.AI_BASE_URL || "http://localhost:8000/v1").replace(/\/+$/, ""),
-		// Some gateways enforce a key, some ignore it; the SDK requires one either way
-		apiKey: process.env.AI_API_KEY || "none",
-		model: (process.env.AI_MODEL || "").trim(),
+		baseUrl: (read("BASE_URL").value || defaults.baseUrl).replace(/\/+$/, ""),
+		apiKey: read("API_KEY").value || defaults.apiKey,
+		model: (read("MODEL").value || defaults.model || "").trim(),
 		contextWindow,
 		// "Explicit" means a VALID value: an invalid one falls back to the default
 		// and must not be treated as an operator decision
-		contextLengthExplicit: isPositiveInt(process.env.AI_CONTEXT_LENGTH),
+		contextLengthExplicit: isPositiveInt(contextLength.value),
 		maxOutputTokens,
-		requestTimeoutMs: parsePositiveInt(process.env.AI_REQUEST_TIMEOUT_MS, 300000),
+		requestTimeoutMs: parsePositiveInt(read("REQUEST_TIMEOUT_MS").value, 300000),
 		maxToolOutputChars: parsePositiveInt(
-			process.env.AI_MAX_TOOL_OUTPUT_CHARS,
+			maxToolOutput.value,
 			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
-		maxToolOutputCharsExplicit: isPositiveInt(process.env.AI_MAX_TOOL_OUTPUT_CHARS),
+		maxToolOutputCharsExplicit: isPositiveInt(maxToolOutput.value),
+		// Variable names quoted in health-check messages: the alias actually in
+		// use, or the canonical AI_* name to set
+		envNames: {
+			model: read("MODEL").source,
+			contextLength: contextLength.source,
+			maxOutputTokens: maxOutput.source,
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the Ollama preset configuration.
+ *
+ * Common settings come from AI_* (or their OLLAMA_* aliases); the API key is a
+ * dummy value required by the OpenAI SDK that the Ollama server does not
+ * check. OLLAMA_VISION_MODEL / OLLAMA_VISION_MAX_OUTPUT_TOKENS are Ollama
+ * specific: the sidecar vision model that describes image attachments as text
+ * through /v1/chat/completions (Ollama's /v1/responses has no image input).
+ *
+ * @returns {ReturnType<typeof getCommonConfig> & {visionModel: string,
+ *   visionMaxOutputTokens: number}}
+ */
+export function getOllamaConfig() {
+	return {
+		...getCommonConfig(PROVIDER_OLLAMA, {
+			baseUrl: "http://localhost:11434/v1",
+			apiKey: "ollama",
+			model: "qwen3.8:27b",
+		}),
+		// Optional sidecar vision model (e.g. qwen3-vl:8b-instruct-8k). Empty =
+		// image descriptions disabled. Vision models often enforce a small
+		// context (8k), so the description output cap must stay modest to leave
+		// room for the image tokens.
+		visionModel: (process.env.OLLAMA_VISION_MODEL || "").trim(),
+		visionMaxOutputTokens: parsePositiveInt(process.env.OLLAMA_VISION_MAX_OUTPUT_TOKENS, 600),
+	};
+}
+
+/**
+ * Get the vLLM preset configuration.
+ *
+ * The model may be left unset: vLLM serves a single model per instance, so the
+ * health check adopts the served model automatically. The context length may
+ * also be left unset: the health check detects max_model_len via /v1/models
+ * (an explicit smaller value still wins as a tighter budget).
+ *
+ * @returns {ReturnType<typeof getCommonConfig>}
+ */
+export function getVllmConfig() {
+	return getCommonConfig(PROVIDER_VLLM, {
+		baseUrl: "http://localhost:8000/v1",
+		apiKey: "vllm",
+		model: "",
+	});
+}
+
+/**
+ * Get the generic OpenAI-compatible preset configuration.
+ *
+ * This preset makes no assumption about the server beyond the OpenAI Responses
+ * API surface: AI_MODEL is therefore required (a gateway typically serves many
+ * models), image input is opt-in (AI_IMAGE_INPUT) and the strict chat-template
+ * conforming that vLLM needs is opt-in (AI_STRICT_INPUT).
+ *
+ * @returns {ReturnType<typeof getCommonConfig> & {imageInput: boolean, strictInput: boolean}}
+ */
+export function getOpenAiCompatibleConfig() {
+	return {
+		...getCommonConfig(PROVIDER_OPENAI_COMPATIBLE, {
+			baseUrl: "http://localhost:8000/v1",
+			// Some gateways enforce a key, some ignore it; the SDK requires one either way
+			apiKey: "none",
+			model: "",
+		}),
 		imageInput: parseBooleanFlag(process.env.AI_IMAGE_INPUT, false),
 		strictInput: parseBooleanFlag(process.env.AI_STRICT_INPUT, false),
 	};
 }
+
+function getPresetConfig(providerName) {
+	switch (providerName) {
+		case PROVIDER_OLLAMA:
+			return getOllamaConfig();
+		case PROVIDER_VLLM:
+			return getVllmConfig();
+		case PROVIDER_OPENAI_COMPATIBLE:
+			return getOpenAiCompatibleConfig();
+		default:
+			return null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge-base embeddings
+// ---------------------------------------------------------------------------
 
 /**
  * Per-task `input_type` values an embedding API requires, if any.
@@ -274,53 +403,57 @@ export function getEmbeddingInputTypes(model) {
 }
 
 /**
- * Get the embedding backend for the local knowledge base, based on the active
- * AI provider. Returns null when no embedding backend applies (OpenAI mode
- * uses hosted file_search; vLLM mode needs a dedicated endpoint because a
- * vLLM instance serves a single model, so the chat instance cannot embed;
- * the generic openai-compatible mode needs AI_EMBEDDING_MODEL, served from
- * AI_EMBEDDING_BASE_URL or the chat base URL).
+ * Operator overrides for the embedding task prefixes
+ * (AI_EMBEDDING_QUERY_PREFIX / AI_EMBEDDING_DOCUMENT_PREFIX, or their OLLAMA_*
+ * aliases). Setting either one, even empty, replaces the per-model defaults.
  *
- * The openai-compatible entry may carry `inputTypes`: some embedding APIs
- * (NVIDIA NIM's nv-embedqa / nv-embed models) require a per-request
- * `input_type` of "query" or "passage" instead of, or in addition to, the text
- * prefixes other models use. Detected from the model name, overridable with
- * AI_EMBEDDING_QUERY_INPUT_TYPE / AI_EMBEDDING_DOCUMENT_INPUT_TYPE (set both
- * empty to send none).
+ * @param {string} [providerName] - Preset (defaults to the active one)
+ * @returns {{query: string, document: string}|null} null = no override
+ */
+export function getEmbeddingPrefixOverrides(providerName = getAiProviderName()) {
+	const query = readAiSetting(providerName, "EMBEDDING_QUERY_PREFIX", { allowEmpty: true });
+	const document = readAiSetting(providerName, "EMBEDDING_DOCUMENT_PREFIX", {
+		allowEmpty: true,
+	});
+	if (query.value === undefined && document.value === undefined) return null;
+	return { query: query.value || "", document: document.value || "" };
+}
+
+/**
+ * Get the embedding backend for the local knowledge base, based on the active
+ * AI provider. Returns null when no embedding backend applies: OpenAI mode uses
+ * hosted file_search; the other presets need AI_EMBEDDING_MODEL (Ollama
+ * defaults it to nomic-embed-text), served from AI_EMBEDDING_BASE_URL or, by
+ * default, the chat base URL with the chat API key. vLLM is the exception: a
+ * vLLM instance serves a single model, so the chat instance cannot embed and
+ * AI_EMBEDDING_BASE_URL must point to a dedicated endpoint.
+ *
+ * The entry carries `inputTypes`: some embedding APIs (NVIDIA NIM's nv-embedqa
+ * / nv-embed models) require a per-request `input_type` of "query" or
+ * "passage" instead of, or in addition to, the text prefixes other models use.
+ * Detected from the model name, overridable with AI_EMBEDDING_QUERY_INPUT_TYPE
+ * / AI_EMBEDDING_DOCUMENT_INPUT_TYPE (set both empty to send none).
  *
  * @param {string} [providerName] - Provider name (defaults to the active one)
  * @returns {{baseUrl: string, apiKey: string, model: string,
- *   inputTypes?: {query: string, document: string}}|null}
+ *   inputTypes: {query: string, document: string}}|null}
  */
 export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
-	if (providerName === PROVIDER_OLLAMA) {
-		const { baseUrl, apiKey, embeddingModel } = getOllamaConfig();
-		return { baseUrl, apiKey, model: embeddingModel };
-	}
+	const chat = getPresetConfig(providerName);
+	if (!chat) return null;
 
-	if (providerName === PROVIDER_VLLM) {
-		const baseUrl = (process.env.VLLM_EMBEDDING_BASE_URL || "").trim().replace(/\/+$/, "");
-		const model = (process.env.VLLM_EMBEDDING_MODEL || "").trim();
-		if (!baseUrl || !model) return null;
-		return {
-			baseUrl,
-			apiKey: process.env.VLLM_EMBEDDING_API_KEY || process.env.VLLM_API_KEY || "vllm",
-			model,
-		};
-	}
+	const read = (setting) => readAiSetting(providerName, setting).value;
+	const defaultModel = providerName === PROVIDER_OLLAMA ? "nomic-embed-text" : "";
+	const model = (read("EMBEDDING_MODEL") || defaultModel).trim();
+	if (!model) return null;
 
-	if (providerName === PROVIDER_OPENAI_COMPATIBLE) {
-		const chat = getOpenAiCompatibleConfig();
-		const model = (process.env.AI_EMBEDDING_MODEL || "").trim();
-		if (!model) return null;
-		const baseUrl = (process.env.AI_EMBEDDING_BASE_URL || "").trim().replace(/\/+$/, "");
-		return {
-			baseUrl: baseUrl || chat.baseUrl,
-			apiKey: process.env.AI_EMBEDDING_API_KEY || chat.apiKey,
-			model,
-			inputTypes: getEmbeddingInputTypes(model),
-		};
-	}
+	const baseUrl = (read("EMBEDDING_BASE_URL") || "").trim().replace(/\/+$/, "");
+	if (!baseUrl && providerName === PROVIDER_VLLM) return null;
 
-	return null;
+	return {
+		baseUrl: baseUrl || chat.baseUrl,
+		apiKey: read("EMBEDDING_API_KEY") || chat.apiKey,
+		model,
+		inputTypes: getEmbeddingInputTypes(model),
+	};
 }

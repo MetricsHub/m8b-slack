@@ -170,11 +170,11 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
    - `SLACK_BOT_TOKEN` - Bot OAuth token (xoxb-...)
    - `SLACK_APP_TOKEN` - App-level token (xapp-...)
    - `OPENAI_API_KEY` - OpenAI API key (OpenAI mode)
-3. To use a local model instead of OpenAI, set `AI_PROVIDER=ollama` plus
-   `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_EMBEDDING_MODEL`, or
-   `AI_PROVIDER=vllm` plus `VLLM_BASE_URL`/`VLLM_API_KEY` (and `M8B_MEDIA_*`
-   for URL-based screenshot handling), or `AI_PROVIDER=openai-compatible` plus
-   `AI_BASE_URL`/`AI_API_KEY`/`AI_MODEL` for any other endpoint — see README
+3. To use a self-hosted model instead of OpenAI, set `AI_PROVIDER` to `ollama`, `vllm`
+   or `openai-compatible` plus the COMMON variables `AI_BASE_URL`, `AI_API_KEY`,
+   `AI_MODEL`, `AI_CONTEXT_LENGTH`, `AI_EMBEDDING_MODEL` (and `M8B_MEDIA_*` for
+   URL-based screenshot handling with native-vision models) — see README. The former
+   `OLLAMA_*`/`VLLM_*` names are deprecated aliases
 
 ## Common Tasks
 
@@ -196,7 +196,7 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 
 1. Edit system prompt in `ai/config/system-prompt.js` (note: `buildSystemPrompt()` rewrites
    hosted-tool instructions for providers without them — keep its replacement strings in sync)
-2. Adjust model parameters in `MODEL_CONFIG` (OpenAI) or `OLLAMA_*` env vars (Ollama) if needed
+2. Adjust model parameters in `MODEL_CONFIG` (OpenAI) or the `AI_*` env vars (self-hosted modes) if needed
 3. Test conversationally before committing
 
 ### Working on the Provider Abstraction
@@ -204,6 +204,11 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 - Provider selection/config: `ai/config/providers.js`; provider objects: `ai/providers/`
 - Never scatter `if (provider === "ollama")` through the app — branch on
   `provider.capabilities.*` flags instead
+- Configuration: every self-hosted preset reads the same `AI_*` variables through
+  `readAiSetting()` in `ai/config/providers.js` (vendor alias > `AI_*` > preset default);
+  `AI_PROVIDER` only fixes defaults and quirks. Add a new common setting to `COMMON_SETTINGS`
+  (its `OLLAMA_*`/`VLLM_*` aliases follow automatically); add a vendor-prefixed variable only
+  for something that exists on one backend (like `OLLAMA_VISION_MODEL`)
 - Ollama's `/v1/responses` is stateless: no `previous_response_id`/`conversation`. Its request
   builder must only emit fields Ollama supports (model, input, instructions, tools, stream,
   temperature, top_p, max_output_tokens)
@@ -215,9 +220,11 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 - The generic `openai-compatible` provider (`ai/providers/openai-compatible-provider.js`) is the
   shared implementation: stateless, function tools only, universally supported request fields
   only. Model-dependent behaviors are OPTIONS (`imageInput`, `strictInput`,
-  `adoptSingleServedModel`), not hard-coded: `vllm` is a preset of it (all three on), the generic
-  mode reads them from `AI_IMAGE_INPUT`/`AI_STRICT_INPUT` and requires `AI_MODEL`. Add new
-  server-specific quirks as options there, never as `if (name === ...)` branches
+  `tolerateMissingModelList`), not hard-coded: `vllm` is a preset of it (images + strict input on,
+  model list required), the generic mode reads them from `AI_IMAGE_INPUT`/`AI_STRICT_INPUT`. Both
+  adopt the single served model when `AI_MODEL` is unset; `app.js` refuses to start when the
+  health check ends without a model. Add new server-specific quirks as options there, never as
+  `if (name === ...)` branches
 - In local modes (ollama/vllm/openai-compatible), never send data to OpenAI (no silent fallback)
 
 ## Key Files Reference

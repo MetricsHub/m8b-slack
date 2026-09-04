@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
+import { getDeprecatedAiVariables } from "./ai/config/providers.js";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
 import { isMediaStoreConfigured, startMediaCleanup } from "./ai/services/media-store.js";
@@ -54,6 +55,17 @@ const app = new App({
 		app.logger.info(`AI provider: ${aiProvider.name}`);
 		app.logger.info(`AI model: ${aiProvider.model}`);
 		app.logger.info(`AI endpoint: ${aiProvider.endpoint}`);
+		// Vendor-prefixed names (OLLAMA_*, VLLM_*) still work but the common
+		// AI_* vocabulary is the documented one: say so once, at startup
+		const deprecated = getDeprecatedAiVariables(aiProvider.name);
+		if (deprecated.length > 0) {
+			const list = deprecated
+				.map(
+					(d) => `${d.name} (${d.removed ? "no longer read" : "deprecated"}; use ${d.replacement})`
+				)
+				.join(", ");
+			app.logger.warn(`Deprecated AI configuration variables: ${list}`);
+		}
 		try {
 			if (aiProvider.name === "ollama") {
 				app.logger.info("Warming up the AI model (may take a minute on a cold server)...");
@@ -69,6 +81,14 @@ const app = new App({
 			}
 		} catch (e) {
 			app.logger.warn("AI backend health check errored", e);
+		}
+		// A backend that is merely unreachable may come back; a provider that
+		// ended up without a model never can serve a request (every call would
+		// go out with model ""), so that configuration is refused up front.
+		if (!aiProvider.model) {
+			throw new Error(
+				"No AI model configured: set AI_MODEL (or let the endpoint serve exactly one model). See the health check output above."
+			);
 		}
 
 		// Age-based cleanup of the local media store (screenshots saved for the

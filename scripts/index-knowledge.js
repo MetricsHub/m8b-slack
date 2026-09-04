@@ -3,12 +3,13 @@
  * Build (or rebuild) the local knowledge base embedding index from the markdown
  * documents in <KNOWLEDGE_BASE_DIR>/docs/.
  *
- * Requires a running embedding backend for the active AI provider:
- * - Ollama mode: the Ollama server with OLLAMA_EMBEDDING_MODEL pulled
- *   (e.g. ollama pull bge-m3)
- * - vLLM mode: a dedicated embedding endpoint via VLLM_EMBEDDING_BASE_URL
- *   and VLLM_EMBEDDING_MODEL (a vLLM instance serves a single model, so the
- *   chat instance cannot embed)
+ * Requires a running embedding backend for the active AI provider
+ * (AI_EMBEDDING_MODEL, served from AI_EMBEDDING_BASE_URL or the chat endpoint):
+ * - Ollama mode: the Ollama server with the embedding model pulled
+ *   (default nomic-embed-text; e.g. ollama pull bge-m3)
+ * - vLLM mode: a dedicated embedding endpoint via AI_EMBEDDING_BASE_URL
+ *   (a vLLM instance serves a single model, so the chat instance cannot embed)
+ * - openai-compatible mode: any model the gateway serves on /v1/embeddings
  *
  * Usage:
  *   node scripts/index-knowledge.js                 # full rebuild
@@ -27,7 +28,7 @@ async function main() {
 	if (!backend) {
 		console.error(
 			"No embedding backend is configured for this AI provider.\n" +
-				"Ollama mode: set OLLAMA_EMBEDDING_MODEL. vLLM mode: set VLLM_EMBEDDING_BASE_URL and VLLM_EMBEDDING_MODEL."
+				"Set AI_EMBEDDING_MODEL (vLLM mode also needs AI_EMBEDDING_BASE_URL pointing to a dedicated embedding endpoint)."
 		);
 		process.exit(1);
 	}
