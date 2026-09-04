@@ -8,11 +8,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import {
+	checkDeploymentNotesBudget,
 	getDeploymentContext,
 	getDeploymentNotes,
 	getOrganizationName,
 	loadDeploymentNotes,
-	checkDeploymentNotesBudget,
 	MAX_PROMPT_EXTRA_BUDGET_SHARE,
 	MAX_PROMPT_EXTRA_CHARS,
 	ORGANIZATION_LOOKUP_RETRY_MS,
