@@ -28,14 +28,6 @@
  *   instead of failing (never for vLLM, which always serves the route)
  */
 
-/**
- * Minimum number of tokens the prompt side (system prompt, tool schemas, the
- * conversation) must keep once the output reservation is subtracted from the
- * context window. Below this the deterministic trimmer cannot do its job and
- * the server rejects requests as the thread grows.
- */
-const MIN_PROMPT_BUDGET_TOKENS = 8000;
-
 import { OpenAI } from "openai";
 import {
 	defaultToolOutputChars,
@@ -47,6 +39,14 @@ import {
 	isMediaStoreConfigured,
 	replaceUnavailableMediaImages,
 } from "../services/media-store.js";
+
+/**
+ * Minimum number of tokens the prompt side (system prompt, tool schemas, the
+ * conversation) must keep once the output reservation is subtracted from the
+ * context window. Below this the deterministic trimmer cannot do its job and
+ * the server rejects requests as the thread grows.
+ */
+const MIN_PROMPT_BUDGET_TOKENS = 8000;
 
 /**
  * Conform input items to what a strict chat template accepts. Three documented
