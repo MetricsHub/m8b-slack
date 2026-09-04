@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
+import { loadDeploymentNotes, resolveOrganizationName } from "./ai/config/deployment.js";
 import { getDeprecatedAiVariables } from "./ai/config/providers.js";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
@@ -42,6 +43,20 @@ const app = new App({
 			context.BOT_ID = BOT_ID;
 			await next();
 		});
+
+		// Deployment-specific prompt context: the organization name comes from
+		// the Slack workspace (team.info, falling back to auth.test), and
+		// administrators may append notes with M8B_PROMPT_EXTRA(_FILE). An
+		// unreadable notes file is a configuration error, so it is loaded here
+		// where it stops the start-up rather than at the first message.
+		const organizationName = await resolveOrganizationName(app.client, app.logger);
+		app.logger.info(`Organization: ${organizationName || "(unknown — generic prompt wording)"}`);
+		const deploymentNotes = loadDeploymentNotes();
+		if (deploymentNotes) {
+			app.logger.info(
+				`Deployment notes appended to the system prompt (${deploymentNotes.length} chars)`
+			);
+		}
 
 		// Initialize MetricsHub MCP registry (discover tools/hosts)
 		try {

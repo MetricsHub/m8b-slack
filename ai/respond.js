@@ -15,6 +15,7 @@
  *   is used statelessly)
  */
 
+import { getDeploymentContext } from "./config/deployment.js";
 import { MAX_AGENT_ITERATIONS } from "./config/providers.js";
 import {
 	buildSystemPrompt,
@@ -406,9 +407,11 @@ async function respondCore({
 		// Build initial input
 		// OpenAI: skip base system prompt when previous_response_id exists (OpenAI maintains context)
 		// Ollama: always include the (capability-adapted) system prompt
-		const systemPrompt = stateless
-			? buildSystemPrompt(provider.capabilities, { contextWindow: provider.contextWindow })
-			: SYSTEM_PROMPT;
+		// Both: organization name + deployment notes come from the deployment context
+		const systemPrompt = buildSystemPrompt(provider.capabilities, {
+			contextWindow: stateless ? provider.contextWindow : undefined,
+			...getDeploymentContext(),
+		});
 		let input = buildInitialInput({
 			codeContainerFiles: fileManager.codeContainerFiles,
 			includeBasePrompt: stateless || !previousResponseId,

@@ -61,7 +61,7 @@ export function getMediaStoreConfig() {
 	return {
 		dir: process.env.M8B_MEDIA_DIR || DEFAULT_MEDIA_DIR,
 		// Public (internal-network) base URL the inference host fetches from,
-		// e.g. https://bm-linux-slack.internal.sentrysoftware.net/m8b-media
+		// e.g. https://m8b.internal.example.com/m8b-media
 		baseUrl: (process.env.M8B_MEDIA_BASE_URL || "").trim().replace(/\/+$/, ""),
 		retentionDays: parsePositiveInt(process.env.M8B_MEDIA_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
 		maxFileBytes: parsePositiveInt(process.env.M8B_MEDIA_MAX_FILE_BYTES, 10 * 1024 * 1024),

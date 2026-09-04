@@ -22,7 +22,7 @@ M8B is a Slack bot powered by OpenAI (hosted), Ollama or vLLM (both local, OpenA
 m8b-slackbot/
 ├── app.js                 # Entry point (logs AI provider + health check)
 ├── ai/
-│   ├── config/            # AI configuration (system prompt, model settings, provider env)
+│   ├── config/            # AI configuration (system prompt, deployment context, model settings, provider env)
 │   ├── providers/         # AI provider abstraction (openai / ollama / vllm / openai-compatible)
 │   ├── services/          # Core services (OpenAI, streaming, citations, local KB, etc.)
 │   ├── tools/             # OpenAI tool definitions
@@ -196,8 +196,12 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 
 1. Edit system prompt in `ai/config/system-prompt.js` (note: `buildSystemPrompt()` rewrites
    hosted-tool instructions for providers without them — keep its replacement strings in sync)
-2. Adjust model parameters in `MODEL_CONFIG` (OpenAI) or the `AI_*` env vars (self-hosted modes) if needed
-3. Test conversationally before committing
+2. Keep the prompt deployment-neutral: no company, teammate names, Slack user IDs, hostnames or
+   languages. The organization name is injected at runtime by `renderBasePrompt()` (resolved from
+   the Slack workspace in `ai/config/deployment.js`); anything else an installation needs goes in
+   the append-only overlay (`M8B_PROMPT_EXTRA` / `M8B_PROMPT_EXTRA_FILE`), never in the code
+3. Adjust model parameters in `MODEL_CONFIG` (OpenAI) or the `AI_*` env vars (self-hosted modes) if needed
+4. Test conversationally before committing
 
 ### Working on the Provider Abstraction
 
@@ -229,30 +233,31 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 
 ## Key Files Reference
 
-| File                                         | Purpose                                                              |
-| -------------------------------------------- | -------------------------------------------------------------------- |
-| `ai/respond.js`                              | Main AI response orchestrator                                        |
-| `ai/config/system-prompt.js`                 | AI personality and configuration                                     |
-| `ai/services/streaming.js`                   | OpenAI streaming response handling                                   |
-| `ai/services/function-calls.js`              | Tool/function call processing                                        |
-| `ai/services/tool-middleware.js`             | Tool output caching, compression, telemetry Markdown tables          |
-| `ai/tools/index.js`                          | OpenAI tool definitions                                              |
-| `ai/mcp_registry.js`                         | MCP server discovery and management                                  |
-| `ai/providers/index.js`                      | AI provider abstraction                                              |
-| `ai/providers/openai-compatible-provider.js` | Shared stateless Responses-API provider (generic mode + vLLM preset) |
-| `ai/config/providers.js`                     | Provider env configuration                                           |
-| `ai/services/conversation-store.js`          | App-side thread state (local modes)                                  |
-| `ai/services/thread-inbox.js`                | Queue/inject messages that arrive while a run is in flight           |
-| `ai/services/knowledge-base.js`              | Local RAG knowledge base (local modes)                               |
-| `ai/services/media-store.js`                 | Local image store served to the vLLM host by URL                     |
-| `ai/services/code-sandbox.js`                | Local Python sandbox for run_python (local modes, Pyodide)           |
-| `ai/services/sandbox-staging.js`             | Disk cache for attachments staged into the sandbox's /data           |
-| `ai/services/web-search.js`                  | App-side web search backends                                         |
-| `ai/services/metricshub-api.js`              | MetricsHub Agent REST API client (config files, encryption)          |
-| `ai/services/config-editor.js`               | Config-editing tool handlers (auth, validate, approve, save)         |
-| `ai/services/config-credentials.js`          | Thread-scoped {{CRED:...}} placeholders for secrets                  |
-| `ai/services/yaml-resources.js`              | Locate/splice resource entries in MetricsHub config YAML             |
-| `ai/services/slack-interactions.js`          | Pending human interactions (modals, approval buttons)                |
+| File                                         | Purpose                                                               |
+| -------------------------------------------- | --------------------------------------------------------------------- |
+| `ai/respond.js`                              | Main AI response orchestrator                                         |
+| `ai/config/system-prompt.js`                 | AI personality and configuration                                      |
+| `ai/services/streaming.js`                   | OpenAI streaming response handling                                    |
+| `ai/services/function-calls.js`              | Tool/function call processing                                         |
+| `ai/services/tool-middleware.js`             | Tool output caching, compression, telemetry Markdown tables           |
+| `ai/tools/index.js`                          | OpenAI tool definitions                                               |
+| `ai/mcp_registry.js`                         | MCP server discovery and management                                   |
+| `ai/providers/index.js`                      | AI provider abstraction                                               |
+| `ai/providers/openai-compatible-provider.js` | Shared stateless Responses-API provider (generic mode + vLLM preset)  |
+| `ai/config/providers.js`                     | Provider env configuration                                            |
+| `ai/config/deployment.js`                    | Org name from Slack + append-only prompt overlay (M8B_PROMPT_EXTRA\*) |
+| `ai/services/conversation-store.js`          | App-side thread state (local modes)                                   |
+| `ai/services/thread-inbox.js`                | Queue/inject messages that arrive while a run is in flight            |
+| `ai/services/knowledge-base.js`              | Local RAG knowledge base (local modes)                                |
+| `ai/services/media-store.js`                 | Local image store served to the vLLM host by URL                      |
+| `ai/services/code-sandbox.js`                | Local Python sandbox for run_python (local modes, Pyodide)            |
+| `ai/services/sandbox-staging.js`             | Disk cache for attachments staged into the sandbox's /data            |
+| `ai/services/web-search.js`                  | App-side web search backends                                          |
+| `ai/services/metricshub-api.js`              | MetricsHub Agent REST API client (config files, encryption)           |
+| `ai/services/config-editor.js`               | Config-editing tool handlers (auth, validate, approve, save)          |
+| `ai/services/config-credentials.js`          | Thread-scoped {{CRED:...}} placeholders for secrets                   |
+| `ai/services/yaml-resources.js`              | Locate/splice resource entries in MetricsHub config YAML              |
+| `ai/services/slack-interactions.js`          | Pending human interactions (modals, approval buttons)                 |
 
 ## Error Handling
 

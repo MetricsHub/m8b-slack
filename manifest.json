@@ -46,6 +46,7 @@
 				"groups:history",
 				"metadata.message:read",
 				"reactions:write",
+				"team:read",
 				"users:read"
 			]
 		}

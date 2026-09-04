@@ -183,6 +183,10 @@ NODE_ENV=production
 SLACK_API_URL=https://slack.com/api
 AI_MAX_AGENT_ITERATIONS=15   # cap on model->tools->model loops per message
 
+# System prompt overlay (append-only, see "Customizing the system prompt")
+M8B_PROMPT_EXTRA_FILE=/etc/m8b-slack/deployment-notes.md
+# M8B_PROMPT_EXTRA="Storage alerts go to #storage-ops."
+
 # MetricsHub MCP Server (single server mode)
 MCP_AGENT_URL=https://metricshub.example.com/sse
 MCP_AGENT_TOKEN=...
@@ -195,6 +199,33 @@ M8B_PROMETHEUS_URL=http://prometheus.example.com:9090
 OPENAI_VECTOR_STORE_IDS=vs_123,vs_456
 # Or single ID:
 OPENAI_VECTOR_STORE_ID=vs_123
+```
+
+### Customizing the system prompt
+
+The system prompt (`ai/config/system-prompt.js`) is deployment-neutral and ships with the bot:
+the persona, the safety rules (no fabrication, action boundaries, credential handling) and the
+tool guidance are the same for every installation and are not configurable. Two things adapt it
+to your organization:
+
+- **Organization name.** Resolved once at startup from the Slack workspace: `team.info` (needs
+  the `team:read` bot scope, included in `manifest.json`), falling back to the team name returned
+  by `auth.test` when the scope is missing (existing installations: re-install the app from the
+  updated manifest to grant it). The name is injected where the prompt refers to the company
+  ("...system administrator for _Acme Corp_'s IT team"); without it the wording stays generic.
+- **Deployment notes** (optional, append-only). `M8B_PROMPT_EXTRA_FILE` points to a Markdown or
+  text file and/or `M8B_PROMPT_EXTRA` holds inline text; both are appended, file first, as a
+  clearly delimited "Deployment notes" section at the end of the prompt. Use them for what the
+  model cannot discover on its own: who handles what, host naming conventions, sites, local
+  habits. The notes complement the built-in rules and are presented to the model as such — they
+  can never replace or relax them. An unreadable file or notes longer than 20,000 characters
+  stop the bot at startup (reference material belongs in the knowledge base, not in the prompt).
+
+The bot logs the resolved organization and the size of the appended notes at startup:
+
+```text
+Organization: Acme Corp
+Deployment notes appended to the system prompt (412 chars)
 ```
 
 ### Self-hosted backends: common variables
@@ -549,6 +580,10 @@ You will need two tokens from Slack:
 
 - **SLACK_BOT_TOKEN** (Bot User OAuth Token)
 - **SLACK_APP_TOKEN** (App-level token with `connections:write`)
+
+The `team:read` bot scope lets the bot read the workspace name for its system prompt (see
+"Customizing the system prompt"). It is optional: without it the bot falls back to the team name
+from `auth.test` and logs a warning at startup.
 
 ## Production Deployment
 
