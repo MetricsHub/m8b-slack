@@ -90,6 +90,47 @@ const threadResponseCache = new Map();
 const SLACK_SAFE_LENGTH = 35000; // Leave buffer for markdown formatting overhead (Slack limit is ~40k)
 
 /**
+ * Upper bound on thread pages fetched when a whole thread must be replayed
+ * (Slack caps a page at 1000 messages; a thread this long is pathological).
+ */
+const MAX_THREAD_PAGES = 20;
+
+/**
+ * Follow conversations.replies pagination from an already-fetched first page
+ * and return the complete thread (first page + every following page).
+ * On a Slack error midway, returns what was collected so far: a partial
+ * replay is still better than the chain it replaces.
+ *
+ * @param {Object} client - Slack WebClient
+ * @param {Object} repliesArgs - Arguments used for the first page (channel, ts, ...)
+ * @param {Object} firstPage - Result of the first conversations.replies call
+ * @param {Object} [logger]
+ * @returns {Promise<Array>} All thread messages in Slack order
+ */
+async function fetchRemainingThreadPages(client, repliesArgs, firstPage, logger) {
+	const messages = [...(firstPage.messages || [])];
+	let cursor = firstPage.response_metadata?.next_cursor;
+	let pages = 0;
+	while (cursor && pages < MAX_THREAD_PAGES) {
+		pages += 1;
+		let page;
+		try {
+			page = await client.conversations.replies({ ...repliesArgs, limit: 200, cursor });
+		} catch (e) {
+			logger?.warn?.("Failed to fetch a further thread page; replaying what was collected", {
+				message: e?.message,
+				pages,
+			});
+			break;
+		}
+		messages.push(...(page.messages || []));
+		cursor = page.has_more ? page.response_metadata?.next_cursor : null;
+	}
+	logger?.info?.(`[Context] Fetched full thread: ${messages.length} messages (${pages + 1} pages)`);
+	return messages;
+}
+
+/**
  * Slack message metadata that lets a later turn resume a hosted (OpenAI)
  * chain: the response to continue from, the files already uploaded, and the
  * fingerprint of the system prompt the chain runs under (see
@@ -340,7 +381,50 @@ async function respondCore({
 			await new Promise((resolve) => setTimeout(resolve, 1000));
 			thread = await client.conversations.replies(repliesArgs);
 		}
-		const messages = thread.messages || [];
+		let messages = thread.messages || [];
+
+		// System prompt: capability-adapted (Ollama), plus the organization name of
+		// the workspace this message comes from and the deployment notes (both modes)
+		const systemPrompt = buildSystemPrompt(provider.capabilities, {
+			contextWindow: stateless ? provider.contextWindow : undefined,
+			...(await getDeploymentContext({ client, teamId, logger })),
+		});
+		const promptVersion = systemPromptVersion(systemPrompt);
+
+		// Determine conversation continuity strategy
+		let previousResponseId = null;
+		// Hosted chains only carry the system prompt from their first turn: when
+		// the thread was started under another prompt (older code, changed
+		// deployment notes) the chain is dropped and re-seeded with the current
+		// prompt plus the whole thread history rebuilt from Slack
+		let restartHostedChain = false;
+		if (!stateless) {
+			// Find previous bot response for continuity
+			const lastBot = findLastBotMessage(messages, context, logger);
+
+			// Try cache first (always this process's prompt), fall back to message metadata
+			const cachedResponseId = threadResponseCache.get(thread_ts);
+			if (cachedResponseId) {
+				previousResponseId = cachedResponseId;
+			} else if (lastBot.responseId && lastBot.promptVersion !== promptVersion) {
+				restartHostedChain = true;
+				logger.info(
+					`Previous response ${lastBot.responseId} was produced under system prompt ${lastBot.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
+				);
+			} else {
+				previousResponseId = lastBot.responseId;
+			}
+			logger.info(
+				`Previous response ID: ${previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
+			);
+		}
+
+		// A restarted chain replays the whole thread: the first page above is
+		// only a window, so fetch the remaining pages before dropping the
+		// server-side chain that held the older turns
+		if (restartHostedChain && thread.has_more) {
+			messages = await fetchRemainingThreadPages(client, repliesArgs, thread, logger);
+		}
 
 		// Human participants in this thread (bot messages excluded). Used to warn
 		// the approving admin when other people could have injected instructions.
@@ -413,42 +497,6 @@ async function respondCore({
 		// explicitly (base 1500 covers the chat template and framing)
 		const trimReserveTokens =
 			1500 + Math.ceil(JSON.stringify(tools || []).length / PAYLOAD_CHARS_PER_TOKEN);
-
-		// System prompt: capability-adapted (Ollama), plus the organization name of
-		// the workspace this message comes from and the deployment notes (both modes)
-		const systemPrompt = buildSystemPrompt(provider.capabilities, {
-			contextWindow: stateless ? provider.contextWindow : undefined,
-			...(await getDeploymentContext({ client, teamId, logger })),
-		});
-		const promptVersion = systemPromptVersion(systemPrompt);
-
-		// Determine conversation continuity strategy
-		let previousResponseId = null;
-		// Hosted chains only carry the system prompt from their first turn: when
-		// the thread was started under another prompt (older code, changed
-		// deployment notes) the chain is dropped and re-seeded with the current
-		// prompt plus the whole thread history rebuilt from Slack
-		let restartHostedChain = false;
-		if (!stateless) {
-			// Find previous bot response for continuity
-			const lastBot = findLastBotMessage(messages, context, logger);
-
-			// Try cache first (always this process's prompt), fall back to message metadata
-			const cachedResponseId = threadResponseCache.get(thread_ts);
-			if (cachedResponseId) {
-				previousResponseId = cachedResponseId;
-			} else if (lastBot.responseId && lastBot.promptVersion !== promptVersion) {
-				restartHostedChain = true;
-				logger.info(
-					`Previous response ${lastBot.responseId} was produced under system prompt ${lastBot.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
-				);
-			} else {
-				previousResponseId = lastBot.responseId;
-			}
-			logger.info(
-				`Previous response ID: ${previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
-			);
-		}
 
 		// Build initial input
 		// OpenAI: skip base system prompt when previous_response_id exists (OpenAI maintains context)

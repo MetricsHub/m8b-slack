@@ -1,6 +1,10 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
-import { loadDeploymentNotes, resolveOrganizationName } from "./ai/config/deployment.js";
+import {
+	checkDeploymentNotesBudget,
+	loadDeploymentNotes,
+	resolveOrganizationName,
+} from "./ai/config/deployment.js";
 import { getDeprecatedAiVariables } from "./ai/config/providers.js";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
@@ -105,6 +109,17 @@ const app = new App({
 			throw new Error(
 				"No AI model configured: set AI_MODEL (or let the endpoint serve exactly one model). See the health check output above."
 			);
+		}
+		// The context window is only final after the health check (the server's
+		// value may have capped it); deployment notes that cannot fit in it would
+		// make every request fail, so that configuration is refused too
+		const notesBudgetError = checkDeploymentNotesBudget({
+			notes: deploymentNotes,
+			contextWindow: aiProvider.contextWindow,
+			maxOutputTokens: aiProvider.maxOutputTokens,
+		});
+		if (notesBudgetError) {
+			throw new Error(notesBudgetError);
 		}
 
 		// Age-based cleanup of the local media store (screenshots saved for the

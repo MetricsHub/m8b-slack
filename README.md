@@ -221,8 +221,10 @@ to your organization:
   clearly delimited "Deployment notes" section at the end of the prompt. Use them for what the
   model cannot discover on its own: who handles what, host naming conventions, sites, local
   habits. The notes complement the built-in rules and are presented to the model as such — they
-  can never replace or relax them. An unreadable file or notes longer than 20,000 characters
-  stop the bot at startup (reference material belongs in the knowledge base, not in the prompt).
+  can never replace or relax them. An unreadable file, notes longer than 20,000 characters, or
+  notes that would take more than a quarter of a self-hosted model's prompt budget (context window
+  minus the output reservation) stop the bot at startup: reference material belongs in the
+  knowledge base, not in the prompt.
 
 Changes take effect on restart, including for threads that are already open: in OpenAI mode each
 reply carries a fingerprint of the system prompt it ran under, and a thread whose chain was started

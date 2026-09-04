@@ -22,6 +22,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { estimatePayloadTokens } from "../utils/tokens.js";
 
 /** Environment variable holding the path to a prompt overlay file. */
 export const PROMPT_EXTRA_FILE_VAR = "M8B_PROMPT_EXTRA_FILE";
@@ -35,14 +36,25 @@ export const PROMPT_EXTRA_VAR = "M8B_PROMPT_EXTRA";
  */
 export const MAX_PROMPT_EXTRA_CHARS = 20000;
 
+/**
+ * How long a failed workspace-name lookup is remembered before the workspace
+ * is asked about again. Long enough that a workspace Slack cannot describe
+ * (missing scope, unknown team) is not queried on every message, short enough
+ * that a transient Slack error does not pin the wrong name until restart.
+ */
+export const ORGANIZATION_LOOKUP_RETRY_MS = 10 * 60 * 1000;
+
 /** Name of the workspace the bot is installed in (startup), or null. */
 let defaultOrganizationName = null;
 /**
- * Workspace names by team ID. A null value records a failed lookup so a
- * workspace that cannot be resolved is not queried again on every message.
- * @type {Map<string, string|null>}
+ * Workspace names by team ID. A failed lookup is recorded with the time it
+ * may be retried (see ORGANIZATION_LOOKUP_RETRY_MS).
+ * @type {Map<string, {name: string}|{retryAt: number}>}
  */
 const organizationNames = new Map();
+
+/** Deployment notes may use at most this share of the prompt-side token budget. */
+export const MAX_PROMPT_EXTRA_BUDGET_SHARE = 0.25;
 /** @type {string|null} null = not loaded yet */
 let deploymentNotes = null;
 
@@ -67,7 +79,11 @@ function normalizeName(name) {
 export function setOrganizationName(name, teamId) {
 	const normalized = normalizeName(name);
 	if (teamId) {
-		organizationNames.set(teamId, normalized);
+		if (normalized) {
+			organizationNames.set(teamId, { name: normalized });
+		} else {
+			organizationNames.delete(teamId);
+		}
 	} else {
 		defaultOrganizationName = normalized;
 	}
@@ -82,10 +98,26 @@ export function setOrganizationName(name, teamId) {
  * @returns {string|null}
  */
 export function getOrganizationName(teamId) {
-	if (teamId && organizationNames.get(teamId)) {
-		return organizationNames.get(teamId);
+	const entry = teamId ? organizationNames.get(teamId) : undefined;
+	if (entry && "name" in entry) {
+		return entry.name;
 	}
 	return defaultOrganizationName;
+}
+
+/**
+ * Whether a workspace needs (re)resolving: never seen, or its last lookup
+ * failed long enough ago to be worth another try.
+ *
+ * @param {string} teamId
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+function needsResolution(teamId, now = Date.now()) {
+	const entry = organizationNames.get(teamId);
+	if (!entry) return true;
+	if ("name" in entry) return false;
+	return entry.retryAt <= now;
 }
 
 /**
@@ -133,15 +165,20 @@ export async function resolveOrganizationName(client, { teamId, logger = console
 		setOrganizationName(name);
 	}
 	if (resolvedTeamId) {
-		// Cache per workspace (a failed lookup too, so it is not retried per message)
-		organizationNames.set(resolvedTeamId, name);
+		// Cache per workspace; a failed lookup is remembered for a while so it is
+		// neither retried on every message nor pinned until the next restart
+		organizationNames.set(
+			resolvedTeamId,
+			name ? { name } : { retryAt: Date.now() + ORGANIZATION_LOOKUP_RETRY_MS }
+		);
 	}
 	return name;
 }
 
 /**
  * The organization name for the workspace a message comes from, resolving
- * (once) workspaces not seen before. Falls back to the startup default.
+ * workspaces not seen before (and retrying failed lookups after
+ * ORGANIZATION_LOOKUP_RETRY_MS). Falls back to the startup default.
  *
  * @param {Object} params
  * @param {Object} [params.client] - Slack WebClient (needed to resolve a new workspace)
@@ -150,7 +187,7 @@ export async function resolveOrganizationName(client, { teamId, logger = console
  * @returns {Promise<string|null>}
  */
 export async function resolveOrganizationNameFor({ client, teamId, logger = console }) {
-	if (teamId && client && !organizationNames.has(teamId)) {
+	if (teamId && client && needsResolution(teamId)) {
 		await resolveOrganizationName(client, { teamId, logger });
 	}
 	return getOrganizationName(teamId);
@@ -194,6 +231,31 @@ export function readDeploymentNotes(env = process.env) {
 		);
 	}
 	return notes;
+}
+
+/**
+ * Check that the deployment notes fit the active provider's context window.
+ *
+ * The character cap (MAX_PROMPT_EXTRA_CHARS) protects large-context models;
+ * a small local context can still be swamped by a note that passes it: the
+ * leading system prompt is never trimmed by the context-budget trimmer, so
+ * an oversized one makes every request fail. The notes may use at most
+ * MAX_PROMPT_EXTRA_BUDGET_SHARE of the prompt-side budget (context window
+ * minus the output reservation).
+ *
+ * @param {Object} params
+ * @param {string} params.notes - Deployment notes text
+ * @param {number} [params.contextWindow] - Provider context window in tokens (unknown = no check)
+ * @param {number} [params.maxOutputTokens] - Output token reservation per turn
+ * @returns {string|null} An error message when the notes do not fit, else null
+ */
+export function checkDeploymentNotesBudget({ notes, contextWindow, maxOutputTokens = 0 }) {
+	if (!notes || !Number.isFinite(contextWindow) || contextWindow <= 0) return null;
+	const promptBudget = Math.max(contextWindow - (maxOutputTokens || 0), 0);
+	const allowance = Math.floor(promptBudget * MAX_PROMPT_EXTRA_BUDGET_SHARE);
+	const tokens = estimatePayloadTokens(notes);
+	if (tokens <= allowance) return null;
+	return `Deployment notes (${PROMPT_EXTRA_VAR}/${PROMPT_EXTRA_FILE_VAR}) are too long for this model: about ${tokens} tokens, but only ${allowance} (${Math.round(MAX_PROMPT_EXTRA_BUDGET_SHARE * 100)}% of the ${promptBudget}-token prompt budget: ${contextWindow} context minus ${maxOutputTokens || 0} output) may go to the notes. Shorten them or use a model with a larger context window.`;
 }
 
 /**

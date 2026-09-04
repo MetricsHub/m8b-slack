@@ -241,6 +241,76 @@ describe("respond in OpenAI mode: system prompt versioning", () => {
 		expect(text).toContain("Is SRV-WEB-01 okay?");
 	});
 
+	it("fetches every thread page before replaying a restarted chain", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Disks are fine."));
+		const threadTs = `200.${threadCounter}`;
+		const firstPage = [
+			{ ts: threadTs, user: "U1", text: "Is SRV-WEB-01 okay?" },
+			{
+				ts: `${threadTs}2`,
+				bot_id: "B1",
+				text: "It is fine. Obviously.",
+				metadata: { event_type: "openai_context", event_payload: { response_id: "resp_old" } },
+			},
+		];
+		const secondPage = [
+			{ ts: `${threadTs}5`, user: "U1", text: "What about SRV-DB-02?" },
+			{
+				ts: `${threadTs}7`,
+				bot_id: "B1",
+				text: "Also fine. Stop asking.",
+				metadata: { event_type: "openai_context", event_payload: { response_id: "resp_old2" } },
+			},
+			{ ts: `${threadTs}9`, user: "U1", text: "And its disks?" },
+		];
+		const harness = makeHarness({ threadTs, threadMessages: firstPage });
+		harness.client.conversations.replies = jest
+			.fn()
+			.mockResolvedValueOnce({
+				messages: firstPage,
+				has_more: true,
+				response_metadata: { next_cursor: "cursor-2" },
+			})
+			.mockResolvedValueOnce({ messages: secondPage, has_more: false });
+
+		await runRespond(harness);
+
+		expect(harness.client.conversations.replies).toHaveBeenCalledTimes(2);
+		expect(harness.client.conversations.replies).toHaveBeenLastCalledWith(
+			expect.objectContaining({ channel: "C1", ts: threadTs, cursor: "cursor-2", limit: 200 })
+		);
+		const [params] = streamOnceMock.mock.calls[0];
+		expect(params.previous_response_id).toBeFalsy();
+		const text = allText(params.input);
+		expect(text).toContain("Is SRV-WEB-01 okay?");
+		expect(text).toContain("It is fine. Obviously.");
+		expect(text).toContain("What about SRV-DB-02?");
+		expect(text).toContain("Also fine. Stop asking.");
+		expect(text).toContain("And its disks?");
+	});
+
+	it("does not page through the thread when the chain simply continues", async () => {
+		streamOnceMock.mockResolvedValueOnce(textResult("Disks are fine."));
+		const threadTs = `200.${threadCounter}`;
+		const harness = makeHarness({ threadTs, threadMessages: [] });
+		harness.client.conversations.replies = jest.fn().mockResolvedValue({
+			messages: threadWith(
+				{
+					event_type: "openai_context",
+					event_payload: { response_id: "resp_old", prompt_version: currentPromptVersion() },
+				},
+				threadTs
+			),
+			has_more: true,
+			response_metadata: { next_cursor: "cursor-2" },
+		});
+
+		await runRespond(harness);
+
+		expect(harness.client.conversations.replies).toHaveBeenCalledTimes(1);
+		expect(streamOnceMock.mock.calls[0][0].previous_response_id).toBe("resp_old");
+	});
+
 	it("stamps the current prompt version into the reply's Slack metadata", async () => {
 		streamOnceMock.mockImplementationOnce(async (_params, { onStreamStart }) => {
 			await onStreamStart("resp_new");
