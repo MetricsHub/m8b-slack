@@ -16,6 +16,7 @@ import {
 	readDeploymentNotes,
 	resetDeploymentContext,
 	resolveOrganizationName,
+	resolveOrganizationNameFor,
 	setOrganizationName,
 } from "../deployment.js";
 
@@ -103,12 +104,16 @@ describe("organization name", () => {
 
 	it("comes from team.info when the scope is granted", async () => {
 		const client = {
-			team: { info: jest.fn().mockResolvedValue({ ok: true, team: { name: "Acme Corp" } }) },
+			team: {
+				info: jest.fn().mockResolvedValue({ ok: true, team: { id: "T1", name: "Acme Corp" } }),
+			},
 			auth: { test: jest.fn() },
 		};
 		const logger = { warn: jest.fn() };
-		await expect(resolveOrganizationName(client, logger)).resolves.toBe("Acme Corp");
+		await expect(resolveOrganizationName(client, { logger })).resolves.toBe("Acme Corp");
+		expect(client.team.info).toHaveBeenCalledWith({});
 		expect(getOrganizationName()).toBe("Acme Corp");
+		expect(getOrganizationName("T1")).toBe("Acme Corp");
 		expect(client.auth.test).not.toHaveBeenCalled();
 		expect(logger.warn).not.toHaveBeenCalled();
 	});
@@ -119,10 +124,11 @@ describe("organization name", () => {
 		});
 		const client = {
 			team: { info: jest.fn().mockRejectedValue(missingScope) },
-			auth: { test: jest.fn().mockResolvedValue({ ok: true, team: "Acme (auth)" }) },
+			auth: { test: jest.fn().mockResolvedValue({ ok: true, team: "Acme (auth)", team_id: "T1" }) },
 		};
 		const logger = { warn: jest.fn() };
-		await expect(resolveOrganizationName(client, logger)).resolves.toBe("Acme (auth)");
+		await expect(resolveOrganizationName(client, { logger })).resolves.toBe("Acme (auth)");
+		expect(getOrganizationName("T1")).toBe("Acme (auth)");
 		expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("missing_scope"));
 		expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("team:read"));
 	});
@@ -132,18 +138,77 @@ describe("organization name", () => {
 			team: { info: jest.fn().mockRejectedValue(new Error("boom")) },
 			auth: { test: jest.fn().mockRejectedValue(new Error("boom too")) },
 		};
-		await expect(resolveOrganizationName(client, { warn: jest.fn() })).resolves.toBeNull();
+		await expect(
+			resolveOrganizationName(client, { logger: { warn: jest.fn() } })
+		).resolves.toBeNull();
 		expect(getOrganizationName()).toBeNull();
+	});
+
+	it("resolves other workspaces of an org-wide install by team ID, once", async () => {
+		setOrganizationName("Acme HQ", "T1");
+		setOrganizationName("Acme HQ");
+		const client = {
+			team: {
+				info: jest.fn().mockResolvedValue({ ok: true, team: { id: "T2", name: "Acme Labs" } }),
+			},
+			auth: { test: jest.fn() },
+		};
+		await expect(resolveOrganizationNameFor({ client, teamId: "T2" })).resolves.toBe("Acme Labs");
+		expect(client.team.info).toHaveBeenCalledWith({ team: "T2" });
+		await expect(resolveOrganizationNameFor({ client, teamId: "T2" })).resolves.toBe("Acme Labs");
+		expect(client.team.info).toHaveBeenCalledTimes(1);
+		// The default (installing workspace) is untouched
+		expect(getOrganizationName()).toBe("Acme HQ");
+		expect(getOrganizationName("T1")).toBe("Acme HQ");
+		expect(client.auth.test).not.toHaveBeenCalled();
+	});
+
+	it("falls back to the startup name for a workspace it cannot resolve, without retrying", async () => {
+		setOrganizationName("Acme HQ");
+		const client = {
+			team: { info: jest.fn().mockRejectedValue(new Error("team_not_found")) },
+			auth: { test: jest.fn() },
+		};
+		const logger = { warn: jest.fn() };
+		await expect(resolveOrganizationNameFor({ client, teamId: "T9", logger })).resolves.toBe(
+			"Acme HQ"
+		);
+		await expect(resolveOrganizationNameFor({ client, teamId: "T9", logger })).resolves.toBe(
+			"Acme HQ"
+		);
+		expect(client.team.info).toHaveBeenCalledTimes(1);
+		// auth.test only names the installing workspace: never used for another team
+		expect(client.auth.test).not.toHaveBeenCalled();
+	});
+
+	it("uses the startup name when the message carries no team ID or client", async () => {
+		setOrganizationName("Acme HQ");
+		await expect(resolveOrganizationNameFor({})).resolves.toBe("Acme HQ");
+		await expect(resolveOrganizationNameFor({ teamId: "T5" })).resolves.toBe("Acme HQ");
 	});
 });
 
 describe("getDeploymentContext", () => {
-	it("bundles the organization name and the notes for buildSystemPrompt", () => {
+	it("bundles the organization name and the notes for buildSystemPrompt", async () => {
 		setOrganizationName("Acme Corp");
 		loadDeploymentNotes({ M8B_PROMPT_EXTRA: "Note." });
-		expect(getDeploymentContext()).toEqual({
+		await expect(getDeploymentContext()).resolves.toEqual({
 			organizationName: "Acme Corp",
 			deploymentNotes: "Note.",
+		});
+	});
+
+	it("picks the name of the workspace the message comes from", async () => {
+		setOrganizationName("Acme HQ");
+		setOrganizationName("Acme Labs", "T2");
+		loadDeploymentNotes({});
+		await expect(getDeploymentContext({ teamId: "T2" })).resolves.toEqual({
+			organizationName: "Acme Labs",
+			deploymentNotes: "",
+		});
+		await expect(getDeploymentContext({ teamId: "T1" })).resolves.toEqual({
+			organizationName: "Acme HQ",
+			deploymentNotes: "",
 		});
 	});
 });

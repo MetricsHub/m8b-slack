@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * System prompt configuration for M8B bot.
  * Centralized location for the AI's personality and behavioral rules.
@@ -216,6 +218,23 @@ export function buildSystemPrompt(
 	}
 
 	return prompt;
+}
+
+/**
+ * Short fingerprint of a system prompt text.
+ *
+ * Hosted (OpenAI) threads chain on previous_response_id and only send the
+ * system prompt once, on the first turn. The fingerprint is stored with each
+ * response ID in Slack message metadata so that a thread whose chain was
+ * started under a different prompt (code change, new deployment notes, other
+ * organization name) is re-seeded with the current prompt and its full
+ * history instead of carrying the old instructions forever.
+ *
+ * @param {string} prompt - Final system prompt text
+ * @returns {string} 12 hex characters
+ */
+export function systemPromptVersion(prompt) {
+	return createHash("sha1").update(String(prompt)).digest("hex").slice(0, 12);
 }
 
 /**

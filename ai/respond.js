@@ -21,6 +21,7 @@ import {
 	buildSystemPrompt,
 	LOADING_MESSAGES,
 	SYSTEM_PROMPT,
+	systemPromptVersion,
 	TOKEN_LIMITS,
 } from "./config/system-prompt.js";
 import { getMcpServerCount } from "./mcp_registry.js";
@@ -87,6 +88,29 @@ const threadResponseCache = new Map();
  * Slack message length limits
  */
 const SLACK_SAFE_LENGTH = 35000; // Leave buffer for markdown formatting overhead (Slack limit is ~40k)
+
+/**
+ * Slack message metadata that lets a later turn resume a hosted (OpenAI)
+ * chain: the response to continue from, the files already uploaded, and the
+ * fingerprint of the system prompt the chain runs under (see
+ * systemPromptVersion(); a mismatch on the next turn restarts the chain).
+ *
+ * @param {Object} params
+ * @param {string} params.responseId
+ * @param {*} params.uploadedFiles
+ * @param {string} params.promptVersion
+ * @returns {{event_type: string, event_payload: Object}}
+ */
+function openaiContextMetadata({ responseId, uploadedFiles, promptVersion }) {
+	return {
+		event_type: "openai_context",
+		event_payload: {
+			response_id: responseId,
+			uploaded_files: uploadedFiles,
+			prompt_version: promptVersion,
+		},
+	};
+}
 
 /**
  * Tools whose results never change the answer (pure Slack side effects).
@@ -390,15 +414,37 @@ async function respondCore({
 		const trimReserveTokens =
 			1500 + Math.ceil(JSON.stringify(tools || []).length / PAYLOAD_CHARS_PER_TOKEN);
 
+		// System prompt: capability-adapted (Ollama), plus the organization name of
+		// the workspace this message comes from and the deployment notes (both modes)
+		const systemPrompt = buildSystemPrompt(provider.capabilities, {
+			contextWindow: stateless ? provider.contextWindow : undefined,
+			...(await getDeploymentContext({ client, teamId, logger })),
+		});
+		const promptVersion = systemPromptVersion(systemPrompt);
+
 		// Determine conversation continuity strategy
 		let previousResponseId = null;
+		// Hosted chains only carry the system prompt from their first turn: when
+		// the thread was started under another prompt (older code, changed
+		// deployment notes) the chain is dropped and re-seeded with the current
+		// prompt plus the whole thread history rebuilt from Slack
+		let restartHostedChain = false;
 		if (!stateless) {
 			// Find previous bot response for continuity
 			const lastBot = findLastBotMessage(messages, context, logger);
 
-			// Try cache first, fall back to message metadata
+			// Try cache first (always this process's prompt), fall back to message metadata
 			const cachedResponseId = threadResponseCache.get(thread_ts);
-			previousResponseId = cachedResponseId || lastBot.responseId;
+			if (cachedResponseId) {
+				previousResponseId = cachedResponseId;
+			} else if (lastBot.responseId && lastBot.promptVersion !== promptVersion) {
+				restartHostedChain = true;
+				logger.info(
+					`Previous response ${lastBot.responseId} was produced under system prompt ${lastBot.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
+				);
+			} else {
+				previousResponseId = lastBot.responseId;
+			}
 			logger.info(
 				`Previous response ID: ${previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
 			);
@@ -407,11 +453,6 @@ async function respondCore({
 		// Build initial input
 		// OpenAI: skip base system prompt when previous_response_id exists (OpenAI maintains context)
 		// Ollama: always include the (capability-adapted) system prompt
-		// Both: organization name + deployment notes come from the deployment context
-		const systemPrompt = buildSystemPrompt(provider.capabilities, {
-			contextWindow: stateless ? provider.contextWindow : undefined,
-			...getDeploymentContext(),
-		});
 		let input = buildInitialInput({
 			codeContainerFiles: fileManager.codeContainerFiles,
 			includeBasePrompt: stateless || !previousResponseId,
@@ -435,11 +476,13 @@ async function respondCore({
 			);
 		} else if (!previousResponseId) {
 			// Add conversation history ONLY if no previous_response_id
-			// When previous_response_id exists, OpenAI maintains context internally
+			// When previous_response_id exists, OpenAI maintains context internally.
+			// A restarted chain replays the whole thread, not just what followed
+			// the last bot message.
 			const lastBot = findLastBotMessage(messages, context, logger);
 			const historyInput = await buildConversationInput(
 				messages,
-				lastBot.index,
+				restartHostedChain ? -1 : lastBot.index,
 				message.ts,
 				context,
 				fileManager.uploadOnce
@@ -646,6 +689,7 @@ async function respondCore({
 					safetyIdentifier,
 					thread_ts,
 					fileManager,
+					promptVersion,
 					say,
 					logger,
 				});
@@ -687,6 +731,7 @@ async function respondCore({
 						safetyIdentifier,
 						thread_ts,
 						fileManager,
+						promptVersion,
 						say,
 						logger,
 					});
@@ -960,6 +1005,7 @@ async function respondCore({
 					say,
 					suggestSummarizeNow,
 					uploadedFilesThisTurn: fileManager.uploadedFilesThisTurn,
+					promptVersion,
 					safetyIdentifier,
 					logger,
 				});
@@ -1225,6 +1271,7 @@ async function executeStreamWithRetry({
 	safetyIdentifier,
 	thread_ts,
 	fileManager,
+	promptVersion,
 	say,
 	logger,
 }) {
@@ -1255,13 +1302,11 @@ async function executeStreamWithRetry({
 						recipient_user_id: userId,
 						thread_ts,
 						metadata: responseId
-							? {
-									event_type: "openai_context",
-									event_payload: {
-										response_id: responseId,
-										uploaded_files: fileManager.uploadedFilesThisTurn,
-									},
-								}
+							? openaiContextMetadata({
+									responseId,
+									uploadedFiles: fileManager.uploadedFilesThisTurn,
+									promptVersion,
+								})
 							: undefined,
 					});
 				} catch (err) {
@@ -1306,13 +1351,11 @@ async function executeStreamWithRetry({
 					// Fallback to say()
 					const payload = { text: cleaned };
 					if (!postedFirstLine && seenResponseId) {
-						payload.metadata = {
-							event_type: "openai_context",
-							event_payload: {
-								response_id: seenResponseId,
-								uploaded_files: fileManager.uploadedFilesThisTurn,
-							},
-						};
+						payload.metadata = openaiContextMetadata({
+							responseId: seenResponseId,
+							uploadedFiles: fileManager.uploadedFilesThisTurn,
+							promptVersion,
+						});
 						postedFirstLine = true;
 					}
 					await say(payload);
@@ -1333,6 +1376,7 @@ async function handleNoTextStreamed({
 	say,
 	suggestSummarizeNow,
 	uploadedFilesThisTurn,
+	promptVersion,
 	safetyIdentifier,
 	logger,
 }) {
@@ -1344,13 +1388,11 @@ async function handleNoTextStreamed({
 			if (text) {
 				await say({
 					text,
-					metadata: {
-						event_type: "openai_context",
-						event_payload: {
-							response_id: responseIdFromFinalTurn,
-							uploaded_files: uploadedFilesThisTurn,
-						},
-					},
+					metadata: openaiContextMetadata({
+						responseId: responseIdFromFinalTurn,
+						uploadedFiles: uploadedFilesThisTurn,
+						promptVersion,
+					}),
 				});
 				return;
 			}
@@ -1361,13 +1403,11 @@ async function handleNoTextStreamed({
 			if (text) {
 				await say({
 					text,
-					metadata: {
-						event_type: "openai_context",
-						event_payload: {
-							response_id: polled?.id || responseIdFromFinalTurn,
-							uploaded_files: uploadedFilesThisTurn,
-						},
-					},
+					metadata: openaiContextMetadata({
+						responseId: polled?.id || responseIdFromFinalTurn,
+						uploadedFiles: uploadedFilesThisTurn,
+						promptVersion,
+					}),
 				});
 				return;
 			}
@@ -1376,26 +1416,22 @@ async function handleNoTextStreamed({
 		await suggestSummarizeNow();
 		await say?.({
 			text: "​",
-			metadata: {
-				event_type: "openai_context",
-				event_payload: {
-					response_id: responseIdFromFinalTurn,
-					uploaded_files: uploadedFilesThisTurn,
-				},
-			},
+			metadata: openaiContextMetadata({
+				responseId: responseIdFromFinalTurn,
+				uploadedFiles: uploadedFilesThisTurn,
+				promptVersion,
+			}),
 		});
 	} catch (err) {
 		logger?.warn?.("Background recovery failed", { err: String(err) });
 		await suggestSummarizeNow();
 		await say?.({
 			text: "​",
-			metadata: {
-				event_type: "openai_context",
-				event_payload: {
-					response_id: responseIdFromFinalTurn,
-					uploaded_files: uploadedFilesThisTurn,
-				},
-			},
+			metadata: openaiContextMetadata({
+				responseId: responseIdFromFinalTurn,
+				uploadedFiles: uploadedFilesThisTurn,
+				promptVersion,
+			}),
 		});
 	}
 }

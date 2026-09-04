@@ -7,7 +7,19 @@ import {
 	DEPLOYMENT_NOTES_HEADING,
 	renderBasePrompt,
 	SYSTEM_PROMPT,
+	systemPromptVersion,
 } from "../system-prompt.js";
+
+describe("systemPromptVersion", () => {
+	it("fingerprints the prompt text: stable, short, and sensitive to any change", () => {
+		const base = systemPromptVersion(SYSTEM_PROMPT);
+		expect(base).toMatch(/^[0-9a-f]{12}$/);
+		expect(systemPromptVersion(SYSTEM_PROMPT)).toBe(base);
+		expect(systemPromptVersion(buildSystemPrompt({}, { organizationName: "Acme" }))).not.toBe(base);
+		expect(systemPromptVersion(buildSystemPrompt({}, { deploymentNotes: "Note." }))).not.toBe(base);
+		expect(systemPromptVersion(buildSystemPrompt({ codeInterpreter: false }))).not.toBe(base);
+	});
+});
 
 describe("SYSTEM_PROMPT (deployment-neutral base)", () => {
 	it("names no company, teammate, Slack user or language", () => {

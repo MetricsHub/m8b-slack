@@ -208,11 +208,14 @@ the persona, the safety rules (no fabrication, action boundaries, credential han
 tool guidance are the same for every installation and are not configurable. Two things adapt it
 to your organization:
 
-- **Organization name.** Resolved once at startup from the Slack workspace: `team.info` (needs
-  the `team:read` bot scope, included in `manifest.json`), falling back to the team name returned
-  by `auth.test` when the scope is missing (existing installations: re-install the app from the
+- **Organization name.** Resolved at startup from the Slack workspace: `team.info` (needs the
+  `team:read` bot scope, included in `manifest.json`), falling back to the team name returned by
+  `auth.test` when the scope is missing (existing installations: re-install the app from the
   updated manifest to grant it). The name is injected where the prompt refers to the company
   ("...system administrator for _Acme Corp_'s IT team"); without it the wording stays generic.
+  On an Enterprise Grid org-wide install, each workspace is resolved on its first message
+  (`team.info` with its team ID) so users get their own workspace's name, falling back to the
+  installing workspace's name.
 - **Deployment notes** (optional, append-only). `M8B_PROMPT_EXTRA_FILE` points to a Markdown or
   text file and/or `M8B_PROMPT_EXTRA` holds inline text; both are appended, file first, as a
   clearly delimited "Deployment notes" section at the end of the prompt. Use them for what the
@@ -220,6 +223,12 @@ to your organization:
   habits. The notes complement the built-in rules and are presented to the model as such — they
   can never replace or relax them. An unreadable file or notes longer than 20,000 characters
   stop the bot at startup (reference material belongs in the knowledge base, not in the prompt).
+
+Changes take effect on restart, including for threads that are already open: in OpenAI mode each
+reply carries a fingerprint of the system prompt it ran under, and a thread whose chain was started
+under a different prompt (older code, edited notes) is re-seeded with the current prompt and its
+full history rebuilt from Slack instead of continuing the old chain. Local modes always resend the
+prompt.
 
 The bot logs the resolved organization and the size of the appended notes at startup:
 

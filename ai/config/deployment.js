@@ -6,9 +6,13 @@
  * and tool guidance stay under our control. Everything that varies from one
  * deployment to the next comes from this module:
  *
- * - The organization name, resolved once at startup from the Slack workspace
- *   (team.info, which needs the team:read bot scope; falls back to the team
- *   name returned by auth.test, which needs no extra scope).
+ * - The organization name, resolved from the Slack workspace (team.info, which
+ *   needs the team:read bot scope; falls back to the team name returned by
+ *   auth.test, which needs no extra scope). The installing workspace is
+ *   resolved at startup; an app installed organization-wide on Enterprise Grid
+ *   serves several workspaces, so names are cached per team ID and any other
+ *   workspace is resolved on its first message (team.info with the team
+ *   parameter), falling back to the startup name.
  * - Optional "deployment notes" that administrators APPEND to the prompt with
  *   M8B_PROMPT_EXTRA_FILE (path to a Markdown/text file) and/or M8B_PROMPT_EXTRA
  *   (inline text). They are append-only: they can add context (team, naming
@@ -31,8 +35,14 @@ export const PROMPT_EXTRA_VAR = "M8B_PROMPT_EXTRA";
  */
 export const MAX_PROMPT_EXTRA_CHARS = 20000;
 
-/** @type {string|null} */
-let organizationName = null;
+/** Name of the workspace the bot is installed in (startup), or null. */
+let defaultOrganizationName = null;
+/**
+ * Workspace names by team ID. A null value records a failed lookup so a
+ * workspace that cannot be resolved is not queried again on every message.
+ * @type {Map<string, string|null>}
+ */
+const organizationNames = new Map();
 /** @type {string|null} null = not loaded yet */
 let deploymentNotes = null;
 
@@ -48,58 +58,102 @@ function normalizeName(name) {
 }
 
 /**
- * Record the organization (Slack workspace) name used in the system prompt.
+ * Record an organization (Slack workspace) name used in the system prompt.
  *
  * @param {string|null|undefined} name - Workspace name; empty/undefined clears it
+ * @param {string} [teamId] - Workspace this name belongs to; without it the
+ *   name becomes the default (the installing workspace)
  */
-export function setOrganizationName(name) {
-	organizationName = normalizeName(name);
+export function setOrganizationName(name, teamId) {
+	const normalized = normalizeName(name);
+	if (teamId) {
+		organizationNames.set(teamId, normalized);
+	} else {
+		defaultOrganizationName = normalized;
+	}
 }
 
 /**
- * The organization name resolved at startup, or null when unknown (the prompt
- * then speaks of "the organization" generically).
+ * The organization name for a workspace: the name cached for that team ID,
+ * else the default resolved at startup, else null (the prompt then speaks of
+ * "the organization" generically).
  *
+ * @param {string} [teamId]
  * @returns {string|null}
  */
-export function getOrganizationName() {
-	return organizationName;
+export function getOrganizationName(teamId) {
+	if (teamId && organizationNames.get(teamId)) {
+		return organizationNames.get(teamId);
+	}
+	return defaultOrganizationName;
 }
 
 /**
- * Resolve the workspace name from Slack and record it for the system prompt.
+ * Resolve a workspace name from Slack and record it for the system prompt.
  *
- * Tries team.info first (needs the team:read bot scope). When that scope is
- * missing (older installations) or the call fails, falls back to the "team"
- * field of auth.test, which every bot token can call.
+ * Tries team.info first (needs the team:read bot scope; with a teamId, asks
+ * for that workspace — required on Enterprise Grid org installs). When the
+ * scope is missing (older installations) or the call fails, falls back to the
+ * "team" field of auth.test, which every bot token can call but only names
+ * the installing workspace — so the fallback is only used for the default.
  *
  * @param {Object} client - Slack WebClient
- * @param {Object} [logger]
+ * @param {Object} [options]
+ * @param {string} [options.teamId] - Workspace to resolve; omitted = the
+ *   installing workspace, stored as the default
+ * @param {Object} [options.logger]
  * @returns {Promise<string|null>} The resolved name (also stored), or null
  */
-export async function resolveOrganizationName(client, logger = console) {
+export async function resolveOrganizationName(client, { teamId, logger = console } = {}) {
 	let name = null;
+	let resolvedTeamId = teamId;
 	try {
-		const info = await client.team.info();
+		const info = await client.team.info(teamId ? { team: teamId } : {});
 		name = normalizeName(info?.team?.name);
+		resolvedTeamId = resolvedTeamId || info?.team?.id;
 	} catch (e) {
 		const reason = e?.data?.error || e?.message || String(e);
 		logger.warn?.(
-			`Could not read the workspace name with team.info (${reason}); falling back to auth.test. Add the "team:read" bot scope to silence this.`
+			`Could not read the workspace name with team.info${teamId ? ` for ${teamId}` : ""} (${reason})${teamId ? "" : "; falling back to auth.test"}. Add the "team:read" bot scope to silence this.`
 		);
 	}
-	if (!name) {
+	if (!name && !teamId) {
 		try {
 			const auth = await client.auth.test();
 			name = normalizeName(auth?.team);
+			resolvedTeamId = resolvedTeamId || auth?.team_id;
 		} catch (e) {
 			logger.warn?.("Could not read the workspace name with auth.test", {
 				message: e?.message,
 			});
 		}
 	}
-	setOrganizationName(name);
+
+	if (!teamId) {
+		setOrganizationName(name);
+	}
+	if (resolvedTeamId) {
+		// Cache per workspace (a failed lookup too, so it is not retried per message)
+		organizationNames.set(resolvedTeamId, name);
+	}
 	return name;
+}
+
+/**
+ * The organization name for the workspace a message comes from, resolving
+ * (once) workspaces not seen before. Falls back to the startup default.
+ *
+ * @param {Object} params
+ * @param {Object} [params.client] - Slack WebClient (needed to resolve a new workspace)
+ * @param {string} [params.teamId] - Workspace of the incoming message
+ * @param {Object} [params.logger]
+ * @returns {Promise<string|null>}
+ */
+export async function resolveOrganizationNameFor({ client, teamId, logger = console }) {
+	if (teamId && client && !organizationNames.has(teamId)) {
+		await resolveOrganizationName(client, { teamId, logger });
+	}
+	return getOrganizationName(teamId);
 }
 
 /**
@@ -172,15 +226,23 @@ export function getDeploymentNotes() {
  * Forget the cached state (tests).
  */
 export function resetDeploymentContext() {
-	organizationName = null;
+	defaultOrganizationName = null;
+	organizationNames.clear();
 	deploymentNotes = null;
 }
 
 /**
- * Everything buildSystemPrompt() needs from this module, in one object.
+ * Everything buildSystemPrompt() needs from this module, for one message.
  *
- * @returns {{ organizationName: string|null, deploymentNotes: string }}
+ * @param {Object} [params]
+ * @param {Object} [params.client] - Slack WebClient (to resolve a workspace seen for the first time)
+ * @param {string} [params.teamId] - Workspace of the incoming message
+ * @param {Object} [params.logger]
+ * @returns {Promise<{ organizationName: string|null, deploymentNotes: string }>}
  */
-export function getDeploymentContext() {
-	return { organizationName: getOrganizationName(), deploymentNotes: getDeploymentNotes() };
+export async function getDeploymentContext({ client, teamId, logger } = {}) {
+	return {
+		organizationName: await resolveOrganizationNameFor({ client, teamId, logger }),
+		deploymentNotes: getDeploymentNotes(),
+	};
 }
