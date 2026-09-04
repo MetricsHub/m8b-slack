@@ -18,10 +18,6 @@ import {
 	getOllamaConfig,
 } from "../config/providers.js";
 
-function isContextLengthExplicit() {
-	return Boolean(process.env.OLLAMA_CONTEXT_LENGTH || process.env.OLLAMA_CONTEXT_WINDOW);
-}
-
 function matchesModel(name, model) {
 	if (!name) return false;
 	return name === model || name === `${model}:latest` || name.replace(/:latest$/, "") === model;
@@ -268,11 +264,11 @@ export function createOllamaProvider() {
 				const detected = await detectServerContextLength(config);
 
 				if (detected) {
-					if (!isContextLengthExplicit()) {
+					if (!config.contextLengthExplicit) {
 						provider.contextWindow = detected.value;
 						contextDetail = `context ${detected.value} (detected from ${detected.source})`;
 					} else if (provider.contextWindow > detected.value) {
-						warning = `Configured OLLAMA_CONTEXT_LENGTH (${provider.contextWindow}) exceeds the server's effective context (${detected.value} from ${detected.source}); using ${detected.value} to avoid silent prompt truncation.`;
+						warning = `Configured ${config.envNames.contextLength} (${provider.contextWindow}) exceeds the server's effective context (${detected.value} from ${detected.source}); using ${detected.value} to avoid silent prompt truncation.`;
 						provider.contextWindow = detected.value;
 						contextDetail = `context ${detected.value} (server-limited)`;
 					} else {
@@ -281,7 +277,7 @@ export function createOllamaProvider() {
 
 					// The default inline tool-output cap is derived from the context
 					// window; keep it consistent when the window was reconciled
-					if (!process.env.OLLAMA_MAX_TOOL_OUTPUT_CHARS) {
+					if (!config.maxToolOutputCharsExplicit) {
 						provider.maxToolOutputChars = defaultToolOutputChars(
 							provider.contextWindow,
 							config.maxOutputTokens

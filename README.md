@@ -131,21 +131,32 @@ npm run dev
 The AI backend is selected with `AI_PROVIDER`:
 
 - `AI_PROVIDER=openai` (default): hosted OpenAI Responses API with `gpt-5.6-sol` — current behavior, unchanged.
-- `AI_PROVIDER=ollama`: a local model through Ollama's OpenAI-compatible `/v1/responses` API. When Ollama mode is active, nothing is ever sent to OpenAI: capabilities without a local equivalent are reported as unavailable instead of falling back.
+- `AI_PROVIDER=ollama`: a local model through Ollama's OpenAI-compatible `/v1/responses` API. Nothing
+  is ever sent to OpenAI: capabilities without a local equivalent are reported as unavailable
+  instead of falling back.
 - `AI_PROVIDER=vllm`: a local model through vLLM's OpenAI-compatible `/v1/responses` API. Same
-  local-only guarantees as Ollama mode, with one capability upgrade: the served model is
-  multimodal, so screenshots are passed to it natively (no sidecar vision model needed).
+  local-only guarantees, with one capability upgrade: the served model is multimodal, so
+  screenshots are passed to it natively (no sidecar vision model needed).
 - `AI_PROVIDER=openai-compatible`: any other endpoint serving the OpenAI `/v1/responses` API with
   streaming and function tools (a corporate inference proxy, an NVIDIA NIM, a LiteLLM gateway,
-  ...). Configured by `AI_BASE_URL`, `AI_API_KEY` and `AI_MODEL`; same local-only guarantees as
-  Ollama/vLLM modes, with model-dependent capabilities switched on by flags (`AI_IMAGE_INPUT`,
-  `AI_STRICT_INPUT`, `AI_EMBEDDING_MODEL`). The `vllm` mode is a preset of this provider.
+  ...). Same local-only guarantees, with model-dependent capabilities switched on by flags.
+
+The three self-hosted modes share **one set of variables**, `AI_*` (endpoint, model, budgets,
+embeddings — see the next sections). `AI_PROVIDER` is a preset: it fixes the defaults (Ollama's
+port 11434 and dummy key, vLLM's port 8000 and single-model adoption) and the backend quirks
+(Ollama's sidecar vision model, vLLM's strict chat template). Only genuinely vendor-specific
+settings keep a vendor prefix: `OLLAMA_VISION_MODEL` / `OLLAMA_VISION_MAX_OUTPUT_TOKENS`, and
+`OLLAMA_CONTEXT_LENGTH`, a permanent alias of `AI_CONTEXT_LENGTH` named after Ollama's own server
+variable so the same line configures both sides. The former `OLLAMA_*` / `VLLM_*` names of the
+common settings still work as deprecated aliases (they take precedence over `AI_*`), with one
+startup warning listing the replacements.
 
 At startup the bot logs the active backend and runs a health check (backend reachability + model
 presence). In Ollama mode it also reads the server's _effective_ context length from the native
-API (`/api/ps` for a loaded model, `/api/show` for a Modelfile `num_ctx`); in vLLM mode it reads
-`max_model_len` from `/v1/models`. In both cases: an unset `OLLAMA_CONTEXT_LENGTH` /
-`VLLM_CONTEXT_LENGTH` adopts the detected value, a smaller configured value is kept (tighter
+API (`/api/ps` for a loaded model, `/api/show` for a Modelfile `num_ctx`); in vLLM and
+openai-compatible modes it reads `max_model_len` / `context_length` from `/v1/models` when the
+server reports it. In all cases: an unset `AI_CONTEXT_LENGTH` adopts the detected value (or the 32k
+default, with a warning, when nothing is reported), a smaller configured value is kept (tighter
 budgets are safe), and a larger one is capped to the server's value with a warning — so the bot
 can never believe it has more context than the server actually allocates:
 
@@ -186,22 +197,46 @@ OPENAI_VECTOR_STORE_IDS=vs_123,vs_456
 OPENAI_VECTOR_STORE_ID=vs_123
 ```
 
-### Example Ollama configuration
+### Self-hosted backends: common variables
+
+Every self-hosted mode (`ollama`, `vllm`, `openai-compatible`) reads the same variables; only the
+defaults differ per preset:
 
 ```bash
-AI_PROVIDER=ollama
-OLLAMA_BASE_URL=http://dev-nvidia-01:11434/v1
-OLLAMA_MODEL=qwen3.8:27b
-OLLAMA_API_KEY=ollama                  # dummy value required by the OpenAI SDK; Ollama ignores it
-OLLAMA_EMBEDDING_MODEL=nomic-embed-text
-OLLAMA_VISION_MODEL=qwen3-vl:8b-instruct-8k  # optional: describes image attachments (unset = disabled)
-OLLAMA_CONTEXT_LENGTH=32768            # must match Ollama's num_ctx (same name as Ollama's own variable)
-OLLAMA_MAX_OUTPUT_TOKENS=4000
+AI_PROVIDER=ollama|vllm|openai-compatible
+AI_BASE_URL=http://host:port/v1       # default: Ollama http://localhost:11434/v1, vLLM/generic http://localhost:8000/v1
+AI_API_KEY=...                        # bearer token; default dummy value (the SDK requires one even if the server ignores it)
+AI_MODEL=...                          # Ollama default qwen3.8:27b; vLLM: adopted from the single served model; generic: REQUIRED
+AI_CONTEXT_LENGTH=32768               # the model's context window (see the detection rules above)
+AI_MAX_OUTPUT_TOKENS=4000
+# AI_REQUEST_TIMEOUT_MS=300000
+# AI_MAX_TOOL_OUTPUT_CHARS=           # inline cap for one tool result; default scales with the context window
+
+# Local knowledge base (unset AI_EMBEDDING_MODEL = disabled; Ollama defaults it to nomic-embed-text)
+AI_EMBEDDING_MODEL=nomic-embed-text
+# AI_EMBEDDING_BASE_URL=              # default: AI_BASE_URL (REQUIRED in vLLM mode, see below)
+# AI_EMBEDDING_API_KEY=               # default: AI_API_KEY
+# AI_EMBEDDING_QUERY_PREFIX=          # task prefixes; auto per model (nomic, mxbai)
+# AI_EMBEDDING_DOCUMENT_PREFIX=
+# AI_EMBEDDING_QUERY_INPUT_TYPE=      # per-request input_type; auto "query"/"passage" for nv-embed* models
+# AI_EMBEDDING_DOCUMENT_INPUT_TYPE=
 KNOWLEDGE_BASE_DIR=data/knowledge
 
 # Web search backend (optional; unset = web search unavailable)
 WEB_SEARCH_PROVIDER=searxng
 SEARXNG_URL=http://searxng.internal:8080
+```
+
+### Ollama preset
+
+```bash
+AI_PROVIDER=ollama
+AI_BASE_URL=http://dev-nvidia-01:11434/v1
+AI_MODEL=qwen3.8:27b
+AI_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_CONTEXT_LENGTH=32768            # must match Ollama's num_ctx (same name as Ollama's own variable)
+OLLAMA_VISION_MODEL=qwen3-vl:8b-instruct-8k  # optional: describes image attachments (unset = disabled)
+# OLLAMA_VISION_MAX_OUTPUT_TOKENS=600
 ```
 
 On the Ollama host, pull the models:
@@ -212,17 +247,14 @@ ollama pull nomic-embed-text
 ollama pull qwen3-vl:8b-instruct-8k   # optional, for screenshot analysis
 ```
 
-### Example vLLM configuration
+### vLLM preset
 
 ```bash
 AI_PROVIDER=vllm
-VLLM_BASE_URL=http://dev-nvidia-01:8000/v1
-VLLM_API_KEY=vllm_...                  # whatever the reverse proxy in front of vLLM expects
-VLLM_MODEL=qwen3.8-27b-int8            # optional: adopted automatically (vLLM serves one model)
-# VLLM_CONTEXT_LENGTH=65536            # optional: detected from /v1/models max_model_len
-VLLM_MAX_OUTPUT_TOKENS=4000
-# VLLM_REQUEST_TIMEOUT_MS=300000
-# VLLM_MAX_TOOL_OUTPUT_CHARS=          # default scales with the context window
+AI_BASE_URL=http://dev-nvidia-01:8000/v1
+AI_API_KEY=vllm_...                    # whatever the reverse proxy in front of vLLM expects
+# AI_MODEL=qwen3.8-27b-int8            # optional: adopted automatically (vLLM serves one model)
+# AI_CONTEXT_LENGTH=65536              # optional: detected from /v1/models max_model_len
 
 # Media store: screenshots are saved locally and served to the vLLM host by URL
 # (unset M8B_MEDIA_BASE_URL = degraded fallback: images inlined as base64 every turn)
@@ -231,38 +263,26 @@ M8B_MEDIA_BASE_URL=https://bm-linux-slack.internal.sentrysoftware.net/m8b-media
 M8B_MEDIA_RETENTION_DAYS=7
 
 # Local knowledge base embeddings: a vLLM instance serves ONE model, so the chat
-# instance cannot embed. Point these at a dedicated embedding endpoint (a second
-# small vLLM instance, or an Ollama server kept around for embeddings).
-# Unset = knowledge base disabled (search_knowledge_base is not offered).
-# VLLM_EMBEDDING_BASE_URL=http://dev-nvidia-01:8001/v1
-# VLLM_EMBEDDING_MODEL=qwen3-embedding-0.6b
-# VLLM_EMBEDDING_API_KEY=              # defaults to VLLM_API_KEY
-KNOWLEDGE_BASE_DIR=data/knowledge
-
-# Web search backend (optional; unset = web search unavailable)
-WEB_SEARCH_PROVIDER=searxng
-SEARXNG_URL=http://searxng.internal:8080
+# instance cannot embed. Point AI_EMBEDDING_BASE_URL at a dedicated embedding
+# endpoint (a second small vLLM instance, or an Ollama server kept around for
+# embeddings). Without it the knowledge base is disabled.
+# AI_EMBEDDING_BASE_URL=http://dev-nvidia-01:8001/v1
+# AI_EMBEDDING_MODEL=qwen3-embedding-0.6b
 ```
 
-### Example OpenAI-compatible configuration
+### OpenAI-compatible preset
 
 For an endpoint that is neither Ollama nor vLLM (a corporate inference gateway, a NIM, ...):
 
 ```bash
 AI_PROVIDER=openai-compatible
 AI_BASE_URL=https://inference.example.com/v1
-AI_API_KEY=...                        # bearer token; any value if the endpoint ignores it
+AI_API_KEY=...
 AI_MODEL=llama-3.3-70b-instruct       # REQUIRED: a gateway serves many models, the bot never guesses
-AI_CONTEXT_LENGTH=131072              # the model's context window; gateways rarely report it (see below)
-# AI_MAX_OUTPUT_TOKENS=4000
-# AI_REQUEST_TIMEOUT_MS=300000
+AI_CONTEXT_LENGTH=131072              # gateways rarely report it (see below)
 # AI_IMAGE_INPUT=true                 # the model reads images natively (then configure M8B_MEDIA_*)
 # AI_STRICT_INPUT=true                # single leading system message, string assistant history
 # AI_EMBEDDING_MODEL=nvidia/nv-embedqa-e5-v5 # unset = knowledge base disabled
-# AI_EMBEDDING_BASE_URL=              # defaults to AI_BASE_URL
-# AI_EMBEDDING_API_KEY=               # defaults to AI_API_KEY
-# AI_EMBEDDING_QUERY_INPUT_TYPE=      # per-request input_type; auto "query"/"passage" for nv-embed* models
-# AI_EMBEDDING_DOCUMENT_INPUT_TYPE=
 ```
 
 The endpoint must implement `/v1/responses` (streaming, `function` tools); `/v1/chat/completions`
@@ -295,17 +315,18 @@ unbounded, process-local in-memory store, so the bot deliberately does not rely 
 In both local modes the bot therefore keeps conversation history application-side, keyed by
 `team + channel + thread_ts`, and resends the relevant user/assistant/tool items in `input` on
 every request. History is trimmed deterministically to fit the model's context window
-(`OLLAMA_CONTEXT_LENGTH`/`VLLM_CONTEXT_LENGTH`), always retaining the system prompt, recent
+(`AI_CONTEXT_LENGTH`), always retaining the system prompt, recent
 turns, and intact tool-call/result pairs. The store is in-memory; after a restart the text
 history is rebuilt from the Slack thread itself (the same cold-start path OpenAI mode uses),
 losing only the tool-call detail of earlier turns. OpenAI mode continues to use
 `previous_response_id` unchanged.
 
-### Ollama mode: local knowledge base
+### Self-hosted modes: local knowledge base
 
-OpenAI's hosted `file_search`/vector stores are not available locally, so Ollama mode uses a
-local RAG path: markdown documents in `data/knowledge/docs/` are chunked, embedded with a local
-Ollama embedding model (`OLLAMA_EMBEDDING_MODEL`, default `nomic-embed-text`), and persisted in
+OpenAI's hosted `file_search`/vector stores are not available locally, so the self-hosted modes
+use a local RAG path: markdown documents in `data/knowledge/docs/` are chunked, embedded through
+the configured `/v1/embeddings` endpoint (`AI_EMBEDDING_MODEL`; Ollama defaults it to
+`nomic-embed-text`), and persisted in
 `data/knowledge/index.json`. Retrieval is cosine similarity, exposed to the model as the
 `search_knowledge_base` function tool; `update_knowledge` writes new entries into the same
 local store. This flat-file design is intentional for a small corpus — no vector database
@@ -317,8 +338,8 @@ required.
 # 1. Export the documents from the OpenAI vector store to data/knowledge/docs/
 OPENAI_API_KEY=sk-... OPENAI_VECTOR_STORE_IDS=vs_... npm run kb:export
 
-# 2. Build the embedding index (requires the Ollama server + embedding model)
-OLLAMA_BASE_URL=http://dev-nvidia-01:11434/v1 npm run kb:index
+# 2. Build the embedding index (requires the embedding endpoint + model)
+AI_PROVIDER=ollama AI_BASE_URL=http://dev-nvidia-01:11434/v1 npm run kb:index
 ```
 
 Indexing is incremental where it can be:
@@ -335,10 +356,10 @@ Indexing is incremental where it can be:
 
 - Task prefixes are applied automatically per embedding model (`nomic-embed-text` requires
   `search_query:`/`search_document:` prefixes; searching an index built without them returns a
-  clear "rebuild" error). Override with `OLLAMA_EMBEDDING_QUERY_PREFIX` /
-  `OLLAMA_EMBEDDING_DOCUMENT_PREFIX` if you use a model with different conventions.
+  clear "rebuild" error). Override with `AI_EMBEDDING_QUERY_PREFIX` /
+  `AI_EMBEDDING_DOCUMENT_PREFIX` if you use a model with different conventions.
 - For a bilingual corpus (French/English), `bge-m3` usually beats `nomic-embed-text`:
-  `ollama pull bge-m3`, set `OLLAMA_EMBEDDING_MODEL=bge-m3`, re-run `npm run kb:index`.
+  `ollama pull bge-m3`, set `AI_EMBEDDING_MODEL=bge-m3`, re-run `npm run kb:index`.
 - Curate the corpus: cosine similarity has no notion of "deprecated". Delete legacy documents,
   or mark them with an explicit first line (e.g. `**Status: DEPRECATED — replaced by X**`) so
   the model dismisses them when they are retrieved, and keep one authoritative overview
@@ -423,8 +444,8 @@ Environment=VLLM_MEDIA_CACHE_TTL_HOURS=24
 
 **vLLM mode** matches the Ollama column, with two differences: images are passed natively to
 the multimodal model via the media store (no `OLLAMA_VISION_MODEL` sidecar), and knowledge-base
-embeddings need a dedicated endpoint (`VLLM_EMBEDDING_BASE_URL` + `VLLM_EMBEDDING_MODEL`;
-without them the knowledge base is disabled).
+embeddings need a dedicated endpoint (`AI_EMBEDDING_BASE_URL` + `AI_EMBEDDING_MODEL`; without
+them the knowledge base is disabled).
 
 **OpenAI-compatible mode** also matches the Ollama column, with the model-dependent rows driven
 by flags: file/image analysis is native (`AI_IMAGE_INPUT=true`, as in vLLM mode) or unavailable
@@ -605,10 +626,10 @@ replayed as an assistant message.
 ### Integration tests against a live Ollama server
 
 The normal test suite mocks all external services. An opt-in integration suite runs against a
-real Ollama instance when both variables are set:
+real Ollama instance when the Ollama preset is selected with an explicit endpoint and model:
 
 ```bash
-OLLAMA_BASE_URL=http://dev-nvidia-01:11434/v1 OLLAMA_MODEL=qwen3.8:27b npm test
+AI_PROVIDER=ollama AI_BASE_URL=http://dev-nvidia-01:11434/v1 AI_MODEL=qwen3.8:27b npm test
 ```
 
 ## Contributing

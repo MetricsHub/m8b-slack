@@ -53,7 +53,7 @@ function createGenericProvider() {
 	// starts anyway: reject the unusable configuration before anything runs.
 	if (!config.model) {
 		throw new Error(
-			`AI_PROVIDER=openai-compatible requires AI_MODEL (the served model to use; GET ${config.baseUrl}/models lists the available IDs)`
+			`AI_PROVIDER=openai-compatible requires ${config.envNames.model} (the served model to use; GET ${config.baseUrl}/models lists the available IDs)`
 		);
 	}
 	return createOpenAiCompatibleProvider({
@@ -73,11 +73,7 @@ function createGenericProvider() {
 		adoptSingleServedModel: false,
 		// Gateways may not implement /v1/models at all
 		tolerateMissingModelList: true,
-		envNames: {
-			model: "AI_MODEL",
-			contextLength: "AI_CONTEXT_LENGTH",
-			maxOutputTokens: "AI_MAX_OUTPUT_TOKENS",
-		},
+		envNames: config.envNames,
 	});
 }
 

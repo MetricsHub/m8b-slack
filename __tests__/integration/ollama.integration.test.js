@@ -1,18 +1,22 @@
 /**
  * Opt-in integration test against a real Ollama server.
  *
- * Skipped unless both OLLAMA_BASE_URL and OLLAMA_MODEL are set, e.g.:
+ * Skipped unless AI_PROVIDER=ollama and both the endpoint and the model are set
+ * (AI_BASE_URL / AI_MODEL, or their OLLAMA_* aliases), e.g.:
  *
- *   OLLAMA_BASE_URL=http://dev-nvidia-01:11434/v1 OLLAMA_MODEL=qwen3.8:27b npm test
+ *   AI_PROVIDER=ollama AI_BASE_URL=http://dev-nvidia-01:11434/v1 AI_MODEL=qwen3.8:27b npm test
  *
  * Not part of the normal suite; it requires the GPU box.
  */
 
 import { describe, expect, it, jest } from "@jest/globals";
+import { getAiProviderName, readAiSetting } from "../../ai/config/providers.js";
 import { createOllamaProvider } from "../../ai/providers/ollama-provider.js";
 import { streamOnce } from "../../ai/services/streaming.js";
 
-const enabled = Boolean(process.env.OLLAMA_BASE_URL && process.env.OLLAMA_MODEL);
+const enabled =
+	getAiProviderName() === "ollama" &&
+	Boolean(readAiSetting("ollama", "BASE_URL").value && readAiSetting("ollama", "MODEL").value);
 const maybeDescribe = enabled ? describe : describe.skip;
 
 maybeDescribe("Ollama integration (live)", () => {

@@ -5,11 +5,14 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import {
 	getAiProviderName,
+	getDeprecatedAiVariables,
 	getEmbeddingBackendConfig,
 	getEmbeddingInputTypes,
+	getEmbeddingPrefixOverrides,
 	getOllamaConfig,
 	getOpenAiCompatibleConfig,
 	getVllmConfig,
+	readAiSetting,
 } from "../../config/providers.js";
 import { describeProviderError, getProvider, resetProviderCache } from "../index.js";
 
@@ -23,6 +26,11 @@ const ENV_KEYS = [
 	"OLLAMA_MAX_OUTPUT_TOKENS",
 	"OLLAMA_VISION_MODEL",
 	"OLLAMA_VISION_MAX_OUTPUT_TOKENS",
+	"OLLAMA_MAX_TOOL_OUTPUT_CHARS",
+	"OLLAMA_EMBEDDING_MODEL",
+	"OLLAMA_EMBEDDING_BASE_URL",
+	"OLLAMA_EMBEDDING_QUERY_PREFIX",
+	"OLLAMA_EMBEDDING_DOCUMENT_PREFIX",
 	"CODE_SANDBOX_ENABLED",
 	"VLLM_BASE_URL",
 	"VLLM_MODEL",
@@ -47,6 +55,8 @@ const ENV_KEYS = [
 	"AI_EMBEDDING_API_KEY",
 	"AI_EMBEDDING_QUERY_INPUT_TYPE",
 	"AI_EMBEDDING_DOCUMENT_INPUT_TYPE",
+	"AI_EMBEDDING_QUERY_PREFIX",
+	"AI_EMBEDDING_DOCUMENT_PREFIX",
 ];
 
 describe("provider selection", () => {
@@ -137,13 +147,85 @@ describe("provider selection", () => {
 		expect(getOllamaConfig().contextWindow).toBe(65536);
 	});
 
-	it("still honors the deprecated OLLAMA_CONTEXT_WINDOW name", () => {
+	it("no longer reads the removed OLLAMA_CONTEXT_WINDOW name, but reports it", () => {
+		process.env.AI_PROVIDER = "ollama";
 		process.env.OLLAMA_CONTEXT_WINDOW = "16384";
-		expect(getOllamaConfig().contextWindow).toBe(16384);
+		expect(getOllamaConfig().contextWindow).toBe(32768);
+		expect(getDeprecatedAiVariables()).toEqual([
+			{ name: "OLLAMA_CONTEXT_WINDOW", replacement: "AI_CONTEXT_LENGTH", removed: true },
+		]);
+	});
 
-		// The new name wins when both are set
-		process.env.OLLAMA_CONTEXT_LENGTH = "65536";
-		expect(getOllamaConfig().contextWindow).toBe(65536);
+	it("reads the common AI_* variables for the Ollama preset", () => {
+		process.env.AI_PROVIDER = "ollama";
+		process.env.AI_BASE_URL = "http://gpu-box:11434/v1/";
+		process.env.AI_API_KEY = "shared-key";
+		process.env.AI_MODEL = "gpt-oss:20b";
+		process.env.AI_CONTEXT_LENGTH = "65536";
+		process.env.AI_MAX_OUTPUT_TOKENS = "3000";
+		process.env.AI_EMBEDDING_MODEL = "bge-m3";
+
+		const config = getOllamaConfig();
+		expect(config).toMatchObject({
+			baseUrl: "http://gpu-box:11434/v1",
+			apiKey: "shared-key",
+			model: "gpt-oss:20b",
+			contextWindow: 65536,
+			contextLengthExplicit: true,
+			maxOutputTokens: 3000,
+		});
+		expect(config.envNames).toEqual({
+			model: "AI_MODEL",
+			contextLength: "AI_CONTEXT_LENGTH",
+			maxOutputTokens: "AI_MAX_OUTPUT_TOKENS",
+		});
+		expect(getEmbeddingBackendConfig()).toMatchObject({
+			baseUrl: "http://gpu-box:11434/v1",
+			apiKey: "shared-key",
+			model: "bge-m3",
+		});
+		expect(getDeprecatedAiVariables()).toEqual([]);
+	});
+
+	it("lets a vendor alias win over the AI_* name and reports it as deprecated", () => {
+		process.env.AI_PROVIDER = "ollama";
+		process.env.AI_MODEL = "generic-model";
+		process.env.OLLAMA_MODEL = "qwen3.8:27b";
+		process.env.AI_CONTEXT_LENGTH = "8192";
+		process.env.OLLAMA_CONTEXT_LENGTH = "32768";
+
+		const config = getOllamaConfig();
+		expect(config.model).toBe("qwen3.8:27b");
+		expect(config.contextWindow).toBe(32768);
+		expect(config.envNames.model).toBe("OLLAMA_MODEL");
+		expect(config.envNames.contextLength).toBe("OLLAMA_CONTEXT_LENGTH");
+		expect(readAiSetting("ollama", "MODEL")).toEqual({
+			value: "qwen3.8:27b",
+			source: "OLLAMA_MODEL",
+		});
+		// OLLAMA_CONTEXT_LENGTH mirrors Ollama's own variable: a permanent alias
+		expect(getDeprecatedAiVariables()).toEqual([
+			{ name: "OLLAMA_MODEL", replacement: "AI_MODEL", removed: false },
+		]);
+	});
+
+	it("ignores the other preset's aliases", () => {
+		process.env.AI_PROVIDER = "ollama";
+		process.env.VLLM_MODEL = "some-vllm-model";
+		expect(getOllamaConfig().model).toBe("qwen3.8:27b");
+		expect(getDeprecatedAiVariables()).toEqual([]);
+	});
+
+	it("takes embedding prefix overrides from AI_* or the Ollama aliases, empty included", () => {
+		process.env.AI_PROVIDER = "ollama";
+		expect(getEmbeddingPrefixOverrides()).toBeNull();
+
+		process.env.AI_EMBEDDING_QUERY_PREFIX = "q: ";
+		expect(getEmbeddingPrefixOverrides()).toEqual({ query: "q: ", document: "" });
+
+		process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX = "";
+		process.env.OLLAMA_EMBEDDING_QUERY_PREFIX = "";
+		expect(getEmbeddingPrefixOverrides()).toEqual({ query: "", document: "" });
 	});
 
 	it("scales the default tool-output cap with the context window", () => {
@@ -507,6 +589,50 @@ describe("vLLM provider", () => {
 		expect(getVllmConfig().apiKey).toBe("vllm");
 	});
 
+	it("reads the common AI_* variables for the vLLM preset, aliases winning", () => {
+		delete process.env.VLLM_BASE_URL;
+		delete process.env.VLLM_MODEL;
+		process.env.AI_BASE_URL = "http://gpu-box:8000/v1";
+		process.env.AI_API_KEY = "proxy-key";
+		process.env.AI_MODEL = "qwen3.8-27b-int8";
+		process.env.AI_EMBEDDING_BASE_URL = "http://gpu-box:8001/v1";
+		process.env.AI_EMBEDDING_MODEL = "qwen3-embedding-0.6b";
+		resetProviderCache();
+
+		const provider = getProvider();
+		expect(provider.name).toBe("vllm");
+		expect(provider.endpoint).toBe("http://gpu-box:8000/v1");
+		expect(provider.model).toBe("qwen3.8-27b-int8");
+		expect(getVllmConfig().apiKey).toBe("proxy-key");
+		expect(getEmbeddingBackendConfig()).toMatchObject({
+			baseUrl: "http://gpu-box:8001/v1",
+			apiKey: "proxy-key",
+			model: "qwen3-embedding-0.6b",
+		});
+		expect(getDeprecatedAiVariables()).toEqual([]);
+
+		process.env.VLLM_API_KEY = "legacy-key";
+		expect(getVllmConfig().apiKey).toBe("legacy-key");
+		expect(getDeprecatedAiVariables()).toEqual([
+			{ name: "VLLM_API_KEY", replacement: "AI_API_KEY", removed: false },
+		]);
+	});
+
+	it("names the alias actually in use in health-check messages", async () => {
+		process.env.VLLM_CONTEXT_LENGTH = "131072";
+		resetProviderCache();
+		mockModelsEndpoint();
+
+		const health = await getProvider().healthCheck();
+		expect(health.warning).toContain("VLLM_CONTEXT_LENGTH");
+
+		delete process.env.VLLM_CONTEXT_LENGTH;
+		process.env.AI_CONTEXT_LENGTH = "131072";
+		resetProviderCache();
+		mockModelsEndpoint();
+		expect((await getProvider().healthCheck()).warning).toContain("AI_CONTEXT_LENGTH");
+	});
+
 	it("only sends fields supported by vLLM's /v1/responses", () => {
 		process.env.VLLM_MAX_OUTPUT_TOKENS = "4000";
 		resetProviderCache();
@@ -717,9 +843,12 @@ describe("vLLM provider", () => {
 	it("requires a dedicated embedding endpoint for the knowledge base", () => {
 		expect(getEmbeddingBackendConfig()).toBeNull();
 
-		process.env.VLLM_EMBEDDING_BASE_URL = "http://dev-nvidia-01:8001/v1/";
+		// A model alone is not enough: the vLLM chat instance cannot embed
 		process.env.VLLM_EMBEDDING_MODEL = "qwen3-embedding-0.6b";
-		expect(getEmbeddingBackendConfig()).toEqual({
+		expect(getEmbeddingBackendConfig()).toBeNull();
+
+		process.env.VLLM_EMBEDDING_BASE_URL = "http://dev-nvidia-01:8001/v1/";
+		expect(getEmbeddingBackendConfig()).toMatchObject({
 			baseUrl: "http://dev-nvidia-01:8001/v1",
 			apiKey: "vllm",
 			model: "qwen3-embedding-0.6b",

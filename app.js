@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
+import { getDeprecatedAiVariables } from "./ai/config/providers.js";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
 import { isMediaStoreConfigured, startMediaCleanup } from "./ai/services/media-store.js";
@@ -54,6 +55,17 @@ const app = new App({
 		app.logger.info(`AI provider: ${aiProvider.name}`);
 		app.logger.info(`AI model: ${aiProvider.model}`);
 		app.logger.info(`AI endpoint: ${aiProvider.endpoint}`);
+		// Vendor-prefixed names (OLLAMA_*, VLLM_*) still work but the common
+		// AI_* vocabulary is the documented one: say so once, at startup
+		const deprecated = getDeprecatedAiVariables(aiProvider.name);
+		if (deprecated.length > 0) {
+			const list = deprecated
+				.map(
+					(d) => `${d.name} (${d.removed ? "no longer read" : "deprecated"}; use ${d.replacement})`
+				)
+				.join(", ");
+			app.logger.warn(`Deprecated AI configuration variables: ${list}`);
+		}
 		try {
 			if (aiProvider.name === "ollama") {
 				app.logger.info("Warming up the AI model (may take a minute on a cold server)...");

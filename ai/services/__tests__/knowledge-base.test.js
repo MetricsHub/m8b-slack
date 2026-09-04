@@ -15,14 +15,27 @@ import {
 } from "../knowledge-base.js";
 
 describe("getEmbeddingPrefixes", () => {
-	const savedQuery = process.env.OLLAMA_EMBEDDING_QUERY_PREFIX;
-	const savedDocument = process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX;
+	const PREFIX_KEYS = [
+		"AI_PROVIDER",
+		"AI_EMBEDDING_QUERY_PREFIX",
+		"AI_EMBEDDING_DOCUMENT_PREFIX",
+		"OLLAMA_EMBEDDING_QUERY_PREFIX",
+		"OLLAMA_EMBEDDING_DOCUMENT_PREFIX",
+	];
+	const saved = {};
+
+	beforeEach(() => {
+		for (const key of PREFIX_KEYS) {
+			saved[key] = process.env[key];
+			delete process.env[key];
+		}
+	});
 
 	afterEach(() => {
-		if (savedQuery === undefined) delete process.env.OLLAMA_EMBEDDING_QUERY_PREFIX;
-		else process.env.OLLAMA_EMBEDDING_QUERY_PREFIX = savedQuery;
-		if (savedDocument === undefined) delete process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX;
-		else process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX = savedDocument;
+		for (const key of PREFIX_KEYS) {
+			if (saved[key] === undefined) delete process.env[key];
+			else process.env[key] = saved[key];
+		}
 	});
 
 	it("applies nomic-embed-text task prefixes", () => {
@@ -42,12 +55,31 @@ describe("getEmbeddingPrefixes", () => {
 		expect(getEmbeddingPrefixes("bge-m3")).toEqual({ query: "", document: "" });
 	});
 
-	it("honors environment overrides", () => {
-		process.env.OLLAMA_EMBEDDING_QUERY_PREFIX = "query: ";
-		process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX = "passage: ";
+	it("honors AI_EMBEDDING_*_PREFIX overrides on any self-hosted preset", () => {
+		process.env.AI_PROVIDER = "openai-compatible";
+		process.env.AI_EMBEDDING_QUERY_PREFIX = "query: ";
+		process.env.AI_EMBEDDING_DOCUMENT_PREFIX = "passage: ";
 		expect(getEmbeddingPrefixes("nomic-embed-text")).toEqual({
 			query: "query: ",
 			document: "passage: ",
+		});
+	});
+
+	it("still honors the OLLAMA_EMBEDDING_*_PREFIX aliases on the Ollama preset only", () => {
+		process.env.OLLAMA_EMBEDDING_QUERY_PREFIX = "query: ";
+		process.env.OLLAMA_EMBEDDING_DOCUMENT_PREFIX = "passage: ";
+
+		process.env.AI_PROVIDER = "ollama";
+		expect(getEmbeddingPrefixes("nomic-embed-text")).toEqual({
+			query: "query: ",
+			document: "passage: ",
+		});
+
+		// Another preset ignores Ollama's aliases and keeps the model defaults
+		process.env.AI_PROVIDER = "vllm";
+		expect(getEmbeddingPrefixes("nomic-embed-text")).toEqual({
+			query: "search_query: ",
+			document: "search_document: ",
 		});
 	});
 });
