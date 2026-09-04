@@ -4,7 +4,7 @@ This document provides instructions for AI agents working on this codebase.
 
 ## Project Overview
 
-M8B is a Slack bot powered by OpenAI (hosted), Ollama, or vLLM (both local, OpenAI-compatible `/v1/responses`) that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights. The AI backend is selected with `AI_PROVIDER` and abstracted behind `ai/providers/` — application code depends on provider capability flags, not provider names.
+M8B is a Slack bot powered by OpenAI (hosted), Ollama or vLLM (both local, OpenAI-compatible `/v1/responses`), or any other OpenAI-compatible `/v1/responses` endpoint (generic `openai-compatible` provider) that acts as a grumpy but competent system administrator. It integrates with MetricsHub via MCP (Model Context Protocol) to provide monitoring and infrastructure insights. The AI backend is selected with `AI_PROVIDER` and abstracted behind `ai/providers/` — application code depends on provider capability flags, not provider names.
 
 ## Tech Stack
 
@@ -23,7 +23,7 @@ m8b-slackbot/
 ├── app.js                 # Entry point (logs AI provider + health check)
 ├── ai/
 │   ├── config/            # AI configuration (system prompt, model settings, provider env)
-│   ├── providers/         # AI provider abstraction (openai / ollama)
+│   ├── providers/         # AI provider abstraction (openai / ollama / vllm / openai-compatible)
 │   ├── services/          # Core services (OpenAI, streaming, citations, local KB, etc.)
 │   ├── tools/             # OpenAI tool definitions
 │   ├── utils/             # Utilities (tokens, output handling, JSON parsing)
@@ -173,7 +173,8 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 3. To use a local model instead of OpenAI, set `AI_PROVIDER=ollama` plus
    `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_EMBEDDING_MODEL`, or
    `AI_PROVIDER=vllm` plus `VLLM_BASE_URL`/`VLLM_API_KEY` (and `M8B_MEDIA_*`
-   for URL-based screenshot handling) — see README
+   for URL-based screenshot handling), or `AI_PROVIDER=openai-compatible` plus
+   `AI_BASE_URL`/`AI_API_KEY`/`AI_MODEL` for any other endpoint — see README
 
 ## Common Tasks
 
@@ -211,33 +212,40 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
   `capabilities.imageInput` — images go in as `input_image` items (the `detail` field is
   REQUIRED by vLLM's schema) referencing local media-store URLs (`ai/services/media-store.js`),
   falling back to base64 data URLs when `M8B_MEDIA_BASE_URL` is unset
-- In local modes (ollama/vllm), never send data to OpenAI (no silent fallback)
+- The generic `openai-compatible` provider (`ai/providers/openai-compatible-provider.js`) is the
+  shared implementation: stateless, function tools only, universally supported request fields
+  only. Model-dependent behaviors are OPTIONS (`imageInput`, `strictInput`,
+  `adoptSingleServedModel`), not hard-coded: `vllm` is a preset of it (all three on), the generic
+  mode reads them from `AI_IMAGE_INPUT`/`AI_STRICT_INPUT` and requires `AI_MODEL`. Add new
+  server-specific quirks as options there, never as `if (name === ...)` branches
+- In local modes (ollama/vllm/openai-compatible), never send data to OpenAI (no silent fallback)
 
 ## Key Files Reference
 
-| File                                | Purpose                                                      |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `ai/respond.js`                     | Main AI response orchestrator                                |
-| `ai/config/system-prompt.js`        | AI personality and configuration                             |
-| `ai/services/streaming.js`          | OpenAI streaming response handling                           |
-| `ai/services/function-calls.js`     | Tool/function call processing                                |
-| `ai/services/tool-middleware.js`    | Tool output caching, compression, telemetry Markdown tables  |
-| `ai/tools/index.js`                 | OpenAI tool definitions                                      |
-| `ai/mcp_registry.js`                | MCP server discovery and management                          |
-| `ai/providers/index.js`             | AI provider abstraction                                      |
-| `ai/config/providers.js`            | Provider env configuration                                   |
-| `ai/services/conversation-store.js` | App-side thread state (local modes)                          |
-| `ai/services/thread-inbox.js`       | Queue/inject messages that arrive while a run is in flight   |
-| `ai/services/knowledge-base.js`     | Local RAG knowledge base (local modes)                       |
-| `ai/services/media-store.js`        | Local image store served to the vLLM host by URL             |
-| `ai/services/code-sandbox.js`       | Local Python sandbox for run_python (local modes, Pyodide)   |
-| `ai/services/sandbox-staging.js`    | Disk cache for attachments staged into the sandbox's /data   |
-| `ai/services/web-search.js`         | App-side web search backends                                 |
-| `ai/services/metricshub-api.js`     | MetricsHub Agent REST API client (config files, encryption)  |
-| `ai/services/config-editor.js`      | Config-editing tool handlers (auth, validate, approve, save) |
-| `ai/services/config-credentials.js` | Thread-scoped {{CRED:...}} placeholders for secrets          |
-| `ai/services/yaml-resources.js`     | Locate/splice resource entries in MetricsHub config YAML     |
-| `ai/services/slack-interactions.js` | Pending human interactions (modals, approval buttons)        |
+| File                                         | Purpose                                                              |
+| -------------------------------------------- | -------------------------------------------------------------------- |
+| `ai/respond.js`                              | Main AI response orchestrator                                        |
+| `ai/config/system-prompt.js`                 | AI personality and configuration                                     |
+| `ai/services/streaming.js`                   | OpenAI streaming response handling                                   |
+| `ai/services/function-calls.js`              | Tool/function call processing                                        |
+| `ai/services/tool-middleware.js`             | Tool output caching, compression, telemetry Markdown tables          |
+| `ai/tools/index.js`                          | OpenAI tool definitions                                              |
+| `ai/mcp_registry.js`                         | MCP server discovery and management                                  |
+| `ai/providers/index.js`                      | AI provider abstraction                                              |
+| `ai/providers/openai-compatible-provider.js` | Shared stateless Responses-API provider (generic mode + vLLM preset) |
+| `ai/config/providers.js`                     | Provider env configuration                                           |
+| `ai/services/conversation-store.js`          | App-side thread state (local modes)                                  |
+| `ai/services/thread-inbox.js`                | Queue/inject messages that arrive while a run is in flight           |
+| `ai/services/knowledge-base.js`              | Local RAG knowledge base (local modes)                               |
+| `ai/services/media-store.js`                 | Local image store served to the vLLM host by URL                     |
+| `ai/services/code-sandbox.js`                | Local Python sandbox for run_python (local modes, Pyodide)           |
+| `ai/services/sandbox-staging.js`             | Disk cache for attachments staged into the sandbox's /data           |
+| `ai/services/web-search.js`                  | App-side web search backends                                         |
+| `ai/services/metricshub-api.js`              | MetricsHub Agent REST API client (config files, encryption)          |
+| `ai/services/config-editor.js`               | Config-editing tool handlers (auth, validate, approve, save)         |
+| `ai/services/config-credentials.js`          | Thread-scoped {{CRED:...}} placeholders for secrets                  |
+| `ai/services/yaml-resources.js`              | Locate/splice resource entries in MetricsHub config YAML             |
+| `ai/services/slack-interactions.js`          | Pending human interactions (modals, approval buttons)                |
 
 ## Error Handling
 

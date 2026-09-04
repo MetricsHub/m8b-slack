@@ -29,9 +29,26 @@
  * - verifyLive:    optional async (context) => string[] of failures, run by respond-live
  *                  after the scenario (local-KB providers only) for deterministic state
  *                  checks; context carries {uploads}: every client.filesUploadV2 call
- * - onlyProvider:  optional provider name or array ("openai"/"ollama"/"vllm"); the
+ * - onlyProvider:  optional provider name or array ("openai"/"ollama"/"vllm"/
+ *                  "openai-compatible"); the
  *                  respond-live harness skips the scenario on any other provider
  */
+
+import { getProvider } from "../ai/providers/index.js";
+
+/**
+ * Whether the active provider can see image attachments (used to skip the
+ * screenshot scenarios where they cannot pass). Read from the instantiated
+ * provider's capability flags, never from provider names: OpenAI reads images
+ * through its Files API, vLLM/openai-compatible natively (imageInput), Ollama
+ * through a sidecar vision model (imageDescriptions).
+ *
+ * @returns {boolean}
+ */
+function visionAvailable() {
+	const { imageInput, imageDescriptions, providerFileUploads } = getProvider().capabilities;
+	return Boolean(imageInput || imageDescriptions || providerFileUploads);
+}
 
 /**
  * Deterministic post-check for the kb-update-article scenario: exactly one
@@ -203,11 +220,10 @@ export const SCENARIOS = [
 			"failed backup job BKP-4412, or the host SRV-WEB-01. It must NOT claim it cannot view " +
 			"images or ask the user to paste the error as text.",
 		// Requires a vision backend: Ollama mode needs the OLLAMA_VISION_MODEL
-		// sidecar; vLLM and OpenAI modes read images natively
-		skipUnless: () =>
-			(process.env.AI_PROVIDER || "openai").trim().toLowerCase() !== "ollama" ||
-			Boolean(process.env.OLLAMA_VISION_MODEL),
-		skipReason: "Ollama mode without OLLAMA_VISION_MODEL",
+		// sidecar, the generic openai-compatible mode needs AI_IMAGE_INPUT=true;
+		// vLLM and OpenAI modes read images natively
+		skipUnless: visionAvailable,
+		skipReason: "no vision capability (OLLAMA_VISION_MODEL / AI_IMAGE_INPUT unset)",
 		timeoutMs: 300000,
 	},
 	{
@@ -224,10 +240,8 @@ export const SCENARIOS = [
 			"BKP-4412, or the host SRV-WEB-01. It must NOT claim it cannot view images, must NOT " +
 			"say the user sent nothing, and must NOT merely ask what the user wants without " +
 			"addressing the image.",
-		skipUnless: () =>
-			(process.env.AI_PROVIDER || "openai").trim().toLowerCase() !== "ollama" ||
-			Boolean(process.env.OLLAMA_VISION_MODEL),
-		skipReason: "Ollama mode without OLLAMA_VISION_MODEL",
+		skipUnless: visionAvailable,
+		skipReason: "no vision capability (OLLAMA_VISION_MODEL / AI_IMAGE_INPUT unset)",
 		timeoutMs: 300000,
 	},
 	{

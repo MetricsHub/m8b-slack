@@ -1,8 +1,10 @@
 /**
  * AI provider configuration.
  *
- * Selects between the hosted OpenAI backend (default) and a local backend
- * exposing the OpenAI-compatible /v1/responses API: Ollama or vLLM.
+ * Selects between the hosted OpenAI backend (default), a local backend
+ * exposing the OpenAI-compatible /v1/responses API (Ollama or vLLM), or any
+ * other OpenAI-compatible endpoint (a corporate inference proxy, a NIM, a
+ * LiteLLM gateway, ...) through the generic "openai-compatible" provider.
  */
 
 import { PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
@@ -10,6 +12,7 @@ import { PAYLOAD_CHARS_PER_TOKEN } from "../utils/tokens.js";
 export const PROVIDER_OPENAI = "openai";
 export const PROVIDER_OLLAMA = "ollama";
 export const PROVIDER_VLLM = "vllm";
+export const PROVIDER_OPENAI_COMPATIBLE = "openai-compatible";
 
 /**
  * Maximum agent-loop iterations (model -> tool calls -> model) per Slack message.
@@ -29,15 +32,42 @@ function parsePositiveInt(value, fallback) {
 }
 
 /**
+ * Whether an environment value is a valid positive integer, i.e. whether
+ * parsePositiveInt() would honor it rather than fall back to the default.
+ * Providers use this to decide if a setting was EXPLICITLY configured
+ * ("AI_CONTEXT_LENGTH=oops" is not).
+ *
+ * @param {string|undefined} value - Raw environment value
+ * @returns {boolean}
+ */
+function isPositiveInt(value) {
+	return parsePositiveInt(value, null) !== null;
+}
+
+/**
  * Get the configured AI provider name.
  *
- * @returns {string} "openai", "ollama", or "vllm"
+ * @returns {string} "openai", "ollama", "vllm", or "openai-compatible"
  */
 export function getAiProviderName() {
 	const raw = (process.env.AI_PROVIDER || PROVIDER_OPENAI).trim().toLowerCase();
 	if (raw === PROVIDER_OLLAMA) return PROVIDER_OLLAMA;
 	if (raw === PROVIDER_VLLM) return PROVIDER_VLLM;
+	if (raw === PROVIDER_OPENAI_COMPATIBLE) return PROVIDER_OPENAI_COMPATIBLE;
 	return PROVIDER_OPENAI;
+}
+
+/**
+ * Parse a boolean environment flag ("true"/"1"/"yes" = true, case-insensitive).
+ *
+ * @param {string|undefined} value - Raw environment value
+ * @param {boolean} fallback - Value when unset or empty
+ * @returns {boolean}
+ */
+export function parseBooleanFlag(value, fallback) {
+	const raw = (value || "").trim().toLowerCase();
+	if (!raw) return fallback;
+	return raw === "true" || raw === "1" || raw === "yes";
 }
 
 /**
@@ -156,7 +186,8 @@ export function getOllamaConfig() {
  * /v1/models (an explicit smaller value still wins as a tighter budget).
  *
  * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
- *   maxOutputTokens: number, requestTimeoutMs: number, maxToolOutputChars: number}}
+ *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
+ *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean}}
  */
 export function getVllmConfig() {
 	const contextWindow = parsePositiveInt(process.env.VLLM_CONTEXT_LENGTH, 32768);
@@ -167,23 +198,99 @@ export function getVllmConfig() {
 		apiKey: process.env.VLLM_API_KEY || "vllm",
 		model: (process.env.VLLM_MODEL || "").trim(),
 		contextWindow,
+		// "Explicit" means a VALID value: an invalid one falls back to the default
+		// and must not be treated as an operator decision
+		contextLengthExplicit: isPositiveInt(process.env.VLLM_CONTEXT_LENGTH),
 		maxOutputTokens,
 		requestTimeoutMs: parsePositiveInt(process.env.VLLM_REQUEST_TIMEOUT_MS, 300000),
 		maxToolOutputChars: parsePositiveInt(
 			process.env.VLLM_MAX_TOOL_OUTPUT_CHARS,
 			defaultToolOutputChars(contextWindow, maxOutputTokens)
 		),
+		maxToolOutputCharsExplicit: isPositiveInt(process.env.VLLM_MAX_TOOL_OUTPUT_CHARS),
 	};
+}
+
+/**
+ * Get the generic OpenAI-compatible backend configuration from environment
+ * variables (AI_PROVIDER=openai-compatible).
+ *
+ * This provider makes no assumption about the server beyond the OpenAI
+ * Responses API surface: AI_MODEL is therefore required (a gateway typically
+ * serves many models), image input is opt-in (AI_IMAGE_INPUT), the strict
+ * chat-template conforming that vLLM needs is opt-in (AI_STRICT_INPUT), and
+ * the knowledge base is enabled only when an embedding model is configured
+ * (AI_EMBEDDING_MODEL, served from AI_EMBEDDING_BASE_URL or, by default, the
+ * same base URL).
+ *
+ * @returns {{baseUrl: string, apiKey: string, model: string, contextWindow: number,
+ *   contextLengthExplicit: boolean, maxOutputTokens: number, requestTimeoutMs: number,
+ *   maxToolOutputChars: number, maxToolOutputCharsExplicit: boolean,
+ *   imageInput: boolean, strictInput: boolean}}
+ */
+export function getOpenAiCompatibleConfig() {
+	const contextWindow = parsePositiveInt(process.env.AI_CONTEXT_LENGTH, 32768);
+	const maxOutputTokens = parsePositiveInt(process.env.AI_MAX_OUTPUT_TOKENS, 4000);
+
+	return {
+		baseUrl: (process.env.AI_BASE_URL || "http://localhost:8000/v1").replace(/\/+$/, ""),
+		// Some gateways enforce a key, some ignore it; the SDK requires one either way
+		apiKey: process.env.AI_API_KEY || "none",
+		model: (process.env.AI_MODEL || "").trim(),
+		contextWindow,
+		// "Explicit" means a VALID value: an invalid one falls back to the default
+		// and must not be treated as an operator decision
+		contextLengthExplicit: isPositiveInt(process.env.AI_CONTEXT_LENGTH),
+		maxOutputTokens,
+		requestTimeoutMs: parsePositiveInt(process.env.AI_REQUEST_TIMEOUT_MS, 300000),
+		maxToolOutputChars: parsePositiveInt(
+			process.env.AI_MAX_TOOL_OUTPUT_CHARS,
+			defaultToolOutputChars(contextWindow, maxOutputTokens)
+		),
+		maxToolOutputCharsExplicit: isPositiveInt(process.env.AI_MAX_TOOL_OUTPUT_CHARS),
+		imageInput: parseBooleanFlag(process.env.AI_IMAGE_INPUT, false),
+		strictInput: parseBooleanFlag(process.env.AI_STRICT_INPUT, false),
+	};
+}
+
+/**
+ * Per-task `input_type` values an embedding API requires, if any.
+ *
+ * @param {string} model - Embedding model name
+ * @returns {{query: string, document: string}} Empty strings = field not sent
+ */
+export function getEmbeddingInputTypes(model) {
+	const queryOverride = process.env.AI_EMBEDDING_QUERY_INPUT_TYPE;
+	const documentOverride = process.env.AI_EMBEDDING_DOCUMENT_INPUT_TYPE;
+	if (queryOverride !== undefined || documentOverride !== undefined) {
+		return { query: (queryOverride || "").trim(), document: (documentOverride || "").trim() };
+	}
+	// NVIDIA retrieval embedders (nv-embedqa-e5-v5, llama-3.2-nv-embedqa-1b-v2,
+	// nv-embed-v1, ...) reject requests without input_type
+	if (/nv-embed|embedqa/i.test(model)) {
+		return { query: "query", document: "passage" };
+	}
+	return { query: "", document: "" };
 }
 
 /**
  * Get the embedding backend for the local knowledge base, based on the active
  * AI provider. Returns null when no embedding backend applies (OpenAI mode
  * uses hosted file_search; vLLM mode needs a dedicated endpoint because a
- * vLLM instance serves a single model, so the chat instance cannot embed).
+ * vLLM instance serves a single model, so the chat instance cannot embed;
+ * the generic openai-compatible mode needs AI_EMBEDDING_MODEL, served from
+ * AI_EMBEDDING_BASE_URL or the chat base URL).
+ *
+ * The openai-compatible entry may carry `inputTypes`: some embedding APIs
+ * (NVIDIA NIM's nv-embedqa / nv-embed models) require a per-request
+ * `input_type` of "query" or "passage" instead of, or in addition to, the text
+ * prefixes other models use. Detected from the model name, overridable with
+ * AI_EMBEDDING_QUERY_INPUT_TYPE / AI_EMBEDDING_DOCUMENT_INPUT_TYPE (set both
+ * empty to send none).
  *
  * @param {string} [providerName] - Provider name (defaults to the active one)
- * @returns {{baseUrl: string, apiKey: string, model: string}|null}
+ * @returns {{baseUrl: string, apiKey: string, model: string,
+ *   inputTypes?: {query: string, document: string}}|null}
  */
 export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
 	if (providerName === PROVIDER_OLLAMA) {
@@ -199,6 +306,19 @@ export function getEmbeddingBackendConfig(providerName = getAiProviderName()) {
 			baseUrl,
 			apiKey: process.env.VLLM_EMBEDDING_API_KEY || process.env.VLLM_API_KEY || "vllm",
 			model,
+		};
+	}
+
+	if (providerName === PROVIDER_OPENAI_COMPATIBLE) {
+		const chat = getOpenAiCompatibleConfig();
+		const model = (process.env.AI_EMBEDDING_MODEL || "").trim();
+		if (!model) return null;
+		const baseUrl = (process.env.AI_EMBEDDING_BASE_URL || "").trim().replace(/\/+$/, "");
+		return {
+			baseUrl: baseUrl || chat.baseUrl,
+			apiKey: process.env.AI_EMBEDDING_API_KEY || chat.apiKey,
+			model,
+			inputTypes: getEmbeddingInputTypes(model),
 		};
 	}
 
