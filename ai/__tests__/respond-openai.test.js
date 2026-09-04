@@ -311,6 +311,90 @@ describe("respond in OpenAI mode: system prompt versioning", () => {
 		expect(streamOnceMock.mock.calls[0][0].previous_response_id).toBe("resp_old");
 	});
 
+	it("continues the previous chain under its own version when the thread cannot be fetched completely", async () => {
+		streamOnceMock.mockImplementationOnce(async (_params, { onStreamStart }) => {
+			await onStreamStart("resp_new");
+			return textResult("Disks are fine.");
+		});
+		const threadTs = `200.${threadCounter}`;
+		const firstPage = threadWith(
+			{ event_type: "openai_context", event_payload: { response_id: "resp_old" } },
+			threadTs
+		);
+		const harness = makeHarness({ threadTs, threadMessages: firstPage });
+		harness.client.conversations.replies = jest
+			.fn()
+			.mockResolvedValueOnce({
+				messages: firstPage,
+				has_more: true,
+				response_metadata: { next_cursor: "cursor-2" },
+			})
+			.mockRejectedValue(
+				Object.assign(new Error("An API error occurred: fatal_error"), {
+					code: "slack_webapi_platform_error",
+				})
+			);
+
+		await runRespond(harness);
+
+		// First page + the failing page + its retry
+		expect(harness.client.conversations.replies).toHaveBeenCalledTimes(3);
+		const [params] = streamOnceMock.mock.calls[0];
+		// The intact old chain is kept rather than replaced by a partial replay
+		expect(params.previous_response_id).toBe("resp_old");
+		expect(allText(params.input)).not.toContain("You are M8B");
+		expect(harness.logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining("continuing the previous chain")
+		);
+		// ...and the reply is stamped with THAT chain's (unversioned) prompt, so
+		// the restart is attempted again on the next turn
+		expect(harness.client.chatStream).toHaveBeenCalledWith(
+			expect.objectContaining({
+				metadata: expect.objectContaining({
+					event_payload: expect.objectContaining({ response_id: "resp_new", prompt_version: null }),
+				}),
+			})
+		);
+	});
+
+	it("restarts a chain cached in this process when the prompt changed since it was cached", async () => {
+		const threadTs = `200.${threadCounter}`;
+		const thread = threadWith(undefined, threadTs);
+
+		// Turn 1: fresh thread, the response is cached in-process under the current prompt
+		streamOnceMock.mockResolvedValueOnce(textResult("It is fine.", "resp_turn1"));
+		await runRespond(makeHarness({ threadTs, threadMessages: thread }));
+
+		// Turn 2, same prompt: the cached chain is continued
+		streamOnceMock.mockResolvedValueOnce(textResult("Still fine.", "resp_turn2"));
+		await runRespond(makeHarness({ threadTs, threadMessages: thread }));
+		expect(streamOnceMock.mock.calls[1][0].previous_response_id).toBe("resp_turn1");
+
+		// The prompt changes within the process (e.g. a workspace name resolved late)
+		process.env.M8B_PROMPT_EXTRA = "Storage alerts go to #storage-ops.";
+		loadDeploymentNotes();
+
+		// Turn 3: the cached chain runs under the old prompt, so it is restarted
+		streamOnceMock.mockResolvedValueOnce(textResult("Disks are fine.", "resp_turn3"));
+		const harness = makeHarness({ threadTs, threadMessages: thread });
+		await runRespond(harness);
+
+		const [params] = streamOnceMock.mock.calls[2];
+		expect(params.previous_response_id).toBeFalsy();
+		const text = allText(params.input);
+		expect(text).toContain("You are M8B");
+		expect(text).toContain("Storage alerts go to #storage-ops.");
+		expect(text).toContain("Is SRV-WEB-01 okay?");
+		expect(harness.logger.info).toHaveBeenCalledWith(
+			expect.stringContaining("restarting the chain with the full thread history")
+		);
+
+		// Turn 4: the restarted chain is cached under the new prompt and continued
+		streamOnceMock.mockResolvedValueOnce(textResult("Yes.", "resp_turn4"));
+		await runRespond(makeHarness({ threadTs, threadMessages: thread }));
+		expect(streamOnceMock.mock.calls[3][0].previous_response_id).toBe("resp_turn3");
+	});
+
 	it("stamps the current prompt version into the reply's Slack metadata", async () => {
 		streamOnceMock.mockImplementationOnce(async (_params, { onStreamStart }) => {
 			await onStreamStart("resp_new");

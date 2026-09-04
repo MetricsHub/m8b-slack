@@ -78,9 +78,11 @@ import {
 } from "./utils/tokens.js";
 
 /**
- * In-memory cache: threadTs -> last OpenAI response_id
- * Used to maintain conversation continuity across messages (OpenAI mode only).
- * Cleared on bot restart.
+ * In-memory cache: threadTs -> { responseId, promptVersion } of the last
+ * OpenAI response, i.e. the chain to continue and the system prompt it runs
+ * under. Used to maintain conversation continuity across messages (OpenAI
+ * mode only). Cleared on bot restart.
+ * @type {Map<string, {responseId: string, promptVersion: string|null}>}
  */
 const threadResponseCache = new Map();
 
@@ -97,31 +99,38 @@ const MAX_THREAD_PAGES = 20;
 
 /**
  * Follow conversations.replies pagination from an already-fetched first page
- * and return the complete thread (first page + every following page).
- * On a Slack error midway, returns what was collected so far: a partial
- * replay is still better than the chain it replaces.
+ * and return the complete thread (first page + every following page). Each
+ * page is retried once on a Slack error; the function throws rather than
+ * return a partial thread, because its caller is about to replace a chain
+ * that still holds the missing turns.
  *
  * @param {Object} client - Slack WebClient
  * @param {Object} repliesArgs - Arguments used for the first page (channel, ts, ...)
  * @param {Object} firstPage - Result of the first conversations.replies call
  * @param {Object} [logger]
  * @returns {Promise<Array>} All thread messages in Slack order
+ * @throws {Error} When a page cannot be fetched or the thread has too many pages
  */
 async function fetchRemainingThreadPages(client, repliesArgs, firstPage, logger) {
 	const messages = [...(firstPage.messages || [])];
 	let cursor = firstPage.response_metadata?.next_cursor;
 	let pages = 0;
-	while (cursor && pages < MAX_THREAD_PAGES) {
+	while (cursor) {
+		if (pages >= MAX_THREAD_PAGES) {
+			throw new Error(`thread has more than ${MAX_THREAD_PAGES} pages`);
+		}
 		pages += 1;
+		const pageArgs = { ...repliesArgs, limit: 200, cursor };
 		let page;
 		try {
-			page = await client.conversations.replies({ ...repliesArgs, limit: 200, cursor });
+			page = await client.conversations.replies(pageArgs);
 		} catch (e) {
-			logger?.warn?.("Failed to fetch a further thread page; replaying what was collected", {
+			logger?.warn?.("conversations.replies page failed; retrying once", {
 				message: e?.message,
 				pages,
 			});
-			break;
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			page = await client.conversations.replies(pageArgs);
 		}
 		messages.push(...(page.messages || []));
 		cursor = page.has_more ? page.response_metadata?.next_cursor : null;
@@ -395,35 +404,55 @@ async function respondCore({
 		let previousResponseId = null;
 		// Hosted chains only carry the system prompt from their first turn: when
 		// the thread was started under another prompt (older code, changed
-		// deployment notes) the chain is dropped and re-seeded with the current
-		// prompt plus the whole thread history rebuilt from Slack
+		// deployment notes, organization name resolved late) the chain is
+		// dropped and re-seeded with the current prompt plus the whole thread
+		// history rebuilt from Slack
 		let restartHostedChain = false;
+		// The prompt the chain this turn extends actually runs under: stamped
+		// into the reply's metadata and the cache. Differs from promptVersion
+		// only when an old chain has to be continued although it is stale.
+		let chainPromptVersion = promptVersion;
 		if (!stateless) {
-			// Find previous bot response for continuity
+			// Find previous bot response for continuity: the in-process cache
+			// first, then the Slack message metadata
 			const lastBot = findLastBotMessage(messages, context, logger);
+			const cached = threadResponseCache.get(thread_ts);
+			const resume =
+				cached ??
+				(lastBot.responseId
+					? { responseId: lastBot.responseId, promptVersion: lastBot.promptVersion }
+					: null);
 
-			// Try cache first (always this process's prompt), fall back to message metadata
-			const cachedResponseId = threadResponseCache.get(thread_ts);
-			if (cachedResponseId) {
-				previousResponseId = cachedResponseId;
-			} else if (lastBot.responseId && lastBot.promptVersion !== promptVersion) {
+			if (resume && resume.promptVersion !== promptVersion) {
 				restartHostedChain = true;
 				logger.info(
-					`Previous response ${lastBot.responseId} was produced under system prompt ${lastBot.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
+					`Previous response ${resume.responseId} was produced under system prompt ${resume.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
 				);
-			} else {
-				previousResponseId = lastBot.responseId;
+			} else if (resume) {
+				previousResponseId = resume.responseId;
 			}
 			logger.info(
-				`Previous response ID: ${previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
+				`Previous response ID: ${previousResponseId} (from ${cached ? "cache" : "metadata"})`
 			);
-		}
 
-		// A restarted chain replays the whole thread: the first page above is
-		// only a window, so fetch the remaining pages before dropping the
-		// server-side chain that held the older turns
-		if (restartHostedChain && thread.has_more) {
-			messages = await fetchRemainingThreadPages(client, repliesArgs, thread, logger);
+			// A restarted chain replays the whole thread: the first page above is
+			// only a window, so fetch the remaining pages before dropping the
+			// server-side chain that held the older turns. If Slack cannot hand
+			// out the whole thread right now, the intact old chain is continued
+			// (stamped with ITS prompt version so the restart is attempted again
+			// on the next turn) rather than replaced by a partial replay.
+			if (restartHostedChain && thread.has_more) {
+				try {
+					messages = await fetchRemainingThreadPages(client, repliesArgs, thread, logger);
+				} catch (e) {
+					logger.warn(
+						`Could not fetch the whole thread (${e?.message}); continuing the previous chain under its own prompt version for this turn`
+					);
+					restartHostedChain = false;
+					previousResponseId = resume.responseId;
+					chainPromptVersion = resume.promptVersion;
+				}
+			}
 		}
 
 		// Human participants in this thread (bot messages excluded). Used to warn
@@ -737,7 +766,7 @@ async function respondCore({
 					safetyIdentifier,
 					thread_ts,
 					fileManager,
-					promptVersion,
+					promptVersion: chainPromptVersion,
 					say,
 					logger,
 				});
@@ -779,7 +808,7 @@ async function respondCore({
 						safetyIdentifier,
 						thread_ts,
 						fileManager,
-						promptVersion,
+						promptVersion: chainPromptVersion,
 						say,
 						logger,
 					});
@@ -828,8 +857,11 @@ async function respondCore({
 				lastSeenResponseId = responseId;
 				if (!stateless) {
 					_previousResponseId = responseId;
-					// Cache the response ID for this thread
-					threadResponseCache.set(thread_ts, responseId);
+					// Cache the response ID for this thread, with the prompt its chain runs under
+					threadResponseCache.set(thread_ts, {
+						responseId,
+						promptVersion: chainPromptVersion,
+					});
 				}
 			}
 			if (hadText) anyTextStreamed = true;
@@ -1053,7 +1085,7 @@ async function respondCore({
 					say,
 					suggestSummarizeNow,
 					uploadedFilesThisTurn: fileManager.uploadedFilesThisTurn,
-					promptVersion,
+					promptVersion: chainPromptVersion,
 					safetyIdentifier,
 					logger,
 				});
