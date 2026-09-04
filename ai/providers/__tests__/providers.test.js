@@ -1106,15 +1106,42 @@ describe("openai-compatible provider (generic)", () => {
 		expect(health.error).toContain("nemotron-super");
 	});
 
-	it("refuses to start without AI_MODEL (never guesses a gateway's model)", () => {
+	it("adopts the single served model when AI_MODEL is unset", async () => {
 		delete process.env.AI_MODEL;
 		resetProviderCache();
+		mockModelsEndpoint({ models: [{ id: "only-one", context_length: 32768 }] });
 
-		expect(() => getProvider()).toThrow(/AI_MODEL/);
+		const provider = getProvider();
+		expect(provider.model).toBe("");
 
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(true);
+		expect(provider.model).toBe("only-one");
+		expect(provider.buildRequest({ input: [] }).model).toBe("only-one");
+	});
+
+	it("never guesses among several served models: AI_MODEL is then required", async () => {
 		process.env.AI_MODEL = "   ";
 		resetProviderCache();
-		expect(() => getProvider()).toThrow(/AI_MODEL/);
+		mockModelsEndpoint({ models: GATEWAY_MODELS });
+
+		const provider = getProvider();
+		const health = await provider.healthCheck();
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("AI_MODEL");
+		expect(health.error).toContain("nemotron-super");
+		// Left without a model: app.js refuses to start in that state
+		expect(provider.model).toBe("");
+	});
+
+	it("cannot adopt a model when /v1/models is not implemented", async () => {
+		delete process.env.AI_MODEL;
+		resetProviderCache();
+		mockModelsEndpoint({ status: 404 });
+
+		const health = await getProvider().healthCheck();
+		expect(health.ok).toBe(false);
+		expect(health.error).toContain("AI_MODEL");
 	});
 
 	it("degrades to an unverified health check when /v1/models is not implemented", async () => {

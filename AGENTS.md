@@ -220,9 +220,11 @@ This runs: `format:check` → `lint` → `test` (TypeScript type checking is sep
 - The generic `openai-compatible` provider (`ai/providers/openai-compatible-provider.js`) is the
   shared implementation: stateless, function tools only, universally supported request fields
   only. Model-dependent behaviors are OPTIONS (`imageInput`, `strictInput`,
-  `adoptSingleServedModel`), not hard-coded: `vllm` is a preset of it (all three on), the generic
-  mode reads them from `AI_IMAGE_INPUT`/`AI_STRICT_INPUT` and requires `AI_MODEL`. Add new
-  server-specific quirks as options there, never as `if (name === ...)` branches
+  `tolerateMissingModelList`), not hard-coded: `vllm` is a preset of it (images + strict input on,
+  model list required), the generic mode reads them from `AI_IMAGE_INPUT`/`AI_STRICT_INPUT`. Both
+  adopt the single served model when `AI_MODEL` is unset; `app.js` refuses to start when the
+  health check ends without a model. Add new server-specific quirks as options there, never as
+  `if (name === ...)` branches
 - In local modes (ollama/vllm/openai-compatible), never send data to OpenAI (no silent fallback)
 
 ## Key Files Reference

@@ -82,6 +82,14 @@ const app = new App({
 		} catch (e) {
 			app.logger.warn("AI backend health check errored", e);
 		}
+		// A backend that is merely unreachable may come back; a provider that
+		// ended up without a model never can serve a request (every call would
+		// go out with model ""), so that configuration is refused up front.
+		if (!aiProvider.model) {
+			throw new Error(
+				"No AI model configured: set AI_MODEL (or let the endpoint serve exactly one model). See the health check output above."
+			);
+		}
 
 		// Age-based cleanup of the local media store (screenshots saved for the
 		// native-vision provider); no-op unless M8B_MEDIA_BASE_URL is configured

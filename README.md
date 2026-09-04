@@ -206,7 +206,7 @@ defaults differ per preset:
 AI_PROVIDER=ollama|vllm|openai-compatible
 AI_BASE_URL=http://host:port/v1       # default: Ollama http://localhost:11434/v1, vLLM/generic http://localhost:8000/v1
 AI_API_KEY=...                        # bearer token; default dummy value (the SDK requires one even if the server ignores it)
-AI_MODEL=...                          # Ollama default qwen3.8:27b; vLLM: adopted from the single served model; generic: REQUIRED
+AI_MODEL=...                          # Ollama default qwen3.8:27b; vLLM/generic: adopted when the endpoint serves exactly one model
 AI_CONTEXT_LENGTH=32768               # the model's context window (see the detection rules above)
 AI_MAX_OUTPUT_TOKENS=4000
 # AI_REQUEST_TIMEOUT_MS=300000
@@ -278,7 +278,7 @@ For an endpoint that is neither Ollama nor vLLM (a corporate inference gateway, 
 AI_PROVIDER=openai-compatible
 AI_BASE_URL=https://inference.example.com/v1
 AI_API_KEY=...
-AI_MODEL=llama-3.3-70b-instruct       # REQUIRED: a gateway serves many models, the bot never guesses
+AI_MODEL=llama-3.3-70b-instruct       # required when the gateway serves several models (the bot never guesses)
 AI_CONTEXT_LENGTH=131072              # gateways rarely report it (see below)
 # AI_IMAGE_INPUT=true                 # the model reads images natively (then configure M8B_MEDIA_*)
 # AI_STRICT_INPUT=true                # single leading system message, string assistant history
@@ -291,9 +291,12 @@ and a reported `max_model_len` / `context_length` sizes the context window as in
 gateways do not report it: set `AI_CONTEXT_LENGTH` to the served model's real window, otherwise
 the bot runs on a 32k default and warns at startup. A gateway that does not expose `/v1/models`
 passes the check with a warning (model unverified); authentication or server errors on that
-endpoint fail it, and so does any `/v1/models` failure in vLLM mode. A missing `AI_MODEL` stops
-the bot at startup, and an `AI_MAX_OUTPUT_TOKENS` that leaves the prompt fewer than 8k tokens of
-the context window is flagged. When `AI_EMBEDDING_MODEL` is set, the health
+endpoint fail it, and so does any `/v1/models` failure in vLLM mode. Without `AI_MODEL` the bot
+adopts the only served model; when several are served, or the model list is unavailable, it
+stops at startup rather than run without a model. An `AI_MAX_OUTPUT_TOKENS` that leaves the prompt
+fewer than 8k tokens of the context window is flagged. Running vLLM through this preset works
+too: it is exactly `openai-compatible` with `AI_IMAGE_INPUT=true` and `AI_STRICT_INPUT=true`; the
+`vllm` name only saves those two lines and keeps `/v1/models` failures fatal. When `AI_EMBEDDING_MODEL` is set, the health
 check also sends one test embedding request and warns if it fails; at runtime an embedding
 failure makes `search_knowledge_base` report the knowledge base as unavailable for that call,
 nothing else breaks. Without an embedding model, neither `search_knowledge_base` nor
