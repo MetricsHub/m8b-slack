@@ -119,8 +119,13 @@ function safeFromCodePoint(code) {
 // title extraction.
 // ---------------------------------------------------------------------------
 
-/** Elements whose content is raw text (no tags inside) until their closer */
-const RAW_TEXT_ELEMENTS = new Set(["script", "style", "textarea", "title", "xmp"]);
+/**
+ * Elements whose content is not markup until their closer: raw text that is
+ * never shown (script, style, xmp) and escapable raw text that is (title,
+ * textarea) — the latter is reported through onText.
+ */
+const RAW_TEXT_ELEMENTS = new Set(["script", "style", "xmp"]);
+const RCDATA_ELEMENTS = new Set(["title", "textarea"]);
 
 /** Elements that never have a closing tag */
 const VOID_ELEMENTS = new Set([
@@ -179,7 +184,7 @@ function isTagNameChar(code) {
  * element swallows the rest of the input, as the HTML tokenizer does.
  *
  * @param {string} html - Markup
- * @param {(tag: {name: string, closing: boolean, selfClosing: boolean}) => (boolean|void)} onTag
+ * @param {(tag: {name: string, closing: boolean, selfClosing: boolean, start: number, end: number, attrs: string}) => (boolean|void)} onTag
  * @param {(text: string) => (boolean|void)} onText
  */
 function tokenizeHtml(html, onTag, onText) {
@@ -235,20 +240,52 @@ function tokenizeHtml(html, onTag, onText) {
 		const gt = gtAfter(nameEnd);
 		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
 		const name = html.slice(nameStart, nameEnd).toLowerCase();
+		// The "/>" slash only means something on void elements (and in foreign
+		// content); the HTML parser opens <div/> like <div>. Reported as a fact,
+		// consumers decide.
 		const selfClosing = !closing && gt > nameEnd && html.charCodeAt(gt - 1) === 47;
-		if (onTag({ name, closing, selfClosing }) === false) return;
+		const tag = { name, closing, selfClosing, start: lt, end: gt + 1, attrs: "" };
+		if (!closing && gt > nameEnd) tag.attrs = html.slice(nameEnd, selfClosing ? gt - 1 : gt);
+		if (onTag(tag) === false) return;
 		pos = gt + 1;
 
-		if (!closing && RAW_TEXT_ELEMENTS.has(name)) {
-			// Raw text until the matching closer (or the end of input)
+		if (!closing && (RAW_TEXT_ELEMENTS.has(name) || RCDATA_ELEMENTS.has(name))) {
+			// Not markup until the matching closer (or the end of input)
 			if (lower === null) lower = html.toLowerCase();
 			const close = lower.indexOf(`</${name}`, pos);
+			const bodyEnd = close === -1 ? length : close;
+			if (RCDATA_ELEMENTS.has(name) && bodyEnd > pos) {
+				if (onText(html.slice(pos, bodyEnd)) === false) return;
+			}
 			if (close === -1) return;
 			const closeGt = gtAfter(close);
-			if (onTag({ name, closing: true, selfClosing: false }) === false) return;
-			pos = closeGt === -1 ? length : closeGt + 1;
+			const closeEnd = closeGt === -1 ? length : closeGt + 1;
+			const closer = {
+				name,
+				closing: true,
+				selfClosing: false,
+				start: close,
+				end: closeEnd,
+				attrs: "",
+			};
+			if (onTag(closer) === false) return;
+			pos = closeEnd;
 		}
 	}
+}
+
+/**
+ * Value of an attribute in a raw attribute string (quoted or bare), or null.
+ * Bounded by the attribute string itself, which the tokenizer has already
+ * delimited with the tag's own ">".
+ */
+function attributeValue(attrs, name) {
+	const match = new RegExp(
+		`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`,
+		"i"
+	).exec(attrs);
+	if (!match) return null;
+	return match[1] ?? match[2] ?? match[3] ?? null;
 }
 
 /**
@@ -268,37 +305,41 @@ function hasTextOfAtLeast(html, minimum) {
 }
 
 /**
- * Text content of a fragment (tags dropped, raw-text bodies skipped), linear.
- */
-function textOfHtml(html) {
-	const parts = [];
-	tokenizeHtml(
-		html,
-		() => undefined,
-		(text) => {
-			parts.push(text);
-		}
-	);
-	return decodeHtmlEntities(parts.join(" ")).replace(/\s+/g, " ").trim();
-}
-
-/**
  * Narrow the document to the region worth reading: a single <main>, else a
- * single <article>, else the <body>, else everything. Index scans only.
+ * single <article>, else the <body>, else everything. One tokenizer pass
+ * records where the exact main/article/body tags are (a <main-menu> custom
+ * element or a "<main" inside a script is not a <main>).
  */
 function selectContentRegion(html) {
-	const lower = html.toLowerCase();
+	const marks = {
+		main: { opens: 0, start: -1, end: -1 },
+		article: { opens: 0, start: -1, end: -1 },
+		body: { opens: 0, start: -1, end: -1 },
+	};
+	tokenizeHtml(
+		html,
+		({ name, closing, start }) => {
+			const mark = marks[name];
+			if (!mark) return;
+			if (closing) {
+				mark.end = start; // the last closer wins
+			} else {
+				mark.opens++;
+				if (mark.start === -1) mark.start = start;
+			}
+		},
+		() => undefined
+	);
+
 	for (const tag of ["main", "article"]) {
-		const start = lower.indexOf(`<${tag}`);
-		if (start === -1 || lower.indexOf(`<${tag}`, start + 1) !== -1) continue;
-		const end = lower.lastIndexOf(`</${tag}`);
+		const { opens, start, end } = marks[tag];
+		if (opens !== 1) continue;
 		const region = end > start ? html.slice(start, end) : html.slice(start);
 		if (hasTextOfAtLeast(region, 200)) return region;
 	}
-	const bodyStart = lower.indexOf("<body");
-	if (bodyStart === -1) return html;
-	const bodyEnd = lower.lastIndexOf("</body");
-	return bodyEnd > bodyStart ? html.slice(bodyStart, bodyEnd) : html.slice(bodyStart);
+	const body = marks.body;
+	if (body.start === -1) return html;
+	return body.end > body.start ? html.slice(body.start, body.end) : html.slice(body.start);
 }
 
 /**
@@ -329,15 +370,34 @@ const MAX_URL_CHARS_PER_DOCUMENT = 300000;
 function estimateMaxNestingDepth(html) {
 	const stack = [];
 	let max = 0;
+	// Foreign content (svg, math) honours "/>" and is dropped by the converter
+	// anyway: skipped as a whole so inline icons and charts never count
+	let foreign = null;
+	let foreignDepth = 0;
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing }) => {
+			if (foreign) {
+				if (name === foreign && !(selfClosing && !closing)) {
+					foreignDepth += closing ? -1 : 1;
+					if (foreignDepth === 0) foreign = null;
+				}
+				return true;
+			}
 			if (closing) {
 				const index = stack.lastIndexOf(name);
 				if (index !== -1) stack.length = index;
 				return true;
 			}
-			if (selfClosing || VOID_ELEMENTS.has(name)) return true;
+			if (name === "svg" || name === "math") {
+				if (!selfClosing) {
+					foreign = name;
+					foreignDepth = 1;
+				}
+				return true;
+			}
+			// "<div/>" opens a div: the slash is only meaningful on void elements
+			if (VOID_ELEMENTS.has(name)) return true;
 			const closes = IMPLICIT_CLOSERS[name];
 			if (closes) {
 				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) stack.pop();
@@ -391,14 +451,17 @@ function stripTagsFallback(html) {
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing }) => {
+			// "<nav/>" opens a nav like the parser does: the slash only counts on
+			// foreign content (svg, math), where an empty element really is empty
+			const emptyForeign = selfClosing && (name === "svg" || name === "math");
 			if (skipping) {
-				if (name === skipping && !selfClosing) {
+				if (name === skipping && !emptyForeign) {
 					skipDepth += closing ? -1 : 1;
 					if (skipDepth === 0) skipping = null;
 				}
 				return true;
 			}
-			if (!closing && !selfClosing && FALLBACK_DROP.has(name)) {
+			if (!closing && !emptyForeign && FALLBACK_DROP.has(name)) {
 				skipping = name;
 				skipDepth = 1;
 				return true;
@@ -425,10 +488,71 @@ function stripTagsFallback(html) {
  * @returns {string} Title text, or "" when none is found
  */
 export function extractHtmlTitle(html) {
+	// One tokenizer pass: the first <title> wins; the first <h1> is the fallback
 	const source = String(html ?? "");
-	const title = source.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
-	const raw = title?.[1] || source.match(/<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i)?.[1] || "";
-	return textOfHtml(raw);
+	let title = null;
+	let heading = null;
+	let collecting = null; // "title" | "h1" while inside the element being captured
+	let buffer = [];
+	tokenizeHtml(
+		source,
+		({ name, closing }) => {
+			if (collecting) {
+				if (name === collecting && closing) {
+					const text = buffer.join(" ");
+					if (collecting === "title") title = text;
+					else heading = text;
+					collecting = null;
+					buffer = [];
+					return title === null; // stop once the title is known
+				}
+				return true;
+			}
+			if (!closing && name === "title" && title === null) collecting = "title";
+			else if (!closing && name === "h1" && heading === null) collecting = "h1";
+			return true;
+		},
+		(text) => {
+			if (collecting) buffer.push(text);
+			return true;
+		}
+	);
+	return decodeHtmlEntities(title ?? heading ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/**
+ * Effective base URL of a document: its first <base href> (resolved against
+ * the response URL, as browsers do), else the response URL itself. One
+ * tokenizer pass that stops at the first <base> or at the end of <head>.
+ *
+ * @param {string} html - Full document
+ * @param {string|undefined} responseUrl - URL the document was fetched from
+ * @returns {string|undefined}
+ */
+function documentBaseUrl(html, responseUrl) {
+	let base = responseUrl;
+	tokenizeHtml(
+		html,
+		({ name, closing, attrs }) => {
+			if (name === "base" && !closing) {
+				const href = attributeValue(attrs, "href");
+				if (href && !/^(?:javascript|data|vbscript):/i.test(href.trim())) {
+					try {
+						base = responseUrl ? new URL(href.trim(), responseUrl).toString() : href.trim();
+					} catch {
+						// Malformed base: keep the response URL
+					}
+				}
+				return false;
+			}
+			// <base> belongs in <head>: past it (or into the body) there is none
+			return !((name === "head" && closing) || name === "body");
+		},
+		() => undefined
+	);
+	return base;
 }
 
 function resolveUrl(href, baseUrl) {
@@ -515,9 +639,13 @@ export function htmlToMarkdown(html, { baseUrl } = {}) {
 	let source = String(html ?? "");
 	if (!source.trim()) return "";
 
-	// Region first (linear string scan), then a real HTML parse: the DOM handles
-	// comments, broken markup and unterminated tags; DROP_ELEMENTS are removed
-	// as nodes, whatever their nesting
+	// <base href> (first one wins, as in browsers) changes what relative links
+	// resolve against; it lives in the head, which the region selection drops
+	const effectiveBase = documentBaseUrl(source, baseUrl);
+
+	// Region first (linear tokenizer pass), then a real HTML parse: the DOM
+	// handles comments, broken markup and unterminated tags; DROP_ELEMENTS are
+	// removed as nodes, whatever their nesting
 	source = selectContentRegion(source);
 
 	// Hostile nesting depth: the parser's cost grows quadratically with it and
@@ -528,28 +656,50 @@ export function htmlToMarkdown(html, { baseUrl } = {}) {
 
 	let markdown;
 	try {
-		markdown = createConverter(baseUrl).turndown(source);
+		markdown = createConverter(effectiveBase).turndown(source);
 	} catch {
 		// Parser failure or stack exhaustion on input the estimate let through:
 		// degrade to plain text rather than fail the whole read
 		return stripTagsFallback(source);
 	}
 
-	// Post-pass: compact list markers (Turndown pads them to a 4-column
-	// indent), punctuation glued back to the word it follows, no runs of
-	// blank lines. Fenced code blocks are left untouched (private-use code
-	// points delimit the placeholders; real text never contains them).
-	const codeBlocks = [];
-	markdown = markdown.replace(/```[\s\S]*?```/g, (block) => {
-		codeBlocks.push(block);
-		return `${codeBlocks.length - 1}`;
-	});
-	markdown = markdown
-		.replace(/^(\s*)-\s{2,}(?=\S)/gm, "$1- ")
-		.replace(/^(\s*\d+\.)\s{2,}(?=\S)/gm, "$1 ")
-		.replace(/ +([,.;:!?)\]])/g, "$1")
-		.replace(/\n{3,}/g, "\n\n")
-		.replace(/(\d+)/g, (_m, index) => codeBlocks[Number(index)] || "");
+	return tidyMarkdown(markdown).trim();
+}
 
-	return markdown.trim();
+/**
+ * Post-pass on Turndown's output: compact list markers (Turndown pads them to
+ * a 4-column indent), punctuation glued back to the word it follows, no runs
+ * of blank lines. Fenced code blocks are left untouched: the text is split at
+ * fence lines (Turndown escapes backticks in prose, so fences are its own) and
+ * only the prose segments are rewritten. No placeholder that page text could
+ * collide with, and the output can never grow.
+ */
+function tidyMarkdown(markdown) {
+	const out = [];
+	let prose = [];
+	let inFence = false;
+	const flush = () => {
+		if (prose.length === 0) return;
+		out.push(
+			prose
+				.join("\n")
+				.replace(/^(\s*)-\s{2,}(?=\S)/gm, "$1- ")
+				.replace(/^(\s*\d+\.)\s{2,}(?=\S)/gm, "$1 ")
+				.replace(/ +([,.;:!?)\]])/g, "$1")
+				.replace(/\n{3,}/g, "\n\n")
+		);
+		prose = [];
+	};
+	for (const line of markdown.split("\n")) {
+		if (/^\s*```/.test(line)) {
+			if (!inFence) flush();
+			out.push(line);
+			inFence = !inFence;
+			continue;
+		}
+		if (inFence) out.push(line);
+		else prose.push(line);
+	}
+	flush();
+	return out.join("\n").replace(/\n{3,}/g, "\n\n");
 }

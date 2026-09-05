@@ -453,7 +453,8 @@ function isTextualType(type) {
 }
 
 function decodeBody(bytes, charset, type) {
-	let label = charset;
+	// A UTF-16 byte-order mark (or declared charset) wins over any sniffing
+	let label = utf16Label(bytes, charset) || charset;
 	if (!label && type && HTML_TYPES.has(type)) {
 		// Sniff <meta charset> in the first bytes of the document
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
@@ -494,10 +495,25 @@ const BINARY_SIGNATURES = [
  * against servers that omit Content-Type (object stores, download endpoints).
  *
  * @param {Uint8Array} bytes - Response body
+ * @param {string|null} [charset] - Declared charset, when the server sent one
  * @returns {boolean}
  */
-export function looksBinary(bytes) {
+export function looksBinary(bytes, charset = null) {
 	if (!bytes || bytes.byteLength === 0) return false;
+
+	// UTF-16 text (declared, or announced by a byte-order mark) encodes most
+	// ASCII with a NUL byte: judge the decoded code units, not the bytes
+	const utf16 = utf16Label(bytes, charset);
+	if (utf16) {
+		let text;
+		try {
+			text = new TextDecoder(utf16, { fatal: false }).decode(bytes.subarray(0, 16384));
+		} catch {
+			return true;
+		}
+		return controlShare(Array.from(text.slice(0, 8192), (char) => char.charCodeAt(0))) > 0.05;
+	}
+
 	// Skip a UTF-8 BOM
 	const start = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
 	if (
@@ -508,23 +524,47 @@ export function looksBinary(bytes) {
 		return true;
 	}
 	const sample = bytes.subarray(start, start + 8192);
+	for (const byte of sample) if (byte === 0) return true;
+	return controlShare(sample) > 0.05;
+}
+
+/**
+ * "utf-16le" / "utf-16be" when the body is UTF-16 (declared charset or BOM), else null.
+ */
+function utf16Label(bytes, charset) {
+	const declared = String(charset || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]/g, "");
+	if (bytes[0] === 0xff && bytes[1] === 0xfe) return "utf-16le";
+	if (bytes[0] === 0xfe && bytes[1] === 0xff) return "utf-16be";
+	if (declared === "utf16be" || declared === "unicodefffe") return "utf-16be";
+	if (declared === "utf16" || declared === "utf16le" || declared === "ucs2") return "utf-16le";
+	return null;
+}
+
+/**
+ * Share of control characters (other than tab, LF, VT, FF, CR and ESC) in a
+ * sequence of byte values or code units. NUL counts as binary outright.
+ */
+function controlShare(values) {
 	let control = 0;
-	for (const byte of sample) {
-		if (byte === 0) return true;
-		// Control characters other than tab, LF, VT, FF, CR and ESC
+	let total = 0;
+	for (const value of values) {
+		total++;
+		if (value === 0) return 1;
 		if (
-			byte < 0x20 &&
-			byte !== 0x09 &&
-			byte !== 0x0a &&
-			byte !== 0x0b &&
-			byte !== 0x0c &&
-			byte !== 0x0d &&
-			byte !== 0x1b
+			value < 0x20 &&
+			value !== 0x09 &&
+			value !== 0x0a &&
+			value !== 0x0b &&
+			value !== 0x0c &&
+			value !== 0x0d &&
+			value !== 0x1b
 		) {
 			control++;
 		}
 	}
-	return control > sample.byteLength * 0.05;
+	return total === 0 ? 0 : control / total;
 }
 
 /**
@@ -732,11 +772,7 @@ function pagePathKey(rawUrl) {
 export function findLlmsTxtEntry(llmsText, pageUrl) {
 	const target = pagePathKey(pageUrl.toString());
 	if (target === null) return null;
-	const links = [
-		...String(llmsText || "").matchAll(/\]\(([^)\s]+)\)|^\s*-?\s*(https?:\/\/\S+)\s*$/gm),
-	];
-	for (const match of links) {
-		const href = match[1] || match[2];
+	for (const href of llmsTxtLinks(String(llmsText || ""))) {
 		let absolute;
 		try {
 			absolute = new URL(href, pageUrl).toString();
@@ -748,6 +784,46 @@ export function findLlmsTxtEntry(llmsText, pageUrl) {
 		}
 	}
 	return null;
+}
+
+/**
+ * Link targets of an llms.txt index — Markdown "[label](url)" links and bare
+ * "- https://..." lines — in one linear pass. The index is attacker-controlled:
+ * a "](" is followed by a scan that stops at the first ")" or whitespace, and
+ * the scan resumes AFTER that point (any "](" inside the scanned run was part
+ * of a URL candidate, or of a run no URL can span), so nothing is rescanned.
+ *
+ * @param {string} text - llms.txt content
+ * @returns {string[]} Raw link targets, in document order
+ */
+export function llmsTxtLinks(text) {
+	const links = [];
+	let pos = 0;
+	for (;;) {
+		const open = text.indexOf("](", pos);
+		if (open === -1) break;
+		let end = open + 2;
+		while (end < text.length) {
+			const code = text.charCodeAt(end);
+			if (code === 41 /* ) */ || code === 32 || code === 9 || code === 10 || code === 13) break;
+			end++;
+		}
+		if (end < text.length && text.charCodeAt(end) === 41 && end > open + 2) {
+			links.push(text.slice(open + 2, end));
+		}
+		pos = end + 1;
+	}
+	// Bare URL lines (one per line; a line is bounded, so the anchored test is too)
+	let lineStart = 0;
+	while (lineStart < text.length) {
+		let lineEnd = text.indexOf("\n", lineStart);
+		if (lineEnd === -1) lineEnd = text.length;
+		const line = text.slice(lineStart, lineEnd).trim();
+		const bare = line.replace(/^-\s*/, "");
+		if (/^https?:\/\/\S+$/.test(bare)) links.push(bare);
+		lineStart = lineEnd + 1;
+	}
+	return links;
 }
 
 function finalizeContent(text) {
@@ -812,7 +888,7 @@ async function tryMarkdownResource(candidateUrl, runtime) {
 			return null;
 		}
 		const bytes = await readBodyCapped(response, runtime.config.maxBytes);
-		if (looksBinary(bytes)) return null;
+		if (looksBinary(bytes, charset)) return null;
 		const text = decodeBody(bytes, charset, type);
 		// A "Markdown" file that is really an HTML error/SPA shell is useless
 		if (/^\s*<(?:!doctype|html|head|body)\b/i.test(text) || !text.trim()) return null;
@@ -854,7 +930,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 
 	const bytes = await readBodyCapped(response, runtime.config.maxBytes);
 	// Servers that omit or mislabel Content-Type: the bytes have the last word
-	if (looksBinary(bytes)) {
+	if (looksBinary(bytes, charset)) {
 		throw new FetchUrlError(
 			`Refused: ${finalUrl.hostname} returned a binary document${type ? ` labelled ${type}` : " without a Content-Type"} (only Markdown, plain text and HTML pages can be read)`
 		);

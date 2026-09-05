@@ -151,6 +151,64 @@ describe("htmlToMarkdown", () => {
 		expect(out).not.toContain("evil()");
 	});
 
+	it("treats the self-closing slash on non-void tags as an opener, like the parser", () => {
+		// <div/> nests in HTML; the depth guard must see it
+		const page = `<body>${"<div/>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+		// ...while inline SVG with many self-closed paths is not nesting at all
+		const svg = `<body><p>Chart:</p><svg>${"<path d='M0 0'/>".repeat(2000)}</svg><p>Legend</p></body>`;
+		const converted = htmlToMarkdown(svg);
+		expect(converted).toBe("Chart:\n\nLegend");
+	});
+
+	it("extracts the title in one pass even with a flood of unterminated <title> tags", () => {
+		const page = `<html><head>${"<title>".repeat(60000)}x</head><body><h1>H</h1></body></html>`;
+		const started = Date.now();
+		const title = extractHtmlTitle(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof title).toBe("string");
+		expect(
+			extractHtmlTitle(
+				"<html><head><title>Real &amp; first</title><title>Second</title></head></html>"
+			)
+		).toBe("Real & first");
+	});
+
+	it("does not mistake a custom element or script text for the <main> region", () => {
+		const long = "Article text. ".repeat(40);
+		const page = `<body><main-menu>${"Menu item. ".repeat(40)}</main-menu><script>var s = "<main>";</script><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Article text.");
+		expect(out).not.toContain("Menu item.");
+	});
+
+	it("resolves relative links against <base href> when the document declares one", () => {
+		const page = `<html><head><base href="/docs/v2/"><title>T</title></head><body><p><a href="guide">Guide</a> <img src="img/a.png" alt="A"></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/index.html" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs/v2/guide)");
+		expect(out).toContain("![A](https://docs.example.com/docs/v2/img/a.png)");
+		// Without <base>, the response URL is the base
+		const plain = htmlToMarkdown("<body><a href='guide'>Guide</a></body>", {
+			baseUrl: "https://docs.example.com/index.html",
+		});
+		expect(plain).toContain("[Guide](https://docs.example.com/guide)");
+	});
+
+	it("keeps code blocks intact without a sentinel that page text could collide with", () => {
+		// Private-use characters and digits in the prose must not expand into code blocks
+		const pua = "";
+		const page = `<body><pre><code>${"x".repeat(5000)}</code></pre><p>${`${pua}0${pua} `.repeat(3000)}</p><ul><li>a</li></ul></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out.length).toBeLessThan(page.length + 1000);
+		expect(out.split("```").length).toBe(3); // exactly one fenced block
+		expect(out).toContain("- a");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

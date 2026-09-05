@@ -13,6 +13,7 @@ import {
 	getFetchUrlTool,
 	githubTokenAllowedFor,
 	isBlockedAddress,
+	llmsTxtLinks,
 	looksBinary,
 	MAX_CONTENT_CHARS,
 	markdownSiblingUrl,
@@ -417,6 +418,35 @@ describe("transport hardening", () => {
 		);
 	});
 
+	it("accepts UTF-16 text (declared charset or BOM) despite its NUL bytes", async () => {
+		const declared = Buffer.from("Hello UTF-16 world\nline two", "utf16le");
+		const withBom = Buffer.concat([Buffer.from([0xff, 0xfe]), declared]);
+		const routes = {
+			"https://example.com/utf16.txt": response(declared, {
+				contentType: "text/plain; charset=utf-16le",
+			}),
+			"https://example.com/bom.txt": response(withBom, { contentType: "text/plain" }),
+			// Code units 0x0001 (control characters) once decoded as UTF-16LE
+			"https://example.com/really-binary": response(
+				Buffer.from(Array.from({ length: 400 }, (_, i) => (i % 2 === 0 ? 0x01 : 0x00))),
+				{ contentType: "text/plain; charset=utf-16le" }
+			),
+		};
+		const declaredResult = await run({ url: "https://example.com/utf16.txt" }, { routes });
+		expect(declaredResult.result.ok).toBe(true);
+		expect(declaredResult.result.content).toBe("Hello UTF-16 world\nline two");
+
+		const bomResult = await run({ url: "https://example.com/bom.txt" }, { routes });
+		expect(bomResult.result.ok).toBe(true);
+		expect(bomResult.result.content).toContain("Hello UTF-16 world");
+
+		// A UTF-16 label does not launder actual binary data
+		const binary = await run({ url: "https://example.com/really-binary" }, { routes });
+		expect(binary.result.ok).toBe(false);
+		expect(looksBinary(Buffer.from("plain", "utf16le"), "utf-16")).toBe(false);
+		expect(looksBinary(Buffer.from("plain", "utf16le"))).toBe(true);
+	});
+
 	it("cancels the body of a response rejected on its declared size", async () => {
 		const cancel = jest.fn(async () => {});
 		const routes = {
@@ -676,6 +706,20 @@ describe("markdownSiblingUrl / findLlmsTxtEntry", () => {
 		expect(sibling("https://d.example")).toBe("https://d.example/index.html.md");
 		expect(sibling("https://d.example/docs/page.md")).toBeNull();
 		expect(sibling("https://d.example/notes.txt")).toBeNull();
+	});
+
+	it("parses llms.txt links in one linear pass, hostile input included", () => {
+		expect(
+			llmsTxtLinks("- [A](https://d.example/a.md): x\n- https://d.example/b.md\n[C](/c.md)")
+		).toEqual(["https://d.example/a.md", "/c.md", "https://d.example/b.md"]);
+		// Candidates with whitespace before the ")" are not links
+		expect(llmsTxtLinks("[A](https://d.example/a b.md)")).toEqual([]);
+		// A flood of "](" with no closing ")" must not make the scan quadratic
+		const flood = "](".repeat(500000);
+		const started = Date.now();
+		expect(llmsTxtLinks(flood)).toEqual([]);
+		expect(Date.now() - started).toBeLessThan(1000);
+		expect(findLlmsTxtEntry(flood, new URL("https://d.example/x"))).toBeNull();
 	});
 
 	it("matches llms.txt entries by page path, tolerating .html and trailing slashes", () => {
