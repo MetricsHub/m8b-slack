@@ -966,6 +966,31 @@ describe("content negotiation", () => {
 		expect(result.content).toContain("Body.");
 	});
 
+	it("ignores XML encoding declarations that are not at the start of the document", async () => {
+		const utf8 = Buffer.from(
+			'<rss><!-- example: <?xml version="1.0" encoding="windows-1252"?> --><channel><title>Café</title></channel></rss>',
+			"utf8"
+		);
+		const routes = {
+			"https://example.com/feed.xml": response(utf8, { contentType: "application/rss+xml" }),
+		};
+		const { result } = await run({ url: "https://example.com/feed.xml" }, { routes });
+		expect(result.content).toContain("Café");
+		// A leading declaration behind a UTF-8 BOM still counts
+		const bom = Buffer.concat([
+			Buffer.from([0xef, 0xbb, 0xbf]),
+			Buffer.from(
+				'<?xml version="1.0" encoding="windows-1252"?><rss><title>Caf\xe9</title></rss>',
+				"latin1"
+			),
+		]);
+		const withBom = await run(
+			{ url: "https://example.com/bom.xml" },
+			{ routes: { "https://example.com/bom.xml": response(bom, { contentType: "text/xml" }) } }
+		);
+		expect(withBom.result.content).toContain("Café");
+	});
+
 	it("accepts whitespace around the XML encoding assignment", async () => {
 		const latinXml = Buffer.from(
 			'<?xml version="1.0" encoding = "windows-1252"?><rss><channel><title>Caf\xe9</title></channel></rss>',

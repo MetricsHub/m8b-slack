@@ -615,7 +615,7 @@ function estimateNesting(html) {
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing }) => {
-			if (foreignOpen > 0 && !closing) {
+			if (foreignOpen > 0 && !closing && inForeignMode(stack)) {
 				if (selfClosing) return true; // "<path/>" is an empty element in foreign content
 				if (FOREIGN_BREAKOUT.has(name)) {
 					// The breakout closes the foreign subtree: pop to below the innermost svg/math
@@ -667,6 +667,12 @@ function estimateNesting(html) {
 						// RECONSTRUCTS the formatting element inside them, so the DOM only
 						// gets deeper. Nothing is popped here: the estimate stays an upper
 						// bound (`<b><i><div></i></b>` repeated keeps nesting, as in the parser).
+						return true;
+					}
+					if (name === "form" && index !== stack.length - 1) {
+						// </form> removes only the form element from the stack; the
+						// descendants above it stay open (`<form><div></form>` keeps nesting)
+						stack.splice(index, 1);
 						return true;
 					}
 					popTo(index);
@@ -839,6 +845,36 @@ const FORMATTING_ELEMENTS = new Set([
 const MAX_PREFIX_DEPTH = 16;
 
 /**
+ * Elements inside svg/math whose children the HTML parser builds as HTML again
+ * (integration points): svg foreignObject/desc/title, MathML annotation-xml
+ * and the text elements. Below one of them, "<x/>" opens an element as in HTML.
+ */
+const FOREIGN_INTEGRATION = new Set([
+	"foreignobject",
+	"desc",
+	"title",
+	"annotation-xml",
+	"mi",
+	"mo",
+	"mn",
+	"ms",
+	"mtext",
+]);
+
+/**
+ * Whether the innermost namespace context on the stack is foreign: the
+ * nearest svg/math or integration point decides (the stack is capped, so this
+ * walk is bounded).
+ */
+function inForeignMode(stack) {
+	for (let i = stack.length - 1; i >= 0; i--) {
+		if (stack[i] === "svg" || stack[i] === "math") return true;
+		if (FOREIGN_INTEGRATION.has(stack[i])) return false;
+	}
+	return false;
+}
+
+/**
  * HTML start tags that end foreign content (svg, math) in the HTML parser:
  * everything after them is ordinary HTML again and counts towards depth.
  */
@@ -973,12 +1009,13 @@ export function extractHtmlTitle(html) {
 	let heading = null;
 	let collecting = null; // "title" | "h1" while inside the element being captured
 	let buffer = [];
-	// <title> inside inline <svg>/<math> is an accessibility label, not the page title
+	// <title> inside inline <svg>/<math> is an accessibility label, and anything
+	// inside <template> is an inert fragment: neither is a page-title candidate
 	let foreignDepth = 0;
 	tokenizeHtml(
 		source,
 		({ name, closing, selfClosing }) => {
-			if (name === "svg" || name === "math") {
+			if (name === "svg" || name === "math" || name === "template") {
 				if (closing) foreignDepth = Math.max(0, foreignDepth - 1);
 				else if (!selfClosing) foreignDepth++;
 				return true;

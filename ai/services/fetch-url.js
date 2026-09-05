@@ -526,7 +526,12 @@ function decodeBody(bytes, charset, type) {
 		// Sniff <meta charset> in the first bytes of the document
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
-			metaCharset(head) || head.match(/<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] || null;
+			metaCharset(head) ||
+			// An XML declaration is only valid at the very start of the document (a
+			// UTF-8 BOM, read as latin1, is the "ï»¿" prefix); one inside a comment
+			// or CDATA is example text and must not decide the encoding
+			head.match(/^[\sï»¿]*<\?xml\b[^>]*?\sencoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] ||
+			null;
 	}
 	try {
 		return new TextDecoder(label || "utf-8", { fatal: false }).decode(bytes);

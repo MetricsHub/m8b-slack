@@ -550,6 +550,34 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown(icon)).toBe("Before\n\nAfter");
 	});
 
+	it("removes only the form element on </form>, keeping its open descendants", () => {
+		// The parser removes the form node alone: every div stays open and nests
+		const page = `<body>${"<form><div></form>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("parses integration-point children as HTML: <x/> nests below <foreignObject>", () => {
+		const page = `<body><svg><foreignObject>${"<x/>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("skips title candidates inside <template>", () => {
+		expect(
+			extractHtmlTitle("<body><template><h1>Card preview</h1></template><h1>Dashboard</h1></body>")
+		).toBe("Dashboard");
+		expect(
+			extractHtmlTitle(
+				"<html><head><template><title>Tpl</title></template><title>Real</title></head></html>"
+			)
+		).toBe("Real");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
