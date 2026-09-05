@@ -474,6 +474,20 @@ describe("htmlToMarkdown", () => {
 		);
 	});
 
+	it("closes a select opened inside a table on table tokens (in select in table)", () => {
+		const deep = "<div>".repeat(600);
+		// <td> closes the select and is reprocessed: implied tbody/tr, the cell, and
+		// the deep div subtree inside it
+		expect(estimateNesting(`<table><select><td>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><select><option>a<td>x").depth).toBe(4);
+		// </table> closes the select (and the table): the divs after it are live
+		expect(estimateNesting(`<table><select><option>x</table>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// Outside a table, table tokens in a select are still ignored
+		expect(estimateNesting(`<select><td>${deep}`).depth).toBe(1);
+	});
+
 	it("keeps <hr> inside an open <select>", () => {
 		// <hr> in a select closes an open option/optgroup and is inserted (void):
 		// the select stays open, so a <base> after it is still ignored
@@ -505,6 +519,9 @@ describe("htmlToMarkdown", () => {
 		let started = Date.now();
 		expect(hasTextOfAtLeast(fragments, 200)).toBe(false);
 		expect(Date.now() - started).toBeLessThan(1000);
+		// A reference cannot span the markup that separated two fragments: "&am<i>p;"
+		// is five visible characters each time, not a fabricated "&amp;"
+		expect(hasTextOfAtLeast("&am<i>p;</i>".repeat(50), 200)).toBe(true);
 		// Visible text still counts once decoded, whatever the batching
 		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(200)}`, 200)).toBe(true);
 		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(199)}`, 200)).toBe(false);

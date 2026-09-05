@@ -29,6 +29,7 @@ import { parseBooleanFlag } from "../config/providers.js";
 import {
 	extractHtmlTitle,
 	htmlToMarkdown,
+	knownEncodingLabel,
 	sniffMetaCharset,
 	startsLikeHtmlDocument,
 } from "../utils/html-text.js";
@@ -494,7 +495,9 @@ function decodeBody(bytes, charset, type) {
 	// A byte-order mark wins over everything, the HTTP charset included (WHATWG
 	// Encoding "decode": BOM sniffing comes first) — a UTF-8 document served as
 	// windows-1252 is still UTF-8. Then the declared charset (UTF-16 by name too)
-	let label = bomLabel(bytes) || utf16Label(bytes, charset) || charset;
+	// An HTTP charset no decoder knows is as good as absent: the document's own
+	// declaration (or the fallback) decides instead of an exception
+	let label = bomLabel(bytes) || utf16Label(bytes, charset) || knownEncodingLabel(charset);
 	// No HTTP charset: the document's own declaration decides. For HTML that is
 	// <meta charset> (then an XML declaration, as browsers accept on XHTML served
 	// as text/html); for XML media types (RSS/Atom feeds, sitemaps, ...) only the

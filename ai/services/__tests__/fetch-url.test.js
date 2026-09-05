@@ -481,6 +481,21 @@ describe("limits", () => {
 		expect(result.content).toContain("Café");
 	});
 
+	it("treats an HTTP charset no decoder knows as absent", async () => {
+		// charset=bogus in the header: the document's meta decides (Windows-1252)
+		const latin = Buffer.from(
+			'<html><head><meta charset="windows-1252"></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		const routes = {
+			"https://example.com/bogus-header": response(latin, {
+				contentType: "text/html; charset=bogus",
+			}),
+		};
+		const { result } = await run({ url: "https://example.com/bogus-header" }, { routes });
+		expect(result.content).toContain("Café");
+	});
+
 	it("skips meta charset labels no decoder knows and reads UTF-16 labels as UTF-8", async () => {
 		// The first declaration is unusable: the second one decides
 		const latin = Buffer.from(

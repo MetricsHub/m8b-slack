@@ -687,7 +687,10 @@ export function hasTextOfAtLeast(html, minimum) {
 	let pending = [];
 	let pendingLength = 0;
 	const decodePending = () => {
-		const text = pending.join("");
+		// Joined with a newline: whitespace (not counted) that no character
+		// reference can span, as none can span the markup that separated the
+		// fragments ("&am<i>p;" is five visible characters, not one)
+		const text = pending.join("\n");
 		pending = [];
 		pendingLength = 0;
 		const decoded = text.includes("&") ? decodeHtmlEntities(text) : text;
@@ -717,6 +720,18 @@ export function hasTextOfAtLeast(html, minimum) {
 
 /** Start/end tags that still mean something inside an open <select> */
 const SELECT_CONTENT = new Set(["option", "optgroup", "script", "template"]);
+
+/** Table tokens that close a <select> opened inside a table ("in select in table") */
+const SELECT_IN_TABLE_CLOSERS = new Set([
+	"caption",
+	"table",
+	"tbody",
+	"tfoot",
+	"thead",
+	"tr",
+	"td",
+	"th",
+]);
 
 /** Row-group elements */
 const TABLE_SECTIONS = new Set(["tbody", "thead", "tfoot"]);
@@ -1041,7 +1056,15 @@ function createTreeTracker() {
 		// is closed by </select>, another <select>, or an <input>/<textarea>
 		const selectIndex = openSelectIndex();
 		if (selectIndex !== -1) {
-			if (!closing) {
+			// "In select in table": a select opened inside a table is closed by a
+			// table token (caption, table, tbody, tfoot, thead, tr, td, th — start
+			// or end tag), which is then reprocessed
+			const tableContext = nearestAlive(tableContexts);
+			const inTable =
+				tableContext !== -1 && stack[tableContext] !== "html" && stack[tableContext] !== "template";
+			if (inTable && SELECT_IN_TABLE_CLOSERS.has(name)) {
+				popTo(selectIndex); // acts as </select>; the token continues below
+			} else if (!closing) {
 				if (name === "select") {
 					popTo(selectIndex); // a nested <select> acts as </select>
 					return !hostile;
@@ -1706,6 +1729,20 @@ function usableEncodingLabel(label) {
 	const trimmed = String(label ?? "").trim();
 	if (!trimmed) return null;
 	if (/^utf-?16(?:le|be)?$/i.test(trimmed)) return "utf-8";
+	return knownEncodingLabel(trimmed);
+}
+
+/**
+ * The label itself when a decoder knows it, else null — an unknown label
+ * (`charset=bogus`) is treated as absent by the callers, so the document's
+ * own declaration or the fallback can decide.
+ *
+ * @param {string|null|undefined} label
+ * @returns {string|null}
+ */
+export function knownEncodingLabel(label) {
+	const trimmed = String(label ?? "").trim();
+	if (!trimmed) return null;
 	try {
 		new TextDecoder(trimmed);
 		return trimmed;
