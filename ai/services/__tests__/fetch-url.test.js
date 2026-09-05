@@ -481,6 +481,18 @@ describe("limits", () => {
 		expect(result.content).toContain("Café");
 	});
 
+	it("does not mistake '<!--' inside a quoted attribute for a comment when sniffing the charset", async () => {
+		// To the tokenizer the "<!--" in the title attribute is text: the meta that
+		// follows is live and the page is Windows-1252, not UTF-8
+		const latin = Buffer.from(
+			'<html><head><div title="<!--"><meta charset="windows-1252"><!-- --></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		const routes = { "https://example.com/quoted": response(latin, { contentType: "text/html" }) };
+		const { result } = await run({ url: "https://example.com/quoted" }, { routes });
+		expect(result.content).toContain("Café");
+	});
+
 	it("does not mistake 'charset=' inside another attribute's value for a declaration", async () => {
 		const utf8 = Buffer.from(
 			'<html><head><meta name="description" content="Example of charset=windows-1252 pages"><title>Café</title></head><body><p>Café</p></body></html>',

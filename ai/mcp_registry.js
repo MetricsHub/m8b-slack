@@ -425,6 +425,39 @@ function hasHostRoutingParam(def) {
 /** Arguments the router fills in itself: never "missing" on the caller's side */
 const ROUTING_FIELDS = new Set(["hosts", "host", "hostname", "hostnames"]);
 
+/** Arguments handled app-side (routing, middleware filters): not the destination's business */
+const APP_SIDE_FIELDS = new Set([...ROUTING_FIELDS, "monitorTypes"]);
+
+/**
+ * Whether a value fits the JSON Schema `type` of a property (one type or a
+ * list; no declared type means anything goes). Structural checks only.
+ *
+ * @param {*} value - Supplied argument
+ * @param {{type?: string|string[]}|undefined} property - Property schema
+ * @returns {boolean}
+ */
+function matchesSchemaType(value, property) {
+	const declared = property?.type;
+	if (!declared) return true;
+	const types = Array.isArray(declared) ? declared : [declared];
+	return types.some((type) => {
+		switch (type) {
+			case "integer":
+				return typeof value === "number" && Number.isInteger(value);
+			case "number":
+				return typeof value === "number";
+			case "array":
+				return Array.isArray(value);
+			case "null":
+				return value === null;
+			case "object":
+				return typeof value === "object" && value !== null && !Array.isArray(value);
+			default:
+				return typeof value === type; // string, boolean
+		}
+	});
+}
+
 /**
  * Why `name` cannot be called on `server` with these arguments, or null when
  * it can. The schema the model saw is ONE server's (the host-routed definition
@@ -451,6 +484,25 @@ function toolIncompatibility(server, name, args) {
 	);
 	if (missing.length > 0) {
 		return `Agent ${server.server_label}'s version of ${name} requires ${missing.join(", ")}, which the call did not provide`;
+	}
+	// What the model supplied must exist on and fit THIS definition too: an
+	// optional property of the advertised schema may be unknown to an older
+	// implementation that refuses unknown properties, or typed differently
+	const props = def.inputSchema?.properties || {};
+	const supplied = Object.keys(args || {}).filter(
+		(key) => !APP_SIDE_FIELDS.has(key) && args[key] !== undefined
+	);
+	if (def.inputSchema?.additionalProperties === false) {
+		const unknown = supplied.filter((key) => !(key in props));
+		if (unknown.length > 0) {
+			return `Agent ${server.server_label}'s version of ${name} does not accept ${unknown.join(", ")}`;
+		}
+	}
+	const mismatched = supplied.filter(
+		(key) => key in props && !matchesSchemaType(args[key], props[key])
+	);
+	if (mismatched.length > 0) {
+		return `Agent ${server.server_label}'s version of ${name} expects a different type for ${mismatched.join(", ")}`;
 	}
 	return null;
 }

@@ -26,7 +26,7 @@
 import dns from "node:dns";
 import net from "node:net";
 import { parseBooleanFlag } from "../config/providers.js";
-import { extractHtmlTitle, htmlToMarkdown } from "../utils/html-text.js";
+import { extractHtmlTitle, htmlToMarkdown, sniffMetaCharset } from "../utils/html-text.js";
 
 /** Default per-request timeout */
 const DEFAULT_TIMEOUT_MS = 20000;
@@ -482,39 +482,6 @@ function isTextualType(type) {
 	);
 }
 
-/**
- * Charset declared by a real <meta> attribute in the first bytes of an HTML
- * document: `<meta charset="...">` or `<meta http-equiv="content-type"
- * content="...; charset=...">`. Attributes are parsed (quoted values are
- * consumed whole), so "charset=" appearing inside another attribute's value
- * is not mistaken for a declaration.
- *
- * @param {string} head - Leading bytes decoded as latin1
- * @returns {string|null}
- */
-function metaCharset(head) {
-	// Inert markup does not declare anything: a <meta> inside a comment or a
-	// script/style body is not part of the document (the sample is 4 KB, so
-	// these passes are cheap)
-	const live = head
-		.replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
-		.replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, " ");
-	const tags = live.matchAll(/<meta\b([^>]*)>/gi);
-	for (const tag of tags) {
-		const attrs = {};
-		const attrPattern = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
-		for (const match of tag[1].matchAll(attrPattern)) {
-			attrs[match[1].toLowerCase()] = (match[2] ?? match[3] ?? match[4] ?? "").trim();
-		}
-		if (attrs.charset) return attrs.charset;
-		if ((attrs["http-equiv"] || "").toLowerCase() === "content-type" && attrs.content) {
-			const inContent = attrs.content.match(/charset\s*=\s*["']?\s*([a-z0-9_-]+)/i);
-			if (inContent) return inContent[1];
-		}
-	}
-	return null;
-}
-
 function decodeBody(bytes, charset, type) {
 	// A byte-order mark wins over everything, the HTTP charset included (WHATWG
 	// Encoding "decode": BOM sniffing comes first) — a UTF-8 document served as
@@ -530,7 +497,7 @@ function decodeBody(bytes, charset, type) {
 	if (!label && (isHtml || isXml)) {
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
-			(isHtml ? metaCharset(head) : null) ||
+			(isHtml ? sniffMetaCharset(head) : null) ||
 			// An XML declaration is only valid at the very start of the document (a
 			// UTF-8 BOM, read as latin1, is the "ï»¿" prefix); one inside a comment
 			// or CDATA is example text and must not decide the encoding

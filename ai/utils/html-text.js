@@ -494,12 +494,15 @@ function findTagEnd(html, from) {
  * delimited with the tag's own ">".
  */
 function attributeValue(attrs, name) {
-	const match = new RegExp(
-		`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`,
-		"i"
-	).exec(attrs);
-	if (!match) return null;
-	return match[1] ?? match[2] ?? match[3] ?? null;
+	// Attributes are read in order with the tokenizer's grammar, so a quoted
+	// value is never mistaken for the next attribute (`title="a href=x" href=y`
+	// has href y). The first attribute of that name wins, as in the parser; one
+	// present without a value is the empty string; absent is null.
+	const attribute = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+	for (const match of String(attrs || "").matchAll(attribute)) {
+		if (asciiLower(match[1]) === name) return match[2] ?? match[3] ?? match[4] ?? "";
+	}
+	return null;
 }
 
 /**
@@ -518,6 +521,112 @@ function hasTextOfAtLeast(html, minimum) {
 	return count >= minimum;
 }
 
+/** Elements whose content is not part of the page: a fragment, or a graphic */
+const INERT_ELEMENTS = new Set(["template", "svg", "math"]);
+
+/**
+ * Tracks the open inert containers (<template>, inline <svg>/<math>) on a
+ * stack, as the parser does: an end tag only closes a matching open element
+ * (`<template></svg>` keeps the template open), and an empty "<svg/>" opens
+ * nothing (while "<template/>" opens a template: the slash means nothing on
+ * HTML elements). Per-name counters keep unmatched closers O(1), so a flood
+ * of them stays linear.
+ */
+function createInertTracker() {
+	const stack = [];
+	const open = new Map();
+	return {
+		/**
+		 * Feed a tag; true when it was an inert container tag (consumed).
+		 * @param {{name: string, closing: boolean, selfClosing: boolean}} tag
+		 */
+		handle({ name, closing, selfClosing }) {
+			if (!INERT_ELEMENTS.has(name)) return false;
+			if (closing) {
+				if ((open.get(name) || 0) > 0) {
+					let popped;
+					do {
+						popped = stack.pop();
+						open.set(popped, open.get(popped) - 1);
+					} while (popped !== name);
+				}
+			} else if (!selfClosing || name === "template") {
+				stack.push(name);
+				open.set(name, (open.get(name) || 0) + 1);
+			}
+			return true;
+		},
+		/** Inside an inert container right now */
+		get inert() {
+			return stack.length > 0;
+		},
+	};
+}
+
+/**
+ * Tracks whether the current position is inside an element the converter
+ * drops (nav, footer, form, ...): a <main> or <h1> found there is not the
+ * page's content, and slicing it out would detach it from the ancestor
+ * Turndown removes. Dropped elements and scope boundaries sit on a small
+ * stack with the parser's end-tag rule (a closer below a scope boundary is
+ * ignored, so `<nav><object></nav>` keeps the nav open; `</form>` removes
+ * only the form). The stack is bounded: past the bound the page is hostile
+ * anyway (the depth guard refuses it) and the caller stops scanning.
+ */
+function createDroppedTracker() {
+	const tracked = [];
+	let droppedDepth = 0;
+	let hostile = false;
+	return {
+		/**
+		 * Feed a tag; true when it was a dropped element or scope boundary
+		 * (consumed by the tracker), false when the caller should look at it.
+		 * @param {{name: string, closing: boolean, selfClosing: boolean}} tag
+		 */
+		handle({ name, closing, selfClosing }) {
+			if (!(DROP_ELEMENT_SET.has(name) || SCOPE_BOUNDARY.has(name))) return false;
+			// A void dropped element (<embed>) has no content and never closes
+			if (VOID_ELEMENTS.has(name)) return true;
+			if (closing) {
+				let index = -1;
+				for (let i = tracked.length - 1; i >= 0; i--) {
+					if (tracked[i] === name) {
+						index = i;
+						break;
+					}
+					if (SCOPE_BOUNDARY.has(tracked[i])) break;
+				}
+				if (index === -1) return true;
+				if (name === "form") {
+					// </form> removes only the form element from the parser's stack: a
+					// <nav> opened inside it stays open, so a <main> that follows is
+					// still inside the nav (`<form><nav></form><main>` is no way out)
+					tracked.splice(index, 1);
+					droppedDepth--;
+					return true;
+				}
+				for (let i = index; i < tracked.length; i++) {
+					if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
+				}
+				tracked.length = index;
+			} else if (!(selfClosing && (name === "svg" || name === "math"))) {
+				tracked.push(name);
+				if (DROP_ELEMENT_SET.has(name)) droppedDepth++;
+				if (tracked.length > MAX_DOM_DEPTH * 2) hostile = true;
+			}
+			return true;
+		},
+		/** Inside a dropped element right now */
+		get dropped() {
+			return droppedDepth > 0;
+		},
+		/** The stack bound was exceeded: the page is hostile, stop scanning */
+		get hostile() {
+			return hostile;
+		},
+	};
+}
+
 /**
  * Narrow the document to the region worth reading: a single <main>, else a
  * single <article>, else the <body>, else everything. One tokenizer pass
@@ -531,65 +640,24 @@ function selectContentRegion(html) {
 		body: { opens: 0, start: -1, end: -1 },
 	};
 	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
-	// slicing it out would also detach it from the ancestor Turndown removes.
-	// Dropped elements and scope boundaries are tracked on a small stack with
-	// the parser's end-tag rule (a closer below a scope boundary is ignored, so
-	// `<nav><object></nav>` keeps the nav open). The stack is bounded: past the
-	// bound the page is hostile anyway (the depth guard refuses it) and region
-	// selection just stops
-	const tracked = [];
-	let droppedDepth = 0;
-	let hostile = false;
+	// slicing it out would also detach it from the ancestor Turndown removes
+	const dropped = createDroppedTracker();
 	tokenizeHtml(
 		html,
-		({ name, closing, selfClosing, start }) => {
-			if (DROP_ELEMENT_SET.has(name) || SCOPE_BOUNDARY.has(name)) {
-				// A void dropped element (<embed>) has no content and never closes
-				if (VOID_ELEMENTS.has(name)) return;
-				if (closing) {
-					let index = -1;
-					for (let i = tracked.length - 1; i >= 0; i--) {
-						if (tracked[i] === name) {
-							index = i;
-							break;
-						}
-						if (SCOPE_BOUNDARY.has(tracked[i])) break;
-					}
-					if (index === -1) return;
-					if (name === "form") {
-						// </form> removes only the form element from the parser's stack: a
-						// <nav> opened inside it stays open, so a <main> that follows is
-						// still inside the nav (`<form><nav></form><main>` is no way out)
-						tracked.splice(index, 1);
-						droppedDepth--;
-						return;
-					}
-					for (let i = index; i < tracked.length; i++) {
-						if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
-					}
-					tracked.length = index;
-				} else if (!(selfClosing && (name === "svg" || name === "math"))) {
-					tracked.push(name);
-					if (DROP_ELEMENT_SET.has(name)) droppedDepth++;
-					if (tracked.length > MAX_DOM_DEPTH * 2) {
-						hostile = true;
-						return false;
-					}
-				}
-				return;
-			}
-			const mark = marks[name];
-			if (!mark || droppedDepth > 0) return;
-			if (closing) {
-				mark.end = start; // the last closer wins
+		(tag) => {
+			if (dropped.handle(tag)) return !dropped.hostile;
+			const mark = marks[tag.name];
+			if (!mark || dropped.dropped) return;
+			if (tag.closing) {
+				mark.end = tag.start; // the last closer wins
 			} else {
 				mark.opens++;
-				if (mark.start === -1) mark.start = start;
+				if (mark.start === -1) mark.start = tag.start;
 			}
 		},
 		() => undefined
 	);
-	if (hostile) return html;
+	if (dropped.hostile) return html;
 
 	for (const tag of ["main", "article"]) {
 		const { opens, start, end } = marks[tag];
@@ -658,12 +726,13 @@ export function estimateNesting(html) {
 		(tag) => {
 			const { name, closing, selfClosing, attrs } = tag;
 			if (foreignOpen > 0 && !closing && inForeignMode(stack)) {
-				if (selfClosing) return true; // "<path/>" is an empty element in foreign content
 				if (
 					FOREIGN_BREAKOUT.has(name) &&
 					(name !== "font" || hasAnyAttribute(attrs, FONT_BREAKOUT_ATTRIBUTES))
 				) {
-					// The breakout closes the foreign subtree: pop to below the innermost svg/math
+					// The breakout closes the foreign subtree (pop to below the innermost
+					// svg/math), then the token is REPROCESSED under the HTML rules below,
+					// where "/>" means nothing on a non-void element: "<div/>" opens a div
 					for (let i = stack.length - 1; i >= 0; i--) {
 						if (stack[i] === "svg" || stack[i] === "math") {
 							popTo(i);
@@ -671,6 +740,7 @@ export function estimateNesting(html) {
 						}
 					}
 				} else {
+					if (selfClosing) return true; // "<path/>" is an empty element in foreign content
 					// Any other start tag opens a foreign element, <textarea>, <title>,
 					// <script> and <style> included: the tokenizer stays in the data
 					// state and their content is markup that nests (and counts) as usual
@@ -1083,17 +1153,23 @@ export function extractHtmlTitle(html) {
 	let collecting = null; // "title" | "h1" while inside the element being captured
 	let buffer = [];
 	// <title> inside inline <svg>/<math> is an accessibility label, and anything
-	// inside <template> is an inert fragment: neither is a page-title candidate
-	let foreignDepth = 0;
+	// inside <template> is an inert fragment: neither is a page-title candidate.
+	// The heading fallback also skips the elements the converter drops (nav,
+	// footer, aside, ...): a menu's <h1> is not the title of the page
+	const inert = createInertTracker();
+	const dropped = createDroppedTracker();
 	tokenizeHtml(
 		source,
-		({ name, closing, selfClosing }) => {
-			if (name === "svg" || name === "math" || name === "template") {
-				if (closing) foreignDepth = Math.max(0, foreignDepth - 1);
-				else if (!selfClosing) foreignDepth++;
-				return true;
+		(tag) => {
+			const { name, closing } = tag;
+			if (!collecting) {
+				const boundary = inert.handle(tag);
+				// <title> is itself on the converter's drop list (and lives in <head>,
+				// another dropped element): it is not judged by the dropped tracker
+				if (name !== "title") dropped.handle(tag);
+				if (dropped.hostile) return false;
+				if (boundary || inert.inert) return true;
 			}
-			if (foreignDepth > 0 && !collecting) return true;
 			if (collecting) {
 				if (name === collecting && closing) {
 					const text = buffer.join(" ");
@@ -1106,7 +1182,9 @@ export function extractHtmlTitle(html) {
 				return true;
 			}
 			if (!closing && name === "title" && title === null) collecting = "title";
-			else if (!closing && name === "h1" && heading === null) collecting = "h1";
+			else if (!closing && name === "h1" && heading === null && !dropped.dropped) {
+				collecting = "h1";
+			}
 			return true;
 		},
 		(text) => {
@@ -1120,6 +1198,43 @@ export function extractHtmlTitle(html) {
 }
 
 /**
+ * Character encoding declared by a <meta> element in the leading bytes of an
+ * HTML document (`<meta charset=...>`, or the http-equiv Content-Type form),
+ * or null. One tokenizer pass: a "<meta" inside a comment, a script/style
+ * body or a quoted attribute value is text, not a declaration — and a "<!--"
+ * inside a quoted attribute value does not start a comment.
+ *
+ * @param {string} head - Leading bytes of the document, decoded as latin1
+ * @returns {string|null}
+ */
+export function sniffMetaCharset(head) {
+	let found = null;
+	tokenizeHtml(
+		String(head ?? ""),
+		({ name, closing, attrs }) => {
+			if (closing || name !== "meta") return true;
+			const charset = attributeValue(attrs, "charset");
+			if (charset?.trim()) {
+				found = charset.trim();
+				return false;
+			}
+			const httpEquiv = attributeValue(attrs, "http-equiv");
+			const content = attributeValue(attrs, "content");
+			if (httpEquiv !== null && httpEquiv.trim().toLowerCase() === "content-type" && content) {
+				const inContent = content.match(/charset\s*=\s*["']?\s*([a-z0-9_-]+)/i);
+				if (inContent) {
+					found = inContent[1];
+					return false;
+				}
+			}
+			return true;
+		},
+		() => undefined
+	);
+	return found;
+}
+
+/**
  * Effective base URL of a document: its first <base href> (resolved against
  * the response URL, as browsers do), else the response URL itself. One
  * tokenizer pass that stops at the first <base> or at the end of <head>.
@@ -1130,18 +1245,15 @@ export function extractHtmlTitle(html) {
  */
 function documentBaseUrl(html, responseUrl) {
 	let base = responseUrl;
-	let inert = 0; // open <template>/<svg>/<math> elements
+	// A <base> inside <template> (a separate document fragment) or inside inline
+	// svg/math does not establish the document base. Stack-based: a stray
+	// "</svg>" inside a template does not end the template
+	const inert = createInertTracker();
 	tokenizeHtml(
 		html,
-		({ name, closing, selfClosing, attrs }) => {
-			// A <base> inside <template> (a separate document fragment) or inside
-			// inline svg/math does not establish the document base
-			if (name === "template" || name === "svg" || name === "math") {
-				if (closing) inert = Math.max(0, inert - 1);
-				else if (!selfClosing) inert++;
-				return true;
-			}
-			if (inert > 0) return true;
+		(tag) => {
+			if (inert.handle(tag) || inert.inert) return true;
+			const { name, closing, attrs } = tag;
 			if (name === "base" && !closing) {
 				// A <base> without href (target only) does not count: keep looking.
 				// Attribute values are raw source: character references are decoded

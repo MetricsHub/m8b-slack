@@ -78,6 +78,70 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		expect(sent[0].args).toEqual({ url: "https://example.com/", hosts: ["db-01"] });
 	});
 
+	it("refuses servers whose definition rejects or retypes a supplied argument", async () => {
+		const strict = fakeServer(
+			"strict",
+			{ "s-01": host("s-01") },
+			{
+				fetch_url: {
+					description: "No mode here.",
+					inputSchema: {
+						type: "object",
+						properties: { url: { type: "string" }, hosts: { type: "array" } },
+						required: ["url", "hosts"],
+						additionalProperties: false,
+					},
+				},
+			}
+		);
+		const retyped = fakeServer(
+			"retyped",
+			{ "r-01": host("r-01") },
+			{
+				fetch_url: {
+					description: "Typed differently.",
+					inputSchema: {
+						type: "object",
+						properties: { url: { type: "string" }, limit: { type: "integer" }, hosts: {} },
+					},
+				},
+			}
+		);
+		_setServersForTests([strict, retyped]);
+		await refreshHostsForServer("strict");
+		await refreshHostsForServer("retyped");
+
+		// An optional "mode" the advertised schema has is unknown to the strict agent
+		const out = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			mode: "text",
+			limit: 2.5,
+			hosts: ["s-01", "r-01"],
+		});
+		const byServer = Object.fromEntries(out.results.map((r) => [r.server_label, r]));
+		expect(byServer.strict.ok).toBe(false);
+		expect(byServer.strict.error).toContain("does not accept mode");
+		// The other agent takes unknown properties but types "limit" as an integer
+		expect(byServer.retyped.ok).toBe(false);
+		expect(byServer.retyped.error).toContain("different type for limit");
+		expect(strict.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
+		expect(retyped.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
+
+		// Arguments that fit go through; app-side fields (monitorTypes) are never judged
+		const ok = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			monitorTypes: ["cpu"],
+			hosts: ["s-01", "r-01"],
+		});
+		expect(ok.results.every((r) => r.ok)).toBe(true);
+		const integer = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			limit: 2,
+			hosts: ["r-01"],
+		});
+		expect(integer.results[0]).toMatchObject({ server_label: "retyped", ok: true });
+	});
+
 	it("refuses servers that lack the tool or require arguments the call does not have", async () => {
 		const without = fakeServer("without", { "a-01": host("a-01") }, {});
 		const stricter = fakeServer(

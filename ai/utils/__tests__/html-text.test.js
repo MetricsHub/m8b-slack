@@ -429,6 +429,14 @@ describe("htmlToMarkdown", () => {
 		expect(out).not.toContain("Earlier.");
 	});
 
+	it("reads <base href> by attribute grammar, not by the first 'href=' in the tag", () => {
+		// The "href=" inside the title's quoted value is text; the real href follows
+		const page = `<html><head><base title="see href=/evil/" href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
 	it("decodes character references in <base href>", () => {
 		const page = `<html><head><base href="/docs&amp;api/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
 		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" });
@@ -538,6 +546,17 @@ describe("htmlToMarkdown", () => {
 		const page = `<html><head><template><base href="/preview/"></template><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
 		const out = htmlToMarkdown(page, { baseUrl: "https://d.example/" });
 		expect(out).toContain("[Guide](https://d.example/docs/guide)");
+		// A mismatched closer inside the template is ignored by the parser: the
+		// template stays open and its <base> still does not count
+		const stray = `<html><head><template></svg><base href="/preview/"></template><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(stray, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		// ...and a "<svg/>" opens nothing, so a <base> after it is live
+		const empty = `<html><head><svg/><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(empty, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
 	});
 
 	it("ends a tag at the '>' that closes an unquoted attribute value", () => {
@@ -615,6 +634,24 @@ describe("htmlToMarkdown", () => {
 		const out = htmlToMarkdown(page);
 		expect(out).toContain("Real content");
 		expect(out).not.toContain("decoy");
+	});
+
+	it("reprocesses a self-closing breakout tag as HTML: <div/> in svg opens a div", () => {
+		// The parser leaves foreign content on <div/>, then handles the token as
+		// HTML, where the slash means nothing on a non-void element
+		expect(estimateNesting(`<svg>${"<div/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg>${"<span/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// (a repeated <p/> breaks out too, but <p> closes the previous <p>, as in HTML)
+		expect(estimateNesting(`<svg>${"<p/>".repeat(600)}`).depth).toBe(1);
+		// Self-closed foreign elements are still empty (inline icons stay shallow),
+		// and self-closed void breakouts (<br/>, <img/>) open nothing either
+		expect(estimateNesting(`<svg>${"<path/>".repeat(600)}</svg>`).depth).toBe(1);
+		expect(estimateNesting(`<svg>${"<br/>".repeat(600)}`).depth).toBe(1);
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg>${"<div/>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
 	});
 
 	it("removes only the form element on </form>, keeping its open descendants", () => {
@@ -711,6 +748,26 @@ describe("extractHtmlTitle", () => {
 
 	it("prefers <title>, decoded and whitespace-normalized", () => {
 		expect(extractHtmlTitle(PAGE)).toBe("Install & Configure — Docs");
+	});
+
+	it("skips headings inside dropped page furniture for the fallback", () => {
+		// The nav's <h1> is removed by the converter with the whole nav: the
+		// page's own heading is the fallback title
+		expect(
+			extractHtmlTitle(
+				"<body><nav><h1>Product menu</h1></nav><main><h1>Account settings</h1></main></body>"
+			)
+		).toBe("Account settings");
+		// </form> removes only the form: the nav it left open still hides its heading
+		expect(
+			extractHtmlTitle("<body><form><nav></form><h1>Menu</h1></nav><h1>Settings</h1></body>")
+		).toBe("Settings");
+		// A stray closer inside a template does not end it: its <title> stays inert
+		expect(
+			extractHtmlTitle(
+				"<head><template></svg><title>Hidden</title></template><title>Real</title></head>"
+			)
+		).toBe("Real");
 	});
 
 	it("falls back to the first heading", () => {
