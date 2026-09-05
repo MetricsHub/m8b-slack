@@ -4,7 +4,7 @@
 
 import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
-import { getFetchUrlTool } from "../services/fetch-url.js";
+import { getFetchUrlTool, isFetchUrlEnabled } from "../services/fetch-url.js";
 import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
 import { getWebSearchTool } from "../services/web-search.js";
 import { getMetricsHubConfigTools } from "./metricshub-config.js";
@@ -205,6 +205,13 @@ export function buildFunctionToolsArray({
 	const fetchUrlTool = getFetchUrlTool();
 	if (fetchUrlTool && !tools.some((tool) => tool.name === fetchUrlTool.name)) {
 		tools.push(fetchUrlTool);
+	} else if (!isFetchUrlEnabled()) {
+		// The switch removes page reading entirely, an MCP-provided reader
+		// included (it may reach internal URLs, and the prompt's fetched-content
+		// guidance is off when the flag is off)
+		const kept = tools.filter((tool) => tool.name !== "fetch_url");
+		tools.length = 0;
+		tools.push(...kept);
 	}
 
 	// Local Python sandbox (app-side code_interpreter replacement)

@@ -302,6 +302,44 @@ describe("htmlToMarkdown", () => {
 		expect(normal).toContain("After");
 	});
 
+	it("tracks dropped ancestors in constant time per tag", () => {
+		// Many open dropped elements, then a flood of unmatched closers of another name
+		const page = `<body><main>${"Real text. ".repeat(40)}</main>${"<nav>".repeat(100000)}${"</footer>".repeat(100000)}</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Real text.");
+	});
+
+	it("treats an equals sign at attribute-name position as a name, not an assignment", () => {
+		// The parser ends this tag at the first ">" and nests every following div
+		const page = `<body>${'<x ="<div>'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary assignments still hide their quoted ">"
+		expect(
+			htmlToMarkdown(`<body><p><a href="/x" title="a > b">Link</a></p></body>`, {
+				baseUrl: "https://d.example/",
+			})
+		).toContain("[Link](https://d.example/x)");
+	});
+
+	it("recognizes every HTML comment terminator", () => {
+		// Abrupt and "--!>" closings end the comment; what follows is markup again
+		for (const comment of ["<!-->", "<!--->", "<!-- x --!>"]) {
+			const page = `<body>${comment}${"<div>".repeat(100000)}Deep</body>`;
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(typeof out).toBe("string");
+		}
+		// Dashes inside a comment do not end it; an unterminated comment swallows the rest
+		expect(htmlToMarkdown("<body><p>A</p><!-- a -- b -- c --><p>B</p></body>")).toBe("A\n\nB");
+		expect(htmlToMarkdown("<body><p>A</p><!-- never closed <p>B</p></body>")).toBe("A");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

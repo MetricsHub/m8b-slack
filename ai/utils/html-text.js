@@ -216,8 +216,7 @@ function tokenizeHtml(html, onTag, onText) {
 		if (next === 33 || next === 63) {
 			// <!-- comment -->, <!doctype>, <![CDATA[ ]]>, <?xml ?>
 			if (html.startsWith("<!--", lt)) {
-				const end = html.indexOf("-->", lt + 4);
-				pos = end === -1 ? length : end + 3;
+				pos = findCommentEnd(html, lt + 4);
 			} else {
 				const gt = gtAfter(lt);
 				pos = gt === -1 ? length : gt + 1;
@@ -295,6 +294,30 @@ function tokenizeHtml(html, onTag, onText) {
 }
 
 /**
+ * Index just past the end of a comment whose body starts at `from` (right
+ * after "<!--"), following the HTML tokenizer's comment end states: "-->" and
+ * "--!>" end a comment, and so do the abrupt forms "<!-->" and "<!--->". An
+ * unterminated comment swallows the rest of the input. Linear: each "--" is
+ * examined once.
+ */
+function findCommentEnd(html, from) {
+	const length = html.length;
+	// Abrupt closings: <!--> and <!--->
+	if (html.charCodeAt(from) === 62) return from + 1;
+	if (html.charCodeAt(from) === 45 && html.charCodeAt(from + 1) === 62) return from + 2;
+	let search = from;
+	for (;;) {
+		const dashes = html.indexOf("--", search);
+		if (dashes === -1) return length;
+		if (html.charCodeAt(dashes + 2) === 62) return dashes + 3; // -->
+		if (html.charCodeAt(dashes + 2) === 33 && html.charCodeAt(dashes + 3) === 62) {
+			return dashes + 4; // --!>
+		}
+		search = dashes + 1;
+	}
+}
+
+/**
  * Index of the ">" that ends a start tag whose attributes begin at `from`, or
  * -1 when the tag never ends. Follows the HTML tokenizer's attribute states:
  * a quote opens a quoted value only right after "=", where it hides any ">"
@@ -304,30 +327,45 @@ function tokenizeHtml(html, onTag, onText) {
  */
 function findTagEnd(html, from) {
 	const length = html.length;
-	let state = 0; // 0 between/inside attribute names, 1 after "=", 2 unquoted value
+	// HTML tokenizer states (simplified): 0 before attribute name, 1 attribute
+	// name, 2 after attribute name, 3 before attribute value, 4 unquoted value
+	let state = 0;
 	for (let i = from; i < length; i++) {
 		const code = html.charCodeAt(i);
-		if (state === 1) {
-			if (code === 34 || code === 39) {
-				// Quoted value: skip to the matching quote (none → unterminated tag)
-				const close = html.indexOf(code === 34 ? '"' : "'", i + 1);
-				if (close === -1) return -1;
-				i = close;
-				state = 0;
-				continue;
-			}
-			if (code === 32 || (code >= 9 && code <= 13)) continue; // whitespace before the value
-			if (code === 62) return i; // ">" right after "=": empty value, tag ends
-			state = 2; // unquoted value starts
-			continue;
+		const whitespace = code === 32 || (code >= 9 && code <= 13);
+		if (code === 62 && state !== 4) return i; // ">" ends the tag in every state but an unquoted value
+		switch (state) {
+			case 0: // before attribute name
+				if (whitespace || code === 47) break;
+				// "=" here STARTS a name (parse error in the spec), it is not an assignment
+				state = 1;
+				break;
+			case 1: // attribute name
+				if (whitespace || code === 47) state = 2;
+				else if (code === 61) state = 3;
+				break;
+			case 2: // after attribute name
+				if (whitespace || code === 47) break;
+				if (code === 61) state = 3;
+				else state = 1; // a new attribute starts
+				break;
+			case 3: // before attribute value
+				if (whitespace) break;
+				if (code === 34 || code === 39) {
+					// Quoted value: skip to the matching quote (none → unterminated tag)
+					const close = html.indexOf(code === 34 ? '"' : "'", i + 1);
+					if (close === -1) return -1;
+					i = close;
+					state = 0;
+				} else {
+					state = 4; // unquoted value starts
+				}
+				break;
+			default: // 4: unquoted value
+				if (code === 62) return i;
+				if (whitespace) state = 0;
+				break;
 		}
-		if (state === 2) {
-			if (code === 62) return i;
-			if (code === 32 || (code >= 9 && code <= 13)) state = 0;
-			continue;
-		}
-		if (code === 62) return i;
-		if (code === 61) state = 1; // "="
 	}
 	return -1;
 }
@@ -375,22 +413,30 @@ function selectContentRegion(html) {
 		body: { opens: 0, start: -1, end: -1 },
 	};
 	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
-	// slicing it out would also detach it from the ancestor Turndown removes
-	const droppedAncestors = [];
+	// slicing it out would also detach it from the ancestor Turndown removes.
+	// Open dropped elements are counted per name (constant time per tag: no
+	// stack a flood of unmatched closers could make this rescan); a closer with
+	// nothing open of its name is ignored, as the parser ignores it
+	const openDropped = new Map();
+	let droppedDepth = 0;
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing, start }) => {
 			if (DROP_ELEMENT_SET.has(name)) {
+				const open = openDropped.get(name) || 0;
 				if (closing) {
-					const index = droppedAncestors.lastIndexOf(name);
-					if (index !== -1) droppedAncestors.length = index;
+					if (open > 0) {
+						openDropped.set(name, open - 1);
+						droppedDepth--;
+					}
 				} else if (!(selfClosing && (name === "svg" || name === "math"))) {
-					droppedAncestors.push(name);
+					openDropped.set(name, open + 1);
+					droppedDepth++;
 				}
 				return;
 			}
 			const mark = marks[name];
-			if (!mark || droppedAncestors.length > 0) return;
+			if (!mark || droppedDepth > 0) return;
 			if (closing) {
 				mark.end = start; // the last closer wins
 			} else {

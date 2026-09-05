@@ -524,6 +524,17 @@ const BINARY_SIGNATURES = [
 export function looksBinary(bytes, charset = null) {
 	if (!bytes || bytes.byteLength === 0) return false;
 
+	// Known binary signatures are refused whatever the server claims: a
+	// charset label must not launder a PDF or an archive
+	const start = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0; // UTF-8 BOM
+	if (
+		BINARY_SIGNATURES.some((signature) =>
+			signature.every((byte, index) => bytes[start + index] === byte)
+		)
+	) {
+		return true;
+	}
+
 	// UTF-16 text (declared, or announced by a byte-order mark) encodes most
 	// ASCII with a NUL byte: judge the decoded code units, not the bytes
 	const utf16 = utf16Label(bytes, charset);
@@ -537,15 +548,6 @@ export function looksBinary(bytes, charset = null) {
 		return controlShare(Array.from(text.slice(0, 8192), (char) => char.charCodeAt(0))) > 0.05;
 	}
 
-	// Skip a UTF-8 BOM
-	const start = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
-	if (
-		BINARY_SIGNATURES.some((signature) =>
-			signature.every((byte, index) => bytes[start + index] === byte)
-		)
-	) {
-		return true;
-	}
 	const sample = bytes.subarray(start, start + 8192);
 	for (const byte of sample) if (byte === 0) return true;
 	return controlShare(sample) > 0.05;

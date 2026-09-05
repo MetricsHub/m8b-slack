@@ -21,7 +21,7 @@ import {
 	handleRequestCredentials,
 	handleSaveConfigFile,
 } from "./config-editor.js";
-import { executeFetchUrl } from "./fetch-url.js";
+import { executeFetchUrl, isFetchUrlEnabled } from "./fetch-url.js";
 import { openai } from "./openai.js";
 import { uploadGeneratedFilesToSlack } from "./slack-files.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
@@ -156,6 +156,14 @@ export async function processFunctionCall(functionCall, context) {
 			// truncated blindly by the provider inline cap. An MCP server that
 			// exports its own fetch_url keeps it (the built-in is not offered then)
 			case "fetch_url":
+				// The switch removes page reading entirely, MCP-provided readers included
+				if (!isFetchUrlEnabled()) {
+					output = {
+						ok: false,
+						error: "fetch_url is disabled on this deployment (FETCH_URL_ENABLED=false).",
+					};
+					break;
+				}
 				output = await executeWithMiddleware(
 					name,
 					args,

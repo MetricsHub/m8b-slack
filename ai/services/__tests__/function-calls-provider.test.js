@@ -77,6 +77,23 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.error).toContain("not available");
 	});
 
+	it("refuses fetch_url calls outright when the switch is off", async () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		process.env.FETCH_URL_ENABLED = "false";
+		try {
+			const items = await processFunctionCall(
+				{ name: "fetch_url", call_id: "call_1", arguments: '{"url":"https://example.com/"}' },
+				makeContext()
+			);
+			const output = parseOutput(items);
+			expect(output.ok).toBe(false);
+			expect(output.error).toContain("FETCH_URL_ENABLED=false");
+		} finally {
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
 	it("routes fetch_url to the application-side page reader", async () => {
 		// A loopback target is refused before any network access: deterministic
 		// proof that the call reached the reader and its address policy

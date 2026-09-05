@@ -234,6 +234,36 @@ describe("buildToolsArray", () => {
 		}
 	});
 
+	it("removes an MCP-provided fetch_url too when the switch is off", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		process.env.FETCH_URL_ENABLED = "false";
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{ description: "Agent-side page reader.", inputSchema: { type: "object" } },
+					],
+					["OtherTool", { description: "Kept.", inputSchema: { type: "object" } }],
+				]),
+			},
+		]);
+		try {
+			const names = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).map(
+				(t) => t.name
+			);
+			expect(names).not.toContain("fetch_url");
+			expect(names).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
 	it("exposes web_search as a function tool only when a backend is configured", () => {
 		const withoutSearch = buildToolsArray({ provider: ollamaProvider });
 		expect(withoutSearch.map((t) => t.name)).not.toContain("web_search");

@@ -463,6 +463,9 @@ describe("transport hardening", () => {
 		const binary = await run({ url: "https://example.com/really-binary" }, { routes });
 		expect(binary.result.ok).toBe(false);
 		expect(looksBinary(Buffer.from("plain", "utf16le"), "utf-16")).toBe(false);
+		// A charset label cannot launder a known binary format
+		expect(looksBinary(Buffer.from("%PDF-1.7 ..."), "utf-16le")).toBe(true);
+		expect(looksBinary(Buffer.from("PK\x03\x04rest", "latin1"), "utf-16")).toBe(true);
 		expect(looksBinary(Buffer.from("plain", "utf16le"))).toBe(true);
 	});
 
