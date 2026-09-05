@@ -591,6 +591,34 @@ describe("transport hardening", () => {
 		expect(away.result.error).toContain("FETCH_URL_ALLOWED_HOSTS");
 	});
 
+	it("drops the token on a redirect to a numeric /repositories/{id} route", async () => {
+		// The destination does not name its repository, so the scope cannot be checked
+		const seen = [];
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response("", {
+					status: 301,
+					headers: { location: "https://api.github.com/repositories/98765/issues/12" },
+				});
+			},
+			"https://api.github.com/repositories/98765/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response(JSON.stringify({ number: 12, title: "T", state: "open" }), {
+					contentType: "application/json",
+				});
+			},
+			"https://api.github.com/repos/acme/tool/issues/12/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+			}),
+		};
+		await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ routes, config: { githubToken: "ghp_secret", githubTokenRepos: ["acme/*"] } }
+		);
+		expect(seen).toEqual(["Bearer ghp_secret", undefined]);
+	});
+
 	it("keeps credentials on a same-origin redirect", async () => {
 		const seen = [];
 		const routes = {
@@ -818,6 +846,72 @@ describe("content negotiation", () => {
 		expect(result.content).toContain("Body.");
 	});
 
+	it("accepts whitespace around the XML encoding assignment", async () => {
+		const latinXml = Buffer.from(
+			'<?xml version="1.0" encoding = "windows-1252"?><rss><channel><title>Caf\xe9</title></channel></rss>',
+			"latin1"
+		);
+		const routes = {
+			"https://example.com/spaced.xml": response(latinXml, { contentType: "application/rss+xml" }),
+		};
+		const { result } = await run({ url: "https://example.com/spaced.xml" }, { routes });
+		expect(result.content).toContain("Café");
+	});
+
+	it("decodes Slack's escaped entities inside a wrapped URL", async () => {
+		const seen = [];
+		const routes = {
+			"https://example.com/search?a=1&b=2": (_init, url) => {
+				seen.push(url);
+				return response("results", { contentType: "text/plain" });
+			},
+		};
+		const { result } = await run(
+			{ url: "<https://example.com/search?a=1&amp;b=2|example.com>" },
+			{ routes }
+		);
+		expect(result.ok).toBe(true);
+		expect(seen).toEqual(["https://example.com/search?a=1&b=2"]);
+	});
+
+	it("keeps the query string on Markdown alternatives and skips llms.txt for queried pages", async () => {
+		const routes = {
+			"https://docs.example.com/guide?version=2": response(HTML_PAGE),
+			"https://docs.example.com/guide.md?version=2": response("# Guide v2", {
+				contentType: "text/markdown",
+			}),
+			// The default rendition must NOT be preferred over the requested version
+			"https://docs.example.com/guide.md": response("# Guide v1", { contentType: "text/markdown" }),
+			"https://docs.example.com/llms.txt": response(
+				"- [Guide](https://docs.example.com/guide.md)",
+				{
+					contentType: "text/plain",
+				}
+			),
+		};
+		const withSibling = await run({ url: "https://docs.example.com/guide?version=2" }, { routes });
+		expect(withSibling.result.source).toBe("markdown");
+		expect(withSibling.result.content).toBe("# Guide v2");
+		expect(withSibling.result.finalUrl).toBe("https://docs.example.com/guide.md?version=2");
+
+		// No queried sibling: llms.txt is not consulted, the HTML itself is converted
+		const noSibling = await run(
+			{ url: "https://docs.example.com/guide?version=2" },
+			{
+				routes: {
+					"https://docs.example.com/guide?version=2": response(HTML_PAGE),
+					"https://docs.example.com/llms.txt": routes["https://docs.example.com/llms.txt"],
+					"https://docs.example.com/guide.md": routes["https://docs.example.com/guide.md"],
+				},
+			}
+		);
+		expect(noSibling.result.source).toBe("html");
+		expect(noSibling.fetchImpl.mock.calls.map((call) => String(call[0]))).toEqual([
+			"https://docs.example.com/guide?version=2",
+			"https://docs.example.com/guide.md?version=2",
+		]);
+	});
+
 	it("unwraps Slack link syntax", async () => {
 		const routes = {
 			"https://example.com/page": response("plain", { contentType: "text/plain" }),
@@ -835,8 +929,9 @@ describe("markdownSiblingUrl / findLlmsTxtEntry", () => {
 	it("derives the llms.txt-convention sibling", () => {
 		const sibling = (url) => markdownSiblingUrl(new URL(url));
 		expect(sibling("https://d.example/docs/page")).toBe("https://d.example/docs/page.md");
+		// The query stays (it may select the content), the fragment goes
 		expect(sibling("https://d.example/docs/page.html?x=1#top")).toBe(
-			"https://d.example/docs/page.md"
+			"https://d.example/docs/page.md?x=1"
 		);
 		expect(sibling("https://d.example/docs/")).toBe("https://d.example/docs/index.html.md");
 		expect(sibling("https://d.example")).toBe("https://d.example/index.html.md");

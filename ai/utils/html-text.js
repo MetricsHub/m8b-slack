@@ -626,6 +626,14 @@ function estimateNesting(html) {
 					if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
 				}
 				if (index !== -1) {
+					if (FORMATTING_ELEMENTS.has(name) && index !== stack.length - 1) {
+						// Adoption agency: the end tag of a formatting element that is not
+						// the current node reconstructs the formatting element and leaves
+						// the block elements above it open. Only that element leaves the
+						// estimate; `<b><div></b>` repeated keeps nesting, as in the parser.
+						stack.splice(index, 1);
+						return true;
+					}
 					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;
 					stack.length = index;
 				}
@@ -686,6 +694,24 @@ const SCOPE_BOUNDARY = new Set([
 /** Additional boundaries of list-item scope (</li>) and button scope (</p>) */
 const LIST_SCOPE = new Set(["ul", "ol"]);
 const BUTTON_SCOPE = new Set(["button"]);
+
+/** Formatting elements, whose end tags go through the adoption agency algorithm */
+const FORMATTING_ELEMENTS = new Set([
+	"a",
+	"b",
+	"big",
+	"code",
+	"em",
+	"font",
+	"i",
+	"nobr",
+	"s",
+	"small",
+	"strike",
+	"strong",
+	"tt",
+	"u",
+]);
 
 /**
  * Elements inside svg/math whose children the HTML parser builds as HTML

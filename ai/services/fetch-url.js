@@ -486,7 +486,7 @@ function decodeBody(bytes, charset, type) {
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
 			head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_-]+)/i)?.[1] ||
-			head.match(/<\?xml[^>]+encoding=["']([a-z0-9_-]+)/i)?.[1] ||
+			head.match(/<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] ||
 			null;
 	}
 	try {
@@ -767,9 +767,9 @@ function describeFetchError(e) {
  * @returns {string|null}
  */
 export function markdownSiblingUrl(url) {
+	// The query stays: "/guide?version=2" selects content the rendition must too
 	const sibling = new URL(url.toString());
 	sibling.hash = "";
-	sibling.search = "";
 	const pathname = sibling.pathname;
 	if (/\.(?:md|markdown|txt)$/i.test(pathname)) return null;
 	if (pathname === "" || pathname.endsWith("/")) {
@@ -1033,7 +1033,8 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 
 	// 3. /llms.txt index at the site root
 	const llmsUrl = new URL("/llms.txt", finalUrl).toString();
-	const llms = await tryMarkdownResource(llmsUrl, runtime);
+	// A listed rendition cannot carry the page's query string: skip the index then
+	const llms = finalUrl.search ? null : await tryMarkdownResource(llmsUrl, runtime);
 	if (llms) {
 		const entry = findLlmsTxtEntry(llms.text, finalUrl);
 		if (entry && entry !== llmsUrl) {
@@ -1185,8 +1186,12 @@ async function githubRequest(
 	// transferred): the token follows only if that repository is in scope too
 	const reviseHeaders = (nextUrl, current) => {
 		if (!current.Authorization) return current;
-		const next = repoOfApiPath(nextUrl.pathname, { owner, repo });
-		if (githubTokenInScope(runtime, next.owner, next.repo)) return current;
+		// A redirect target that does not name its repository (/repositories/{id})
+		// cannot be checked against the scope: the token does not follow it.
+		// (Pagination links, which come from an authorized response, keep their
+		// scope through scopeRepo instead.)
+		const next = repoOfApiPath(nextUrl.pathname, null);
+		if (next.owner && githubTokenInScope(runtime, next.owner, next.repo)) return current;
 		const { Authorization: _dropped, ...rest } = current;
 		return rest;
 	};
@@ -1556,7 +1561,12 @@ export async function executeFetchUrl(args, logger, options = {}) {
 
 	try {
 		// Slack wraps pasted links in <...|label>; models sometimes forward that form
-		const cleaned = rawUrl.replace(/^<([^|>]+)(?:\|[^>]*)?>$/, "$1");
+		// Slack escapes &, < and > in message text: "?a=1&amp;b=2" is "?a=1&b=2"
+		const cleaned = rawUrl
+			.replace(/^<([^|>]+)(?:\|[^>]*)?>$/, "$1")
+			.replace(/&amp;/g, "&")
+			.replace(/&lt;/g, "<")
+			.replace(/&gt;/g, ">");
 		const url = validateUrlPolicy(cleaned, config);
 
 		const github = parseGitHubUrl(url);

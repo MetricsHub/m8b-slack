@@ -429,6 +429,20 @@ describe("htmlToMarkdown", () => {
 		expect(out).toContain("[Guide](https://docs.example.com/docs&api/guide)");
 	});
 
+	it("accounts for the adoption agency on formatting end tags", () => {
+		// </b> with a <div> above it reconstructs the <b> and leaves the div open:
+		// the divs keep nesting in the parser, so they must in the estimate
+		const page = `<body>${"<b><div></b>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary formatting still converts on the DOM route
+		expect(htmlToMarkdown("<body><p>a <b>bold</b> <i>it</i> c</p></body>")).toBe(
+			"a **bold** *it* c"
+		);
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
