@@ -92,6 +92,27 @@ describe("htmlToMarkdown", () => {
 		expect(out).toBe("Click https://x.example/ top");
 	});
 
+	it("bounds link expansion: many relative hrefs against a long base URL cannot blow up the output", () => {
+		const baseUrl = `https://docs.example.com/${"segment/".repeat(180)}page.html`;
+		expect(baseUrl.length).toBeGreaterThan(1400);
+		const links = Array.from({ length: 5000 }, (_, i) => `<a href="l${i}">L${i}</a> `).join("");
+		const page = `<body><p>${links}</p></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page, { baseUrl });
+		expect(Date.now() - started).toBeLessThan(5000);
+		// Unbounded resolution would be ~5000 × 1.4 KB ≈ 7 MB; the budget keeps it well below
+		expect(out.length).toBeLessThan(400000);
+		// Early links resolved, later ones keep their label only — no link is lost
+		expect(out).toContain("[L0](https://docs.example.com/");
+		expect(out).toContain("L4999");
+		expect(out).not.toContain("[L4999](");
+	});
+
+	it("drops absurdly long single URLs but keeps the label", () => {
+		const out = htmlToMarkdown(`<p><a href="https://x.example/${"a".repeat(5000)}">Long</a></p>`);
+		expect(out).toBe("Long");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

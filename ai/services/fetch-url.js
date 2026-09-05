@@ -115,7 +115,7 @@ function parseHostList(value) {
 /**
  * Read the fetch_url configuration from the environment.
  *
- * @returns {{timeoutMs: number, maxBytes: number, allowedHosts: string[], blockedHosts: string[], githubToken: string}}
+ * @returns {{timeoutMs: number, maxBytes: number, allowedHosts: string[], blockedHosts: string[], githubToken: string, githubTokenRepos: string[]}}
  */
 export function getFetchUrlConfig() {
 	return {
@@ -124,7 +124,34 @@ export function getFetchUrlConfig() {
 		allowedHosts: parseHostList(process.env.FETCH_URL_ALLOWED_HOSTS),
 		blockedHosts: parseHostList(process.env.FETCH_URL_BLOCKED_HOSTS),
 		githubToken: (process.env.GITHUB_TOKEN || "").trim(),
+		githubTokenRepos: String(process.env.GITHUB_TOKEN_REPOS || "")
+			.split(",")
+			.map((entry) =>
+				entry
+					.trim()
+					.toLowerCase()
+					.replace(/^\/+|\/+$/g, "")
+			)
+			.filter(Boolean),
 	};
+}
+
+/**
+ * Whether the shared GITHUB_TOKEN may be used for a repository. The token is
+ * the bot's, not the requesting user's: GITHUB_TOKEN_REPOS ("owner/repo" or
+ * "owner/*", comma-separated) limits which repositories it is spent on. An
+ * empty scope means every repository (documented as the operator's decision).
+ *
+ * @param {string[]} scope - Parsed GITHUB_TOKEN_REPOS entries
+ * @param {string} owner - Repository owner
+ * @param {string} repo - Repository name
+ * @returns {boolean}
+ */
+export function githubTokenAllowedFor(scope, owner, repo) {
+	if (!Array.isArray(scope) || scope.length === 0) return true;
+	const full = `${owner}/${repo}`.toLowerCase();
+	const ownerKey = String(owner).toLowerCase();
+	return scope.some((entry) => entry === full || entry === `${ownerKey}/*` || entry === ownerKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +533,8 @@ export function looksBinary(bytes) {
 async function readBodyCapped(response, maxBytes) {
 	const declared = Number(response.headers?.get?.("content-length"));
 	if (Number.isFinite(declared) && declared > maxBytes) {
+		// Release the connection: undici would otherwise keep draining the body
+		await response.body?.cancel?.().catch(() => {});
 		throw new FetchUrlError(
 			`Refused: response is ${declared} bytes, above the FETCH_URL_MAX_BYTES cap of ${maxBytes}`
 		);
@@ -554,15 +583,23 @@ async function guardedGet(rawUrl, headers, runtime, { derivedHost = false } = {}
 	const { config, fetchImpl, lookup, dispatcher, logger } = runtime;
 	let url = validateUrlPolicy(rawUrl, config, { derivedHost });
 	let hops = 0;
+	let requestHeaders = { ...headers };
 
 	for (;;) {
-		await resolvePublicAddresses(url.hostname.replace(/^\[|\]$/g, ""), lookup);
+		// The preliminary resolution runs before the request (and its timeout)
+		// exists: bound it by the same deadline, or a stalled resolver would hold
+		// the Slack run for the OS's much longer DNS timeout
+		await withTimeout(
+			resolvePublicAddresses(url.hostname.replace(/^\[|\]$/g, ""), lookup),
+			config.timeoutMs,
+			`DNS resolution of ${url.hostname}`
+		);
 
 		let response;
 		try {
 			response = await fetchImpl(url.toString(), {
 				method: "GET",
-				headers: { "User-Agent": USER_AGENT, ...headers },
+				headers: { "User-Agent": USER_AGENT, ...requestHeaders },
 				redirect: "manual",
 				signal: AbortSignal.timeout(config.timeoutMs),
 				...(dispatcher ? { dispatcher } : {}),
@@ -589,12 +626,37 @@ async function guardedGet(rawUrl, headers, runtime, { derivedHost = false } = {}
 			}
 			logger?.info?.(`[FETCH_URL] ${url.hostname} redirected (${status}) to ${next}`);
 			// Redirect targets are never trusted, whatever the origin of the hop
-			url = validateUrlPolicy(next, config);
+			const nextUrl = validateUrlPolicy(next, config);
+			// Credentials never follow a redirect to another origin (the GitHub
+			// token is for api.github.com only), as browsers and curl behave
+			if (nextUrl.origin !== url.origin) {
+				requestHeaders = Object.fromEntries(
+					Object.entries(requestHeaders).filter(
+						([key]) => !SENSITIVE_HEADERS.has(key.toLowerCase())
+					)
+				);
+			}
+			url = nextUrl;
 			continue;
 		}
 
 		return { response, url };
 	}
+}
+
+/** Request headers that must not follow a redirect to another origin */
+const SENSITIVE_HEADERS = new Set(["authorization", "cookie", "proxy-authorization"]);
+
+/**
+ * Bound a promise by a deadline (the promise itself keeps running; its result
+ * is dropped). dns.promises.lookup takes no AbortSignal, hence the race.
+ */
+function withTimeout(promise, ms, label) {
+	let timer;
+	const deadline = new Promise((_resolve, reject) => {
+		timer = setTimeout(() => reject(new FetchUrlError(`${label} timed out after ${ms} ms`)), ms);
+	});
+	return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 function describeFetchError(e) {
@@ -800,11 +862,14 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	const body = decodeBody(bytes, charset, type);
 	const contentType = type || "text/plain";
 
+	// One HTML predicate for every branch: declared HTML, or an untyped /
+	// text/plain body that is really markup (misconfigured servers)
+	const looksHtml =
+		HTML_TYPES.has(type) ||
+		((!type || type === "text/plain") && /^\s*<(?:!doctype|html)\b|<html\b|<body\b/i.test(body));
+
 	// 1. The server answered our Accept header with Markdown or plain text
-	if (
-		MARKDOWN_TYPES.has(type) ||
-		(type === "text/plain" && !/^\s*<(?:!doctype|html)\b/i.test(body))
-	) {
+	if (MARKDOWN_TYPES.has(type) || (type === "text/plain" && !looksHtml)) {
 		return buildResult({
 			requestedUrl,
 			finalUrl: finalUrl.toString(),
@@ -814,9 +879,6 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 		});
 	}
 
-	const looksHtml =
-		HTML_TYPES.has(type) ||
-		((!type || type === "text/plain") && /^\s*<(?:!doctype|html)\b|<html\b|<body\b/i.test(body));
 	if (!looksHtml) {
 		// JSON, XML, YAML, scripts: hand over verbatim
 		return buildResult({
@@ -918,7 +980,13 @@ async function githubApi(path, runtime) {
 		Accept: "application/vnd.github+json",
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
-	if (runtime.config.githubToken) {
+	// The token is the bot's, shared by every Slack user who can talk to it:
+	// only spend it on repositories the operator scoped it to
+	const [, owner = "", repo = ""] = path.match(/^\/repos\/([^/]+)\/([^/]+)/) || [];
+	const tokenInScope =
+		Boolean(runtime.config.githubToken) &&
+		githubTokenAllowedFor(runtime.config.githubTokenRepos, owner, repo);
+	if (tokenInScope) {
 		headers.Authorization = `Bearer ${runtime.config.githubToken}`;
 	}
 	const { response } = await guardedGet(`https://api.github.com${path}`, headers, runtime, {
@@ -928,19 +996,19 @@ async function githubApi(path, runtime) {
 		await response.body?.cancel?.().catch(() => {});
 		const remaining = response.headers?.get?.("x-ratelimit-remaining");
 		if (response.status === 404) {
+			let hint = "Set GITHUB_TOKEN on the bot to read private repositories.";
+			if (tokenInScope) hint = "The configured GITHUB_TOKEN cannot see this repository.";
+			else if (runtime.config.githubToken)
+				hint = `The bot's GITHUB_TOKEN is not scoped to ${owner}/${repo} (GITHUB_TOKEN_REPOS), so the request was anonymous.`;
 			throw new FetchUrlError(
 				`GitHub returned 404 for ${path}: the issue does not exist, or the repository is private`,
-				runtime.config.githubToken
-					? "The configured GITHUB_TOKEN cannot see this repository."
-					: "Set GITHUB_TOKEN on the bot to read private repositories."
+				hint
 			);
 		}
 		if ((response.status === 403 || response.status === 429) && remaining === "0") {
 			throw new FetchUrlError(
 				"GitHub API rate limit exhausted",
-				runtime.config.githubToken
-					? "Try again later."
-					: "Set GITHUB_TOKEN for a higher rate limit."
+				tokenInScope ? "Try again later." : "Set GITHUB_TOKEN for a higher rate limit."
 			);
 		}
 		throw new FetchUrlError(`GitHub API returned HTTP ${response.status} for ${path}`);

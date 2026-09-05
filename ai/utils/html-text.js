@@ -139,6 +139,15 @@ function selectContentRegion(html) {
  */
 const MAX_DOM_DEPTH = 512;
 
+/** Longest URL emitted for a link or image (browsers accept ~2 KB in practice) */
+const MAX_URL_CHARS = 2048;
+
+/**
+ * Total URL characters emitted per document. Bounds the only expansion step
+ * of the conversion (relative hrefs resolved against a long base URL).
+ */
+const MAX_URL_CHARS_PER_DOCUMENT = 300000;
+
 /** Elements that never have a closing tag */
 const VOID_ELEMENTS = new Set([
 	"area",
@@ -243,14 +252,28 @@ function createConverter(baseUrl) {
 	service.use(gfmPlugin.gfm);
 	service.remove(DROP_ELEMENTS);
 
+	// Resolving relative hrefs is the one step where output can outgrow the
+	// input (thousands of short hrefs × a long base URL): each URL is capped
+	// and the URLs emitted per document share a budget; past it, links keep
+	// their label only. Everything else Turndown emits is bounded by the input.
+	let urlBudget = MAX_URL_CHARS_PER_DOCUMENT;
+	const emitUrl = (raw) => {
+		const target = resolveUrl(raw, baseUrl);
+		if (!target || target.length > MAX_URL_CHARS || target.length > urlBudget) return null;
+		urlBudget -= target.length;
+		return target;
+	};
+
 	// Links: absolute URLs, no duplicate of the label, no javascript: targets
 	service.addRule("absoluteLinks", {
 		filter: (node) => node.nodeName === "A" && Boolean(node.getAttribute("href")),
 		replacement: (content, node) => {
 			const label = content.replace(/\s+/g, " ").trim();
 			if (!label) return "";
-			const target = resolveUrl(node.getAttribute("href"), baseUrl);
-			if (!target || target.startsWith("#") || label === target) return label;
+			const href = String(node.getAttribute("href") || "").trim();
+			if (href.startsWith("#")) return label;
+			const target = emitUrl(href);
+			if (!target || label === target) return label;
 			return `[${label}](${target})`;
 		},
 	});
@@ -262,7 +285,7 @@ function createConverter(baseUrl) {
 			const alt = String(node.getAttribute("alt") || "")
 				.replace(/\s+/g, " ")
 				.trim();
-			const src = resolveUrl(node.getAttribute("src"), baseUrl);
+			const src = emitUrl(node.getAttribute("src"));
 			if (!alt && !src) return "";
 			return src ? `![${alt}](${src})` : `[image: ${alt}]`;
 		},

@@ -275,6 +275,7 @@ SEARXNG_URL=http://searxng.internal:8080
 # FETCH_URL_TIMEOUT_MS=20000
 # FETCH_URL_MAX_BYTES=2097152
 # GITHUB_TOKEN=                       # private repositories / higher rate limit (api.github.com only)
+# GITHUB_TOKEN_REPOS=                 # scope the (shared) token: owner/repo or owner/*; empty = all
 ```
 
 ### Ollama preset
@@ -547,7 +548,11 @@ output. `FETCH_URL_ENABLED=false` removes the tool.
 results never go to OpenAI, and never leave your network (beyond your own inference endpoint) unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends
 the search query — not the conversation — to ollama.com). `fetch_url` contacts the sites whose
 URLs users paste (plus `api.github.com` for GitHub links) with a plain GET carrying no Slack or
-MCP credentials; only `GITHUB_TOKEN`, when set, is sent, and only to `api.github.com`.
+MCP credentials; only `GITHUB_TOKEN`, when set, is sent, and only to `api.github.com` (never
+across a redirect). That token is the bot's, so every Slack user who can talk to the bot reads
+GitHub through it: `GITHUB_TOKEN_REPOS` (`owner/repo` or `owner/*`) limits the repositories it is
+used for. Fetched pages are untrusted input: the system prompt tells the model to treat them as
+data and never to follow instructions found in them.
 
 `NODE_ENV` controls Bolt logging:
 

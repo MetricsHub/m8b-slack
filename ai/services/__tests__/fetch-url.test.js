@@ -11,6 +11,7 @@ import {
 	executeFetchUrl,
 	findLlmsTxtEntry,
 	getFetchUrlTool,
+	githubTokenAllowedFor,
 	isBlockedAddress,
 	looksBinary,
 	MAX_CONTENT_CHARS,
@@ -395,6 +396,108 @@ describe("limits", () => {
 	});
 });
 
+describe("transport hardening", () => {
+	it("cancels the body of a response rejected on its declared size", async () => {
+		const cancel = jest.fn(async () => {});
+		const routes = {
+			"https://big.example.com/": () => ({
+				...response("x", { contentType: "text/plain", headers: { "content-length": "9000000" } }),
+				body: { cancel },
+			}),
+		};
+		const { result } = await run({ url: "https://big.example.com/" }, { routes });
+		expect(result.ok).toBe(false);
+		expect(cancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds the preliminary DNS lookup by the request timeout", async () => {
+		const stalled = jest.fn(() => new Promise(() => {}));
+		const started = Date.now();
+		const { result, fetchImpl } = await run(
+			{ url: "https://slow-dns.example.com/" },
+			{ lookup: stalled, config: { timeoutMs: 80 } }
+		);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("DNS resolution of slow-dns.example.com timed out");
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("drops credentials when a redirect leaves the origin", async () => {
+		const seen = [];
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response("", {
+					status: 302,
+					headers: { location: "https://mirror.example.net/issue.json" },
+				});
+			},
+			"https://mirror.example.net/issue.json": (init) => {
+				seen.push(init.headers.Authorization);
+				return response(JSON.stringify({ number: 12, title: "T", state: "open" }), {
+					contentType: "application/json",
+				});
+			},
+			"https://mirror.example.net/repos/acme/tool/issues/12/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+			}),
+		};
+		await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ routes, config: { githubToken: "ghp_secret" } }
+		);
+		expect(seen[0]).toBe("Bearer ghp_secret");
+		expect(seen[1]).toBeUndefined();
+	});
+
+	it("keeps credentials on a same-origin redirect", async () => {
+		const seen = [];
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response("", { status: 301, headers: { location: "/repos/acme/tool/issues/12/" } });
+			},
+			"https://api.github.com/repos/acme/tool/issues/12/": (init) => {
+				seen.push(init.headers.Authorization);
+				return response(JSON.stringify({ number: 12, title: "T", state: "open" }), {
+					contentType: "application/json",
+				});
+			},
+			"https://api.github.com/repos/acme/tool/issues/12/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+			}),
+		};
+		await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ routes, config: { githubToken: "ghp_secret" } }
+		);
+		expect(seen).toEqual(["Bearer ghp_secret", "Bearer ghp_secret"]);
+	});
+
+	it("routes HTML mislabelled as text/plain through the HTML reader", async () => {
+		const routes = {
+			"https://misconfigured.example.com/": response(
+				`<body><nav>Menu</nav><main><h1>Title</h1><p>${"Body text. ".repeat(30)}</p></main></body>`,
+				{ contentType: "text/plain" }
+			),
+			"https://preamble.example.com/": response(
+				`Some preamble\n<html><body><p>${"Paragraph. ".repeat(30)}</p></body></html>`,
+				{ contentType: "text/plain" }
+			),
+		};
+		const body = await run({ url: "https://misconfigured.example.com/" }, { routes });
+		expect(body.result.source).toBe("html");
+		expect(body.result.content).toContain("# Title");
+		expect(body.result.content).not.toContain("<nav>");
+		expect(body.result.content).not.toContain("Menu");
+
+		const preamble = await run({ url: "https://preamble.example.com/" }, { routes });
+		expect(preamble.result.source).toBe("html");
+		expect(preamble.result.content).not.toContain("<html>");
+	});
+});
+
 describe("content negotiation", () => {
 	it("sends a Markdown-first Accept header and uses a Markdown response as-is", async () => {
 		const routes = {
@@ -775,5 +878,47 @@ describe("GitHub", () => {
 		expect(api.result.ok).toBe(false);
 		expect(api.result.error).toContain("api.github.com is blocked");
 		expect(api.fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("scopes the shared token to GITHUB_TOKEN_REPOS", () => {
+		expect(githubTokenAllowedFor([], "acme", "tool")).toBe(true);
+		expect(githubTokenAllowedFor(["acme/tool"], "acme", "tool")).toBe(true);
+		expect(githubTokenAllowedFor(["acme/tool"], "Acme", "Tool")).toBe(true);
+		expect(githubTokenAllowedFor(["acme/*"], "acme", "other")).toBe(true);
+		expect(githubTokenAllowedFor(["acme"], "acme", "other")).toBe(true);
+		expect(githubTokenAllowedFor(["acme/tool"], "acme", "other")).toBe(false);
+		expect(githubTokenAllowedFor(["acme/*"], "evil", "tool")).toBe(false);
+	});
+
+	it("sends the token only for repositories in scope, and says so on a 404", async () => {
+		const seen = {};
+		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": (init) => {
+				seen.inScope = init.headers.Authorization;
+				return json(issue);
+			},
+			"https://api.github.com/repos/acme/tool/issues/12/comments?per_page=100": json([]),
+			"https://api.github.com/repos/other/secret/issues/1": (init) => {
+				seen.outOfScope = init.headers.Authorization;
+				return notFound();
+			},
+		};
+		const config = { githubToken: "ghp_test", githubTokenRepos: ["acme/*"] };
+
+		const inScope = await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ routes, config }
+		);
+		expect(inScope.result.ok).toBe(true);
+		expect(seen.inScope).toBe("Bearer ghp_test");
+
+		const outOfScope = await run(
+			{ url: "https://github.com/other/secret/issues/1" },
+			{ routes, config }
+		);
+		expect(outOfScope.result.ok).toBe(false);
+		expect(seen.outOfScope).toBeUndefined();
+		expect(outOfScope.result.hint).toContain("GITHUB_TOKEN_REPOS");
 	});
 });
