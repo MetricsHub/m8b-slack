@@ -470,10 +470,16 @@ function routedCalls(def, args, hosts) {
 	if ("hosts" in props) return [{ ...base, hosts }];
 	const field = ["hostnames", "hostname", "host"].find((candidate) => candidate in props);
 	if (!field) return [base]; // unreachable: hasHostRoutingParam() was checked
+	// Does the field take the whole bucket? The destination's own validator
+	// decides (it resolves $ref, anyOf and the rest of the schema); without a
+	// usable validator, the declared type and the field name decide
+	const listCall = { ...base, [field]: hosts };
+	const { validate } = schemaValidator(def);
 	const type = props[field]?.type;
-	const takesList =
-		type === "array" || (Array.isArray(type) && type.includes("array")) || field === "hostnames";
-	if (takesList) return [{ ...base, [field]: hosts }];
+	const takesList = validate
+		? validate(listCall)
+		: type === "array" || (Array.isArray(type) && type.includes("array")) || field === "hostnames";
+	if (takesList) return [listCall];
 	if (hosts.length === 1 && base[field] !== undefined && base[field] !== null) return [base];
 	return hosts.map((host) => ({ ...base, [field]: host }));
 }

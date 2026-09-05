@@ -632,19 +632,38 @@ function findDoctypeEnd(html, from) {
 }
 
 /**
- * Value of an attribute in a raw attribute string (quoted or bare), or null.
- * Bounded by the attribute string itself, which the tokenizer has already
- * delimited with the tag's own ">".
+ * Attributes of a start tag, in order, as the tokenizer reads them: a name
+ * starts at any character but whitespace, "/" and ">" — quotes, "<" and a
+ * leading "=" included (`"color"` is the attribute named `"color"`, not
+ * color) — and runs to whitespace, "/", "=" or ">"; an unquoted value runs to
+ * whitespace or ">", quotes included. Each attribute is visited once.
+ *
+ * @param {string} attrs - Raw attribute text of a start tag
+ * @returns {Array<[string, string|null]>} [lowercased name, value or null when absent]
+ */
+function attributeEntries(attrs) {
+	/** @type {Array<[string, string|null]>} */
+	const entries = [];
+	const attribute =
+		/([^\t\n\f\r />][^\t\n\f\r /=>]*)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"([^"]*)"|'([^']*)'|([^\t\n\f\r >]+))?)?/g;
+	for (const match of String(attrs || "").matchAll(attribute)) {
+		const value = match[2] ?? match[3] ?? match[4] ?? (match[0].includes("=") ? "" : null);
+		entries.push([asciiLower(match[1]), value]);
+	}
+	return entries;
+}
+
+/**
+ * Value of the first attribute of that name (as the parser keeps the first of
+ * duplicates); "" when present without a value; null when absent.
+ *
+ * @param {string} attrs - Raw attribute text of a start tag
+ * @param {string} name - Lowercase attribute name
+ * @returns {string|null}
  */
 function attributeValue(attrs, name) {
-	// Attributes are read in order with the tokenizer's grammar, so a quoted
-	// value is never mistaken for the next attribute (`title="a href=x" href=y`
-	// has href y). The first attribute of that name wins, as in the parser; one
-	// present without a value is the empty string; absent is null.
-	const attribute =
-		/([^\t\n\f\r =/>"']+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"([^"]*)"|'([^']*)'|([^\t\n\f\r "'>]+)))?/g;
-	for (const match of String(attrs || "").matchAll(attribute)) {
-		if (asciiLower(match[1]) === name) return match[2] ?? match[3] ?? match[4] ?? "";
+	for (const [attributeName, value] of attributeEntries(attrs)) {
+		if (attributeName === name) return value ?? "";
 	}
 	return null;
 }
@@ -694,35 +713,57 @@ const HEAD_ELEMENTS = new Set([
 
 /**
  * Simulation of the parser's stack of open elements — the one model behind
- * every pre-parser pass (depth estimate, region selection, title, base URL),
- * so they all agree on what the DOM will contain. It applies the tree
- * builder's rules that decide nesting and namespaces:
+ * every pre-parser pass (depth estimate, region selection, title, base URL,
+ * the fallback converter), so they all agree on what the DOM will contain.
+ * It applies the tree builder's rules that decide nesting and namespaces:
  *
  * - end tags pop to their element only when it is in scope (a closer below a
  *   scope boundary is ignored); the generic algorithm stops at special
  *   elements; formatting end tags obey the adoption agency (nothing popped);
  *   </form> removes only the form; </body> and </html> pop nothing;
- * - everyday unclosed <li>/<p>/<td>... are closed by their siblings, an
- *   unclosed <head> by the first non-head start tag;
+ * - everyday unclosed <li>/<p>/<td>... are closed by their siblings, headings
+ *   by the next heading, an unclosed <head> by the first non-head start tag;
+ *   a nested <form> is ignored (the form element pointer);
+ * - table parts follow the table insertion modes (implied tbody/tr/colgroup,
+ *   table parts outside a table ignored); "in select" and "in frameset"
+ *   ignore the tokens the parser ignores, without switching the tokenizer;
  * - svg/math open foreign content, in which every start tag (HTML void names
  *   and <textarea>/<style>/<script> included) is a foreign element with
  *   children; "/>" closes it at once; a breakout start tag (div, p, font
  *   color=..., ...) and the </p> and </br> end tags pop the foreign elements
  *   and are reprocessed as HTML, where "/>" means nothing; end tags pop to
  *   the matching foreign element; integration points (svg foreignObject/desc/
- *   title, MathML mi/mo/mn/ms/mtext and annotation-xml with an HTML encoding)
- *   make their children HTML again; namespaces are bound per element.
+ *   title, MathML mi/mo/mn/ms/mtext — except their mglyph/malignmark children —
+ *   and annotation-xml with an HTML encoding) make their children HTML;
+ *   namespaces are bound per element.
+ *
+ * Every rule is O(1) per tag whatever the depth: besides the stack itself,
+ * index stacks record the open instances of each name and the positions of
+ * the elements the rules stop at (special elements, scope boundaries, ul/ol,
+ * button, table contexts, HTML-namespace elements). A page that exceeds a cap
+ * is hostile — `handle` then returns false; the DOM route refuses it, while
+ * the fallback converter keeps feeding tags and still stays linear.
  *
  * Also counts what the callers need: the depth, the list/blockquote nesting
  * (Turndown multiplies the output by it), whether the current position is
- * inside an element the converter drops, inside a <template>, or in foreign
- * content. `handle` returns false once a cap is exceeded: the page is
- * hostile, the caller stops scanning and the DOM route is refused.
+ * inside an element the converter drops, inside a <template>, "in select",
+ * or in foreign content.
  */
 function createTreeTracker() {
-	const stack = []; // element names (lowercase)
+	const stack = []; // element names (lowercase; "" is the slot of a removed <form>)
 	const ns = []; // "svg" | "math" for foreign elements, null for HTML ones
 	const integration = []; // the element is an integration point: its children are HTML
+	// Index stacks: open instances per name, and the positions of the elements
+	// the end-tag and table rules stop at. Entries are pushed in stack order and
+	// popped with the stack; a slot emptied by </form> is skipped lazily.
+	const positions = new Map(); // name → indexes of its open instances
+	const specials = []; // SPECIAL_ELEMENTS (the generic end tag stops there)
+	const boundaries = []; // SCOPE_BOUNDARY ("has an element in scope")
+	const listScopes = []; // ul/ol (</li>)
+	const buttons = []; // button (</p>)
+	const tableContexts = []; // HTML td/th/tr/tbody/thead/tfoot/caption/colgroup/table/template/html
+	const htmlElements = []; // HTML-namespace elements (a foreign end tag stops at the nearest)
+	const AUX = [specials, boundaries, listScopes, buttons, tableContexts, htmlElements];
 	let depth = 0;
 	let prefixDepth = 0;
 	let prefixes = 0; // list/blockquote ancestors currently open
@@ -738,40 +779,74 @@ function createTreeTracker() {
 		const top = stack.length - 1;
 		return top >= 0 && isForeign(top) ? ns[top] : "html";
 	};
-	const openCounts = new Map(); // element name → how many are open
+	const openCount = (name) => positions.get(name)?.length || 0;
+	/** Index of the nearest open element of that name, or -1 */
+	const nearest = (name) => {
+		const list = positions.get(name);
+		return list && list.length > 0 ? list[list.length - 1] : -1;
+	};
+	/** Top index of an index stack (-1 when empty), skipping emptied slots */
+	const nearestAlive = (aux) => {
+		while (aux.length > 0 && stack[aux[aux.length - 1]] === "") aux.pop();
+		return aux.length > 0 ? aux[aux.length - 1] : -1;
+	};
+
 	const forget = (i) => {
-		if (ns[i] === null && PREFIXING.has(stack[i])) prefixes--;
-		if (DROP_ELEMENT_SET.has(stack[i])) dropped--;
-		if (stack[i] === "template") templates--;
-		openCounts.set(stack[i], openCounts.get(stack[i]) - 1);
+		const name = stack[i];
+		if (ns[i] === null && PREFIXING.has(name)) prefixes--;
+		if (DROP_ELEMENT_SET.has(name)) dropped--;
+		if (name === "template") templates--;
+		positions.get(name).pop();
+	};
+	const popTop = () => {
+		const index = stack.length - 1;
+		if (stack[index] !== "") forget(index);
+		stack.pop();
+		ns.pop();
+		integration.pop();
+		for (const aux of AUX) {
+			while (aux.length > 0 && aux[aux.length - 1] >= index) aux.pop();
+		}
 	};
 	const popTo = (index) => {
-		for (let i = index; i < stack.length; i++) forget(i);
-		stack.length = index;
-		ns.length = index;
-		integration.length = index;
+		while (stack.length > index) popTop();
 	};
+	/**
+	 * </form> with descendants: the form leaves the stack, its descendants stay.
+	 * The slot is emptied rather than spliced (indexes stay valid); it still
+	 * counts one level — an over-estimate, never an under-estimate.
+	 */
 	const removeAt = (index) => {
 		forget(index);
-		stack.splice(index, 1);
-		ns.splice(index, 1);
-		integration.splice(index, 1);
+		stack[index] = "";
+		ns[index] = null;
+		integration[index] = false;
 	};
 	const push = (name, namespace, isIntegration) => {
+		const index = stack.length;
 		stack.push(name);
 		ns.push(namespace);
 		integration.push(isIntegration);
-		if (namespace === null && PREFIXING.has(name)) prefixes++;
+		if (!positions.has(name)) positions.set(name, []);
+		positions.get(name).push(index);
+		if (SPECIAL_ELEMENTS.has(name)) specials.push(index);
+		if (SCOPE_BOUNDARY.has(name)) boundaries.push(index);
+		if (namespace === null) {
+			if (LIST_SCOPE.has(name)) listScopes.push(index);
+			if (BUTTON_SCOPE.has(name)) buttons.push(index);
+			if (TABLE_CONTEXT.has(name)) tableContexts.push(index);
+			htmlElements.push(index);
+			if (PREFIXING.has(name)) prefixes++;
+		}
 		if (DROP_ELEMENT_SET.has(name)) dropped++;
 		if (name === "template") templates++;
-		openCounts.set(name, (openCounts.get(name) || 0) + 1);
 		if (stack.length > depth) depth = stack.length;
 		if (prefixes > prefixDepth) prefixDepth = prefixes;
 		if (depth > MAX_DOM_DEPTH || prefixDepth > MAX_PREFIX_DEPTH) hostile = true;
 	};
 	/** Leave foreign content: pop until the current node is HTML or an integration point */
 	const popForeign = () => {
-		while (stack.length > 0 && isForeign(stack.length - 1)) popTo(stack.length - 1);
+		while (stack.length > 0 && isForeign(stack.length - 1)) popTop();
 	};
 	/**
 	 * Start tag of a table part (td, th, tr, tbody, thead, tfoot, caption,
@@ -788,9 +863,8 @@ function createTreeTracker() {
 	 * @returns {boolean} Handled
 	 */
 	const tableStart = (name) => {
-		let i = stack.length - 1;
-		while (i >= 0 && !(ns[i] === null && TABLE_CONTEXT.has(stack[i]))) i--;
-		const context = i >= 0 ? stack[i] : null;
+		const i = nearestAlive(tableContexts);
+		const context = i === -1 ? null : stack[i];
 		if (context === null || context === "html") return true; // no table: ignored
 		if (context === "template") return false;
 		if (context === "td" || context === "th") {
@@ -848,7 +922,8 @@ function createTreeTracker() {
 	};
 	/**
 	 * Index of the <select> the parser is "in select" for — the current node
-	 * is a select, or an option/optgroup inside one — else -1
+	 * is a select, or an option/optgroup inside one — else -1. Siblings close
+	 * each other, so the walk over option/optgroup is short.
 	 */
 	const openSelectIndex = () => {
 		for (let i = stack.length - 1; i >= 0; i--) {
@@ -906,21 +981,32 @@ function createTreeTracker() {
 			} else {
 				// A foreign end tag pops to its element when one is open above the
 				// nearest HTML element; otherwise the HTML rules decide
-				for (let i = stack.length - 1; i >= 0; i--) {
-					if (ns[i] === null) break;
-					if (stack[i] === name) {
-						popTo(i);
-						return !hostile;
-					}
+				const i = nearest(name);
+				if (i !== -1 && ns[i] !== null && nearestAlive(htmlElements) < i) {
+					popTo(i);
+					return !hostile;
 				}
 			}
 		}
 
 		// HTML rules
+		// "In frameset": below a <frameset>, only frameset, frame and noframes start
+		// tags mean anything; every other token is ignored and never switches the
+		// tokenizer (an ignored <textarea> is not RCDATA)
+		if (
+			!closing &&
+			stack.length > 0 &&
+			ns[stack.length - 1] === null &&
+			stack[stack.length - 1] === "frameset"
+		) {
+			if (name === "frameset" || name === "noframes") push(name, null, false);
+			else if (name !== "frame") tag.rawText = false;
+			return !hostile;
+		}
 		// "In select": while a <select> is the current node (or an option/optgroup
 		// inside it), the parser IGNORES almost every other token — no element is
 		// inserted for a stray <base>, <title> or <div> there — until the select
-		// is closed by </select>, another <select>, or an <input>/<textarea>/<hr>
+		// is closed by </select>, another <select>, or an <input>/<textarea>
 		const selectIndex = openSelectIndex();
 		if (selectIndex !== -1) {
 			if (!closing) {
@@ -931,7 +1017,7 @@ function createTreeTracker() {
 				if (name === "hr") {
 					// <hr> is inserted INSIDE the select, closing an open option/optgroup:
 					// void, so nothing is pushed and the select stays open
-					while (stack.length - 1 > selectIndex) popTo(stack.length - 1);
+					popTo(selectIndex + 1);
 					return !hostile;
 				}
 				if (name === "input" || name === "keygen" || name === "textarea") {
@@ -953,13 +1039,13 @@ function createTreeTracker() {
 			stack[stack.length - 1] === "head" &&
 			!HEAD_ELEMENTS.has(name)
 		) {
-			popTo(stack.length - 1); // an unclosed <head> ends at the first body start tag
+			popTop(); // an unclosed <head> ends at the first body start tag
 		}
 		// </body> and </html> only change the parser's insertion mode: nothing is
 		// popped, the open elements stay nested. Extra <body>/<html> start tags
 		// are ignored by the parser as well.
 		if (name === "body" || name === "html") {
-			if (!closing && !stack.includes(name)) push(name, null, false);
+			if (!closing && openCount(name) === 0) push(name, null, false);
 			return !hostile;
 		}
 		if (closing) {
@@ -967,22 +1053,18 @@ function createTreeTracker() {
 			// table, td, template, ...) sits above it: the parser then ignores the
 			// end tag and everything stays open. Special elements have their own
 			// end-tag rules ("in scope": stop at the scope boundaries; </li> adds
-			// ul/ol, </p> adds button). Any other end tag uses the generic algorithm,
-			// which gives up at the first SPECIAL element it meets
-			// (`<span><div></span>` leaves the div open). The stack is capped, so
-			// this walk is bounded.
-			const special = SPECIAL_ELEMENTS.has(name);
-			const extraBoundary = name === "li" ? LIST_SCOPE : name === "p" ? BUTTON_SCOPE : null;
-			let index = -1;
-			for (let i = stack.length - 1; i >= 0; i--) {
-				if (stack[i] === name) {
-					index = i;
-					break;
-				}
-				if (special) {
-					if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
-				} else if (SPECIAL_ELEMENTS.has(stack[i])) {
-					break;
+			// ul/ol, </p> adds button). Any other end tag uses the generic
+			// algorithm, which gives up at the first SPECIAL element it meets
+			// (`<span><div></span>` leaves the div open). All O(1): the nearest
+			// instance and the nearest stopper come from the index stacks.
+			let index = nearest(name);
+			if (index !== -1) {
+				if (SPECIAL_ELEMENTS.has(name)) {
+					const extra =
+						name === "li" ? nearestAlive(listScopes) : name === "p" ? nearestAlive(buttons) : -1;
+					if (nearestAlive(boundaries) > index || extra > index) index = -1;
+				} else if (nearestAlive(specials) > index) {
+					index = -1;
 				}
 			}
 			if (index !== -1) {
@@ -1007,15 +1089,16 @@ function createTreeTracker() {
 			if (!selfClosing) push(name, name, false); // an empty <svg/> opens nothing
 			return !hostile;
 		}
+		// The form element pointer: a <form> while one is open (outside a template)
+		// is ignored, so a single </form> closes the outer one
+		if (name === "form" && openCount("form") > 0 && templates === 0) return !hostile;
 		// Table parts first: a <col> (void) still inserts the colgroup it lacks
 		if (TABLE_PARTS.has(name) && tableStart(name)) return !hostile;
 		// "<div/>" opens a div: the slash is only meaningful on void elements
 		if (VOID_ELEMENTS.has(name)) return !hostile;
 		const closes = IMPLICIT_CLOSERS[name];
 		if (closes) {
-			while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
-				popTo(stack.length - 1);
-			}
+			while (stack.length > 0 && closes.includes(stack[stack.length - 1])) popTop();
 		}
 		push(name, null, false);
 		return !hostile;
@@ -1023,7 +1106,6 @@ function createTreeTracker() {
 
 	return {
 		handle,
-		/** Options for tokenizeHtml(): CDATA sections are opaque in foreign content */
 		/**
 		 * Options for tokenizeHtml(): a CDATA section opens whenever the current
 		 * node is a foreign element — an integration point (foreignObject) INCLUDED,
@@ -1069,9 +1151,7 @@ function createTreeTracker() {
 		 * parser ignores, or a start tag it discards, changes nothing).
 		 * @param {string} name
 		 */
-		openCount(name) {
-			return openCounts.get(name) || 0;
-		},
+		openCount,
 	};
 }
 
@@ -1410,9 +1490,9 @@ const FOREIGN_BREAKOUT = new Set([
 const FONT_BREAKOUT_ATTRIBUTES = new Set(["color", "face", "size"]);
 
 /**
- * Whether a tag's attribute string (as sliced by the tokenizer) names one of
- * `names`. Attribute names are ASCII case-insensitive; a value-less attribute
- * (`<font color>`) counts. Single pass over the string.
+ * Whether a tag's attribute text names one of `names` (ASCII case-insensitive,
+ * a value-less attribute counts) — with the tokenizer's notion of a name, so
+ * `<font "color">` does NOT have a color attribute.
  *
  * @param {string} attrs - Raw attribute text of a start tag
  * @param {Set<string>} names - Lowercase attribute names
@@ -1420,16 +1500,8 @@ const FONT_BREAKOUT_ATTRIBUTES = new Set(["color", "face", "size"]);
  */
 function hasAnyAttribute(attrs, names) {
 	if (!attrs) return false;
-	const attribute =
-		/([^\t\n\f\r =/>"']+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"[^"]*"|'[^']*'|[^\t\n\f\r "'>]+))?/g;
-	for (const match of attrs.matchAll(attribute)) {
-		if (names.has(asciiLower(match[1]))) return true;
-	}
-	return false;
+	return attributeEntries(attrs).some(([name]) => names.has(name));
 }
-
-/** Elements whose content is dropped by the fallback converter */
-const FALLBACK_DROP = new Set([...DROP_ELEMENTS, "title"]);
 
 /** Elements that start or end a line in the fallback converter */
 const FALLBACK_BLOCKS = new Set([
@@ -1459,37 +1531,26 @@ const FALLBACK_BLOCKS = new Set([
 /**
  * Last-resort conversion when the DOM route is refused (hostile nesting
  * depth) or fails (parser error, stack exhaustion): drop noise elements,
- * strip the other tags, keep the text. Single pass, linear.
+ * strip the other tags, keep the text. Runs the same tree simulation as the
+ * other passes, so what is dropped is what the parser would build inside a
+ * dropped element (a nested <form> the parser ignores does not swallow the
+ * page). Single pass, linear: the simulation's walks are bounded.
  */
 function stripTagsFallback(html) {
 	const parts = [];
-	let skipping = null; // name of the noise element being skipped
-	let skipDepth = 0;
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
-		({ name, closing, selfClosing }) => {
-			// "<nav/>" opens a nav like the parser does: the slash only counts on
-			// foreign content (svg, math), where an empty element really is empty
-			const emptyForeign = selfClosing && (name === "svg" || name === "math");
-			if (skipping) {
-				if (name === skipping && !emptyForeign) {
-					skipDepth += closing ? -1 : 1;
-					if (skipDepth === 0) skipping = null;
-				}
-				return true;
-			}
-			if (!closing && !emptyForeign && FALLBACK_DROP.has(name) && !VOID_ELEMENTS.has(name)) {
-				skipping = name;
-				skipDepth = 1;
-				return true;
-			}
-			if (FALLBACK_BLOCKS.has(name)) parts.push("\n");
-			else parts.push(" ");
+		(tag) => {
+			tree.handle(tag); // hostile or not, the scan goes on: this IS the fallback
+			if (!tree.dropped) parts.push(FALLBACK_BLOCKS.has(tag.name) ? "\n" : " ");
 			return true;
 		},
 		(text) => {
-			if (!skipping) parts.push(text);
-		}
+			if (!tree.dropped && !tree.inTemplate) parts.push(text);
+			return true;
+		},
+		tree.tokenizerOptions
 	);
 	return decodeHtmlEntities(parts.join(""))
 		.replace(/[ \t\r\f\v]+/g, " ")

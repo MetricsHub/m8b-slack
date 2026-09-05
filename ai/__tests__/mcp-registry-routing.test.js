@@ -155,6 +155,37 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		).toEqual(["h-01", "h-02"]);
 	});
 
+	it("lets the destination schema decide whether the routing field takes the whole bucket", async () => {
+		// hostname is an array through a $ref: one call with the bucket, not one per host
+		const byRef = fakeServer(
+			"byref",
+			{ "r-01": host("r-01"), "r-02": host("r-02") },
+			{
+				fetch_url: {
+					description: "Array hostname via $ref.",
+					inputSchema: {
+						type: "object",
+						$defs: { hostList: { type: "array", items: { type: "string" } } },
+						properties: { url: { type: "string" }, hostname: { $ref: "#/$defs/hostList" } },
+						required: ["url", "hostname"],
+						additionalProperties: false,
+					},
+				},
+			}
+		);
+		_setServersForTests([byRef]);
+		await refreshHostsForServer("byref");
+		const out = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			hosts: ["r-01", "r-02"],
+		});
+		expect(out.results).toHaveLength(1);
+		expect(out.results[0].ok).toBe(true);
+		expect(byRef.calls.filter((c) => c.name === "fetch_url").map((c) => c.args)).toEqual([
+			{ url: "https://example.com/", hostname: ["r-01", "r-02"] },
+		]);
+	});
+
 	it("validates with the JSON Schema dialect the destination declares", async () => {
 		const modern = fakeServer(
 			"modern",

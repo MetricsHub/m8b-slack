@@ -483,6 +483,54 @@ describe("htmlToMarkdown", () => {
 		expect(estimateNesting("<select><optgroup><option><hr><option>x").depth).toBe(3);
 	});
 
+	it("reads attribute names as the tokenizer does: quotes are part of a name", () => {
+		const deep = "<x>".repeat(600);
+		// <font "color"> has the attribute named "color" (with the quotes): not a
+		// breakout, the svg stays open and the textarea below it is foreign
+		expect(estimateNesting(`<svg><font "color"><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<svg><font 'size'><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// A real color/face/size attribute (any form) still breaks out: RCDATA follows
+		expect(estimateNesting(`<svg><font color="red"><textarea>${deep}`).depth).toBe(2);
+		expect(estimateNesting(`<svg><font size><textarea>${deep}`).depth).toBe(2);
+		// Unquoted values run to whitespace or ">", quotes included
+		const page = `<html><head><base href=/docs/"x/><base href="/decoy/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/%22x/guide)"
+		);
+	});
+
+	it("ignores a nested <form> and the fallback keeps what follows the outer one", () => {
+		// The form element pointer: the inner <form> is ignored, so the single
+		// </form> closes the outer form and the article after it is live — on the
+		// fallback route (forced by hostile depth) as on the DOM route
+		const hostile = `<body><p>Before</p>${"<div>".repeat(200000)}<form><form>menu</form>Actual article</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(hostile);
+		expect(Date.now() - started).toBeLessThan(3000);
+		expect(out).toContain("Actual article");
+		expect(out).not.toContain("menu");
+		expect(estimateNesting("<form>".repeat(600)).depth).toBe(1);
+		// Inside a <template> the pointer does not apply
+		expect(estimateNesting("<template><form><form>").depth).toBe(3);
+	});
+
+	it("models the frameset insertion mode: ignored tags never switch the tokenizer", () => {
+		// Below <frameset> a <textarea> is ignored (not RCDATA): the nested framesets
+		// after it are real and deep
+		expect(
+			estimateNesting(`<html><frameset><textarea>${"<frameset>".repeat(600)}`).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<html><frameset><frame><frame><div><p>").depth).toBe(2);
+		// <noframes> is still raw text inside a frameset
+		expect(
+			estimateNesting(`<html><frameset><noframes>${"<frameset>".repeat(600)}</noframes>`).depth
+		).toBe(3);
+	});
+
 	it("keeps CDATA opaque at integration points too (the current node is foreign)", () => {
 		// Inside <foreignObject> the children are HTML, but the tokenizer's CDATA
 		// rule looks at the current node's namespace, which is SVG: the fake
