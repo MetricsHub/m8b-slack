@@ -15,11 +15,13 @@
  *   is used statelessly)
  */
 
+import { getDeploymentContext } from "./config/deployment.js";
 import { MAX_AGENT_ITERATIONS } from "./config/providers.js";
 import {
 	buildSystemPrompt,
 	LOADING_MESSAGES,
 	SYSTEM_PROMPT,
+	systemPromptVersion,
 	TOKEN_LIMITS,
 } from "./config/system-prompt.js";
 import { getMcpServerCount } from "./mcp_registry.js";
@@ -76,9 +78,11 @@ import {
 } from "./utils/tokens.js";
 
 /**
- * In-memory cache: threadTs -> last OpenAI response_id
- * Used to maintain conversation continuity across messages (OpenAI mode only).
- * Cleared on bot restart.
+ * In-memory cache: threadTs -> { responseId, promptVersion } of the last
+ * OpenAI response, i.e. the chain to continue and the system prompt it runs
+ * under. Used to maintain conversation continuity across messages (OpenAI
+ * mode only). Cleared on bot restart.
+ * @type {Map<string, {responseId: string, promptVersion: string|null}>}
  */
 const threadResponseCache = new Map();
 
@@ -86,6 +90,77 @@ const threadResponseCache = new Map();
  * Slack message length limits
  */
 const SLACK_SAFE_LENGTH = 35000; // Leave buffer for markdown formatting overhead (Slack limit is ~40k)
+
+/**
+ * Upper bound on thread pages fetched when a whole thread must be replayed
+ * (Slack caps a page at 1000 messages; a thread this long is pathological).
+ */
+const MAX_THREAD_PAGES = 20;
+
+/**
+ * Follow conversations.replies pagination from an already-fetched first page
+ * and return the complete thread (first page + every following page). Each
+ * page is retried once on a Slack error; the function throws rather than
+ * return a partial thread, because its caller is about to replace a chain
+ * that still holds the missing turns.
+ *
+ * @param {Object} client - Slack WebClient
+ * @param {Object} repliesArgs - Arguments used for the first page (channel, ts, ...)
+ * @param {Object} firstPage - Result of the first conversations.replies call
+ * @param {Object} [logger]
+ * @returns {Promise<Array>} All thread messages in Slack order
+ * @throws {Error} When a page cannot be fetched or the thread has too many pages
+ */
+async function fetchRemainingThreadPages(client, repliesArgs, firstPage, logger) {
+	const messages = [...(firstPage.messages || [])];
+	let cursor = firstPage.response_metadata?.next_cursor;
+	let pages = 0;
+	while (cursor) {
+		if (pages >= MAX_THREAD_PAGES) {
+			throw new Error(`thread has more than ${MAX_THREAD_PAGES} pages`);
+		}
+		pages += 1;
+		const pageArgs = { ...repliesArgs, limit: 200, cursor };
+		let page;
+		try {
+			page = await client.conversations.replies(pageArgs);
+		} catch (e) {
+			logger?.warn?.("conversations.replies page failed; retrying once", {
+				message: e?.message,
+				pages,
+			});
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			page = await client.conversations.replies(pageArgs);
+		}
+		messages.push(...(page.messages || []));
+		cursor = page.has_more ? page.response_metadata?.next_cursor : null;
+	}
+	logger?.info?.(`[Context] Fetched full thread: ${messages.length} messages (${pages + 1} pages)`);
+	return messages;
+}
+
+/**
+ * Slack message metadata that lets a later turn resume a hosted (OpenAI)
+ * chain: the response to continue from, the files already uploaded, and the
+ * fingerprint of the system prompt the chain runs under (see
+ * systemPromptVersion(); a mismatch on the next turn restarts the chain).
+ *
+ * @param {Object} params
+ * @param {string} params.responseId
+ * @param {*} params.uploadedFiles
+ * @param {string} params.promptVersion
+ * @returns {{event_type: string, event_payload: Object}}
+ */
+function openaiContextMetadata({ responseId, uploadedFiles, promptVersion }) {
+	return {
+		event_type: "openai_context",
+		event_payload: {
+			response_id: responseId,
+			uploaded_files: uploadedFiles,
+			prompt_version: promptVersion,
+		},
+	};
+}
 
 /**
  * Tools whose results never change the answer (pure Slack side effects).
@@ -315,7 +390,70 @@ async function respondCore({
 			await new Promise((resolve) => setTimeout(resolve, 1000));
 			thread = await client.conversations.replies(repliesArgs);
 		}
-		const messages = thread.messages || [];
+		let messages = thread.messages || [];
+
+		// System prompt: capability-adapted (Ollama), plus the organization name of
+		// the workspace this message comes from and the deployment notes (both modes)
+		const systemPrompt = buildSystemPrompt(provider.capabilities, {
+			contextWindow: stateless ? provider.contextWindow : undefined,
+			...(await getDeploymentContext({ client, teamId, logger })),
+		});
+		const promptVersion = systemPromptVersion(systemPrompt);
+
+		// Determine conversation continuity strategy
+		let previousResponseId = null;
+		// Hosted chains only carry the system prompt from their first turn: when
+		// the thread was started under another prompt (older code, changed
+		// deployment notes, organization name resolved late) the chain is
+		// dropped and re-seeded with the current prompt plus the whole thread
+		// history rebuilt from Slack
+		let restartHostedChain = false;
+		// The prompt the chain this turn extends actually runs under: stamped
+		// into the reply's metadata and the cache. Differs from promptVersion
+		// only when an old chain has to be continued although it is stale.
+		let chainPromptVersion = promptVersion;
+		if (!stateless) {
+			// Find previous bot response for continuity: the in-process cache
+			// first, then the Slack message metadata
+			const lastBot = findLastBotMessage(messages, context, logger);
+			const cached = threadResponseCache.get(thread_ts);
+			const resume =
+				cached ??
+				(lastBot.responseId
+					? { responseId: lastBot.responseId, promptVersion: lastBot.promptVersion }
+					: null);
+
+			if (resume && resume.promptVersion !== promptVersion) {
+				restartHostedChain = true;
+				logger.info(
+					`Previous response ${resume.responseId} was produced under system prompt ${resume.promptVersion || "(unversioned)"}, current is ${promptVersion}: restarting the chain with the full thread history`
+				);
+			} else if (resume) {
+				previousResponseId = resume.responseId;
+			}
+			logger.info(
+				`Previous response ID: ${previousResponseId} (from ${cached ? "cache" : "metadata"})`
+			);
+
+			// A restarted chain replays the whole thread: the first page above is
+			// only a window, so fetch the remaining pages before dropping the
+			// server-side chain that held the older turns. If Slack cannot hand
+			// out the whole thread right now, the intact old chain is continued
+			// (stamped with ITS prompt version so the restart is attempted again
+			// on the next turn) rather than replaced by a partial replay.
+			if (restartHostedChain && thread.has_more) {
+				try {
+					messages = await fetchRemainingThreadPages(client, repliesArgs, thread, logger);
+				} catch (e) {
+					logger.warn(
+						`Could not fetch the whole thread (${e?.message}); continuing the previous chain under its own prompt version for this turn`
+					);
+					restartHostedChain = false;
+					previousResponseId = resume.responseId;
+					chainPromptVersion = resume.promptVersion;
+				}
+			}
+		}
 
 		// Human participants in this thread (bot messages excluded). Used to warn
 		// the approving admin when other people could have injected instructions.
@@ -389,26 +527,9 @@ async function respondCore({
 		const trimReserveTokens =
 			1500 + Math.ceil(JSON.stringify(tools || []).length / PAYLOAD_CHARS_PER_TOKEN);
 
-		// Determine conversation continuity strategy
-		let previousResponseId = null;
-		if (!stateless) {
-			// Find previous bot response for continuity
-			const lastBot = findLastBotMessage(messages, context, logger);
-
-			// Try cache first, fall back to message metadata
-			const cachedResponseId = threadResponseCache.get(thread_ts);
-			previousResponseId = cachedResponseId || lastBot.responseId;
-			logger.info(
-				`Previous response ID: ${previousResponseId} (from ${cachedResponseId ? "cache" : "metadata"})`
-			);
-		}
-
 		// Build initial input
 		// OpenAI: skip base system prompt when previous_response_id exists (OpenAI maintains context)
 		// Ollama: always include the (capability-adapted) system prompt
-		const systemPrompt = stateless
-			? buildSystemPrompt(provider.capabilities, { contextWindow: provider.contextWindow })
-			: SYSTEM_PROMPT;
 		let input = buildInitialInput({
 			codeContainerFiles: fileManager.codeContainerFiles,
 			includeBasePrompt: stateless || !previousResponseId,
@@ -432,11 +553,13 @@ async function respondCore({
 			);
 		} else if (!previousResponseId) {
 			// Add conversation history ONLY if no previous_response_id
-			// When previous_response_id exists, OpenAI maintains context internally
+			// When previous_response_id exists, OpenAI maintains context internally.
+			// A restarted chain replays the whole thread, not just what followed
+			// the last bot message.
 			const lastBot = findLastBotMessage(messages, context, logger);
 			const historyInput = await buildConversationInput(
 				messages,
-				lastBot.index,
+				restartHostedChain ? -1 : lastBot.index,
 				message.ts,
 				context,
 				fileManager.uploadOnce
@@ -643,6 +766,7 @@ async function respondCore({
 					safetyIdentifier,
 					thread_ts,
 					fileManager,
+					promptVersion: chainPromptVersion,
 					say,
 					logger,
 				});
@@ -684,6 +808,7 @@ async function respondCore({
 						safetyIdentifier,
 						thread_ts,
 						fileManager,
+						promptVersion: chainPromptVersion,
 						say,
 						logger,
 					});
@@ -732,8 +857,11 @@ async function respondCore({
 				lastSeenResponseId = responseId;
 				if (!stateless) {
 					_previousResponseId = responseId;
-					// Cache the response ID for this thread
-					threadResponseCache.set(thread_ts, responseId);
+					// Cache the response ID for this thread, with the prompt its chain runs under
+					threadResponseCache.set(thread_ts, {
+						responseId,
+						promptVersion: chainPromptVersion,
+					});
 				}
 			}
 			if (hadText) anyTextStreamed = true;
@@ -957,6 +1085,7 @@ async function respondCore({
 					say,
 					suggestSummarizeNow,
 					uploadedFilesThisTurn: fileManager.uploadedFilesThisTurn,
+					promptVersion: chainPromptVersion,
 					safetyIdentifier,
 					logger,
 				});
@@ -1222,6 +1351,7 @@ async function executeStreamWithRetry({
 	safetyIdentifier,
 	thread_ts,
 	fileManager,
+	promptVersion,
 	say,
 	logger,
 }) {
@@ -1252,13 +1382,11 @@ async function executeStreamWithRetry({
 						recipient_user_id: userId,
 						thread_ts,
 						metadata: responseId
-							? {
-									event_type: "openai_context",
-									event_payload: {
-										response_id: responseId,
-										uploaded_files: fileManager.uploadedFilesThisTurn,
-									},
-								}
+							? openaiContextMetadata({
+									responseId,
+									uploadedFiles: fileManager.uploadedFilesThisTurn,
+									promptVersion,
+								})
 							: undefined,
 					});
 				} catch (err) {
@@ -1303,13 +1431,11 @@ async function executeStreamWithRetry({
 					// Fallback to say()
 					const payload = { text: cleaned };
 					if (!postedFirstLine && seenResponseId) {
-						payload.metadata = {
-							event_type: "openai_context",
-							event_payload: {
-								response_id: seenResponseId,
-								uploaded_files: fileManager.uploadedFilesThisTurn,
-							},
-						};
+						payload.metadata = openaiContextMetadata({
+							responseId: seenResponseId,
+							uploadedFiles: fileManager.uploadedFilesThisTurn,
+							promptVersion,
+						});
 						postedFirstLine = true;
 					}
 					await say(payload);
@@ -1330,6 +1456,7 @@ async function handleNoTextStreamed({
 	say,
 	suggestSummarizeNow,
 	uploadedFilesThisTurn,
+	promptVersion,
 	safetyIdentifier,
 	logger,
 }) {
@@ -1341,13 +1468,11 @@ async function handleNoTextStreamed({
 			if (text) {
 				await say({
 					text,
-					metadata: {
-						event_type: "openai_context",
-						event_payload: {
-							response_id: responseIdFromFinalTurn,
-							uploaded_files: uploadedFilesThisTurn,
-						},
-					},
+					metadata: openaiContextMetadata({
+						responseId: responseIdFromFinalTurn,
+						uploadedFiles: uploadedFilesThisTurn,
+						promptVersion,
+					}),
 				});
 				return;
 			}
@@ -1358,13 +1483,11 @@ async function handleNoTextStreamed({
 			if (text) {
 				await say({
 					text,
-					metadata: {
-						event_type: "openai_context",
-						event_payload: {
-							response_id: polled?.id || responseIdFromFinalTurn,
-							uploaded_files: uploadedFilesThisTurn,
-						},
-					},
+					metadata: openaiContextMetadata({
+						responseId: polled?.id || responseIdFromFinalTurn,
+						uploadedFiles: uploadedFilesThisTurn,
+						promptVersion,
+					}),
 				});
 				return;
 			}
@@ -1373,26 +1496,22 @@ async function handleNoTextStreamed({
 		await suggestSummarizeNow();
 		await say?.({
 			text: "​",
-			metadata: {
-				event_type: "openai_context",
-				event_payload: {
-					response_id: responseIdFromFinalTurn,
-					uploaded_files: uploadedFilesThisTurn,
-				},
-			},
+			metadata: openaiContextMetadata({
+				responseId: responseIdFromFinalTurn,
+				uploadedFiles: uploadedFilesThisTurn,
+				promptVersion,
+			}),
 		});
 	} catch (err) {
 		logger?.warn?.("Background recovery failed", { err: String(err) });
 		await suggestSummarizeNow();
 		await say?.({
 			text: "​",
-			metadata: {
-				event_type: "openai_context",
-				event_payload: {
-					response_id: responseIdFromFinalTurn,
-					uploaded_files: uploadedFilesThisTurn,
-				},
-			},
+			metadata: openaiContextMetadata({
+				responseId: responseIdFromFinalTurn,
+				uploadedFiles: uploadedFilesThisTurn,
+				promptVersion,
+			}),
 		});
 	}
 }

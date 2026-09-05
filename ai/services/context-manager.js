@@ -119,7 +119,7 @@ export async function summarizeConversationHistory(
  *
  * @param {Array} messages - Thread messages
  * @param {Object} context - Slack context with BOT_ID and BOT_USER_ID
- * @returns {{index: number, message: Object|null, responseId: string|null}}
+ * @returns {{index: number, message: Object|null, responseId: string|null, promptVersion: string|null}}
  */
 export function findLastBotMessage(messages, context, logger = null) {
 	const msgCount = messages?.length || 0;
@@ -142,12 +142,15 @@ export function findLastBotMessage(messages, context, logger = null) {
 				index: i,
 				message: msg,
 				responseId,
+				// Fingerprint of the system prompt the chain was started with
+				// (absent on messages posted before prompt versioning existed)
+				promptVersion: msg.metadata.event_payload.prompt_version || null,
 			};
 		}
 	}
 
 	logger?.info?.(`[CONTEXT] No previous bot response found (will send full context)`);
-	return { index: -1, message: null, responseId: null };
+	return { index: -1, message: null, responseId: null, promptVersion: null };
 }
 
 /**

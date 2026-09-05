@@ -1,5 +1,10 @@
 import "dotenv/config";
 import { App, LogLevel } from "@slack/bolt";
+import {
+	checkDeploymentNotesBudget,
+	loadDeploymentNotes,
+	resolveOrganizationName,
+} from "./ai/config/deployment.js";
 import { getDeprecatedAiVariables } from "./ai/config/providers.js";
 import { initializeMcpRegistry } from "./ai/mcp_registry.js";
 import { getProvider } from "./ai/providers/index.js";
@@ -42,6 +47,21 @@ const app = new App({
 			context.BOT_ID = BOT_ID;
 			await next();
 		});
+
+		// Deployment-specific prompt context: the organization name comes from
+		// the Slack workspace (team.info, falling back to auth.test; other
+		// workspaces of an org-wide install are resolved on their first message),
+		// and administrators may append notes with M8B_PROMPT_EXTRA(_FILE). An
+		// unreadable notes file is a configuration error, so it is loaded here
+		// where it stops the start-up rather than at the first message.
+		const organizationName = await resolveOrganizationName(app.client, { logger: app.logger });
+		app.logger.info(`Organization: ${organizationName || "(unknown — generic prompt wording)"}`);
+		const deploymentNotes = loadDeploymentNotes();
+		if (deploymentNotes) {
+			app.logger.info(
+				`Deployment notes appended to the system prompt (${deploymentNotes.length} chars)`
+			);
+		}
 
 		// Initialize MetricsHub MCP registry (discover tools/hosts)
 		try {
@@ -89,6 +109,17 @@ const app = new App({
 			throw new Error(
 				"No AI model configured: set AI_MODEL (or let the endpoint serve exactly one model). See the health check output above."
 			);
+		}
+		// The context window is only final after the health check (the server's
+		// value may have capped it); deployment notes that cannot fit in it would
+		// make every request fail, so that configuration is refused too
+		const notesBudgetError = checkDeploymentNotesBudget({
+			notes: deploymentNotes,
+			contextWindow: aiProvider.contextWindow,
+			maxOutputTokens: aiProvider.maxOutputTokens,
+		});
+		if (notesBudgetError) {
+			throw new Error(notesBudgetError);
 		}
 
 		// Age-based cleanup of the local media store (screenshots saved for the

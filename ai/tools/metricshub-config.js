@@ -28,7 +28,7 @@ export const METRICSHUB_CONFIG_TOOLS = [
 				agent: AGENT_PARAM,
 				resourceId: {
 					type: "string",
-					description: "The resource ID (YAML key), e.g. dev-nvidia-01.",
+					description: "The resource ID (YAML key), e.g. srv-web-01.",
 				},
 			},
 			required: ["resourceId"],

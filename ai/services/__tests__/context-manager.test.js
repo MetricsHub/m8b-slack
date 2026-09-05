@@ -81,6 +81,27 @@ describe("findLastBotMessage", () => {
 		expect(result.index).toBe(1);
 		expect(result.message.ts).toBe("2");
 		expect(result.responseId).toBe("resp_123");
+		// Posted before prompt versioning existed
+		expect(result.promptVersion).toBeNull();
+	});
+
+	it("should report the system prompt version the chain was started with", () => {
+		const messages = [
+			{
+				ts: "1",
+				bot_id: "B12345",
+				text: "Response",
+				metadata: {
+					event_type: "openai_context",
+					event_payload: { response_id: "resp_123", prompt_version: "abc123def456" },
+				},
+			},
+		];
+
+		const result = findLastBotMessage(messages, mockContext);
+
+		expect(result.responseId).toBe("resp_123");
+		expect(result.promptVersion).toBe("abc123def456");
 	});
 
 	it("should return most recent bot message", () => {
