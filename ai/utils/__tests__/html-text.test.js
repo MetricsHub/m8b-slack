@@ -993,6 +993,36 @@ describe("extractHtmlTitle", () => {
 		);
 	});
 
+	it("ends the heading fallback where the parser closes the heading", () => {
+		// An unclosed <h1> is closed by the next heading start tag: the section
+		// and body text are not part of the title
+		expect(extractHtmlTitle("<body><h1>Page title<h2>Section</h2><p>Body</p></body>")).toBe(
+			"Page title"
+		);
+		// ...or by a same-name start tag
+		expect(extractHtmlTitle("<body><h1>A<h1>B</h1></body>")).toBe("A");
+		// Inline children are still part of the heading
+		expect(extractHtmlTitle("<body><h1>Keep <em>this</em> too</h1></body>")).toBe("Keep this too");
+		// The same closers count in the depth estimate: headings never nest
+		expect(estimateNesting("<h1>a<h2>b<h3>c".repeat(300)).depth).toBe(1);
+	});
+
+	it("counts the implied <tbody> and <tr> the parser inserts around cells", () => {
+		// <table><td> builds table > tbody > tr > td: four levels per repetition
+		expect(estimateNesting("<table><td>".repeat(200)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><tr><td>".repeat(200)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><tr><td>x</td></tr></table>").depth).toBe(4);
+		expect(estimateNesting("<table><td>x</td></table>").depth).toBe(4);
+		// Explicit sections are not doubled, and sibling cells/rows still close each other
+		expect(estimateNesting("<table><tbody><tr><td>x</td></tr></tbody></table>").depth).toBe(4);
+		expect(estimateNesting("<table><thead><td>x").depth).toBe(4);
+		expect(estimateNesting("<table><td>a<td>b<tr><td>c").depth).toBe(4);
+		// Everyday tables still convert on the DOM route
+		const page =
+			"<body><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></body>";
+		expect(htmlToMarkdown(page)).toMatch(/| As+| Bs+|/);
+	});
+
 	it("skips headings inside dropped page furniture for the fallback", () => {
 		// The nav's <h1> is removed by the converter with the whole nav: the
 		// page's own heading is the fallback title

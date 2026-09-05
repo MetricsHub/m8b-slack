@@ -181,9 +181,17 @@ const VOID_ELEMENTS = new Set([
  * the stack (unclosed <li>, <p>, <td>, <tr>, <option>... are everyday HTML):
  * opener → names it closes when found on top.
  */
+const HEADINGS = ["h1", "h2", "h3", "h4", "h5", "h6"];
 const IMPLICIT_CLOSERS = {
 	li: ["li"],
 	p: ["p"],
+	// A heading start tag closes an open paragraph or heading (<h1>Title<h2>...)
+	h1: ["p", ...HEADINGS],
+	h2: ["p", ...HEADINGS],
+	h3: ["p", ...HEADINGS],
+	h4: ["p", ...HEADINGS],
+	h5: ["p", ...HEADINGS],
+	h6: ["p", ...HEADINGS],
 	dt: ["dt", "dd"],
 	dd: ["dt", "dd"],
 	option: ["option"],
@@ -195,6 +203,9 @@ const IMPLICIT_CLOSERS = {
 	thead: ["td", "th", "tr", "tbody", "thead", "tfoot"],
 	tfoot: ["td", "th", "tr", "tbody", "thead", "tfoot"],
 };
+
+/** Row-group elements: a <td>/<th> right below one gets an implied <tr> */
+const TABLE_SECTIONS = new Set(["tbody", "thead", "tfoot"]);
 
 /**
  * ASCII whitespace as the HTML tokenizer defines it: tab, LF, FF, CR and
@@ -816,6 +827,17 @@ function createTreeTracker() {
 				popTo(stack.length - 1);
 			}
 		}
+		// Implied table containers: the parser inserts the <tbody> a <tr> lacks,
+		// and the <tbody> and <tr> a <td>/<th> lacks — elements the source does
+		// not spell out but the DOM (and its depth) does contain
+		if (name === "td" || name === "th" || name === "tr") {
+			let top = stack.length - 1;
+			if (top >= 0 && ns[top] === null && stack[top] === "table") push("tbody", null, false);
+			top = stack.length - 1;
+			if (name !== "tr" && top >= 0 && ns[top] === null && TABLE_SECTIONS.has(stack[top])) {
+				push("tr", null, false);
+			}
+		}
 		push(name, null, false);
 		return !hostile;
 	};
@@ -1304,9 +1326,14 @@ export function extractHtmlTitle(html) {
 			// by the state before the tag (its parent's namespace); one the parser
 			// ignores (inside an open <select>) is no title at all
 			const inert = tree.inTemplate || tree.inForeign || tree.inSelect;
+			const openBefore = collecting ? tree.openCount(collecting) : 0;
 			if (!tree.handle(tag)) return false;
 			if (collecting) {
-				if (name === collecting && closing) {
+				// The element ends where the tree pops it: its own end tag, a start
+				// tag that closes it implicitly (<h2> after an unclosed <h1>), or a
+				// same-name start tag that replaces it (<h1>A<h1>B)
+				const ended = tree.openCount(collecting) < openBefore || (!closing && name === collecting);
+				if (ended) {
 					const text = buffer.join(" ");
 					if (collecting === "title") title = text;
 					else heading = text;
