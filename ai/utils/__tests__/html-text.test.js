@@ -1049,6 +1049,50 @@ describe("extractHtmlTitle", () => {
 		expect(estimateNesting("<h1>a<h2>b<h3>c".repeat(300)).depth).toBe(1);
 	});
 
+	it("follows the table insertion modes: colgroup and caption close before a cell", () => {
+		// <table><colgroup><td>: the colgroup is closed, then tbody and tr inserted
+		// (four levels per repetition), likewise after a <caption>
+		expect(estimateNesting("<table><colgroup><td>".repeat(170)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting("<table><caption><td>".repeat(170)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting("<table><colgroup><td>x").depth).toBe(4);
+		expect(estimateNesting("<table><caption>c<td>x").depth).toBe(4);
+		// A <col> gets its colgroup; a row group closes the previous one
+		expect(estimateNesting("<table><col><col>").depth).toBe(2);
+		expect(estimateNesting("<table><thead><tr><th>h<tbody><tr><td>d").depth).toBe(4);
+		// Table parts outside any table are ignored, as in body
+		expect(estimateNesting("<td>".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<div><tr><td>x</td></tr></div>").depth).toBe(1);
+	});
+
+	it("keeps a NUL inside a tag name, as the tokenizer does", () => {
+		// "<input\u0000>" is the non-void element "input\uFFFD" to the parser
+		expect(estimateNesting("<input\u0000>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<br\u0000>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// ...and "<base\u0000 href>" is not a base
+		const page = `<html><head><base\u0000 href="/decoy/"><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("measures a candidate region by its visible text", () => {
+		const real = "Real content. ".repeat(20);
+		// 60 non-breaking spaces are 360 source characters but no visible text: the
+		// <main> is not substantial, the body (with the real paragraph) is used
+		const blank = `<html><body><main>${"&nbsp;".repeat(60)}</main><p>${real}</p></body></html>`;
+		expect(htmlToMarkdown(blank)).toContain("Real content.");
+		// Text inside dropped elements (a nav) does not count either
+		const menu = `<html><body><main><nav>${"Menu item. ".repeat(30)}</nav><p>short</p></main><p>${real}</p></body></html>`;
+		expect(htmlToMarkdown(menu)).toContain("Real content.");
+		// A genuinely substantial main is still selected
+		const substantial = `<html><body><main><p>${real}</p></main><p>Outside</p></body></html>`;
+		expect(htmlToMarkdown(substantial)).not.toContain("Outside");
+	});
+
 	it("counts the implied <tbody> and <tr> the parser inserts around cells", () => {
 		// <table><td> builds table > tbody > tr > td: four levels per repetition
 		expect(estimateNesting("<table><td>".repeat(200)).depth).toBeGreaterThan(MAX_DOM_DEPTH);

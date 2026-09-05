@@ -196,16 +196,35 @@ const IMPLICIT_CLOSERS = {
 	dd: ["dt", "dd"],
 	option: ["option"],
 	optgroup: ["option", "optgroup"],
-	td: ["td", "th"],
-	th: ["td", "th"],
-	tr: ["td", "th", "tr"],
-	tbody: ["td", "th", "tr", "tbody", "thead", "tfoot"],
-	thead: ["td", "th", "tr", "tbody", "thead", "tfoot"],
-	tfoot: ["td", "th", "tr", "tbody", "thead", "tfoot"],
 };
 
-/** Row-group elements: a <td>/<th> right below one gets an implied <tr> */
-const TABLE_SECTIONS = new Set(["tbody", "thead", "tfoot"]);
+/** Table parts whose start tags follow the table insertion modes (see tableStart) */
+const TABLE_PARTS = new Set([
+	"td",
+	"th",
+	"tr",
+	"tbody",
+	"thead",
+	"tfoot",
+	"caption",
+	"colgroup",
+	"col",
+]);
+
+/** Elements that decide the table insertion mode: the nearest one on the stack */
+const TABLE_CONTEXT = new Set([
+	"td",
+	"th",
+	"tr",
+	"tbody",
+	"thead",
+	"tfoot",
+	"caption",
+	"colgroup",
+	"table",
+	"template",
+	"html",
+]);
 
 /**
  * ASCII whitespace as the HTML tokenizer defines it: tab, LF, FF, CR and
@@ -216,9 +235,13 @@ function isTokenizerWhitespace(code) {
 	return code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
 }
 
-/** Characters that end a tag name in the HTML tokenizer: ASCII whitespace, "/", ">", NUL */
+/**
+ * Characters that end a tag name in the HTML tokenizer: ASCII whitespace, "/"
+ * and ">". A NUL does NOT end it — the tokenizer appends U+FFFD to the name
+ * and goes on, so "<input\u0000>" is the non-void element "input\uFFFD".
+ */
 function isTagNameTerminator(code) {
-	return isTokenizerWhitespace(code) || code === 47 || code === 62 || code === 0;
+	return isTokenizerWhitespace(code) || code === 47 || code === 62;
 }
 
 /**
@@ -623,23 +646,33 @@ function attributeValue(attrs, name) {
 }
 
 /**
- * Whether the text outside tags reaches a minimum length (stops early).
+ * Whether the text the converter will expose reaches a minimum length (stops
+ * early): character references decoded, whitespace (non-breaking spaces
+ * included) not counted, and nothing counted inside the elements the
+ * converter drops or the parser keeps as raw text.
  */
 function hasTextOfAtLeast(html, minimum) {
 	let count = 0;
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
-		() => undefined,
+		(tag) => tree.handle(tag),
 		(text) => {
-			count += text.trim().length;
+			if (tree.dropped || tree.inTemplate) return true;
+			const visible = text.includes("&") ? decodeHtmlEntities(text) : text;
+			count += visible.replace(/[\s\u00a0]+/g, "").length;
 			return count < minimum;
-		}
+		},
+		tree.tokenizerOptions
 	);
 	return count >= minimum;
 }
 
 /** Start/end tags that still mean something inside an open <select> */
 const SELECT_CONTENT = new Set(["option", "optgroup", "script", "template"]);
+
+/** Row-group elements */
+const TABLE_SECTIONS = new Set(["tbody", "thead", "tfoot"]);
 
 /** Elements allowed inside <head>: any other start tag ends an unclosed <head> */
 const HEAD_ELEMENTS = new Set([
@@ -733,6 +766,79 @@ function createTreeTracker() {
 	/** Leave foreign content: pop until the current node is HTML or an integration point */
 	const popForeign = () => {
 		while (stack.length > 0 && isForeign(stack.length - 1)) popTo(stack.length - 1);
+	};
+	/**
+	 * Start tag of a table part (td, th, tr, tbody, thead, tfoot, caption,
+	 * colgroup, col) under the table insertion modes, decided by the nearest
+	 * table-context element on the stack: a cell, row, row group, caption or
+	 * colgroup that cannot contain the token is closed and the token
+	 * reprocessed one level up; in the table itself the stack is cleared back
+	 * to the table and the containers the source omits are inserted (the
+	 * <tbody> a row lacks, the <tbody> and <tr> a cell lacks, the <colgroup>
+	 * a <col> lacks). Outside any table the token is ignored, as in body.
+	 * Returns false when the token is inside a <template> (inserted as written).
+	 *
+	 * @param {string} name - Tag name
+	 * @returns {boolean} Handled
+	 */
+	const tableStart = (name) => {
+		let i = stack.length - 1;
+		while (i >= 0 && !(ns[i] === null && TABLE_CONTEXT.has(stack[i]))) i--;
+		const context = i >= 0 ? stack[i] : null;
+		if (context === null || context === "html") return true; // no table: ignored
+		if (context === "template") return false;
+		if (context === "td" || context === "th") {
+			popTo(i); // close the cell, reprocess in the row
+			return tableStart(name);
+		}
+		if (context === "tr") {
+			if (name === "td" || name === "th") {
+				popTo(i + 1); // clear back to the row
+				push(name, null, false);
+				return true;
+			}
+			popTo(i); // anything else closes the row
+			return tableStart(name);
+		}
+		if (TABLE_SECTIONS.has(context)) {
+			if (name === "td" || name === "th") {
+				popTo(i + 1);
+				push("tr", null, false); // the row the cell lacks
+				push(name, null, false);
+				return true;
+			}
+			if (name === "tr") {
+				popTo(i + 1);
+				push("tr", null, false);
+				return true;
+			}
+			popTo(i); // caption, colgroup, col or another section close this one
+			return tableStart(name);
+		}
+		if (context === "caption") {
+			popTo(i); // acts as </caption>
+			return tableStart(name);
+		}
+		if (context === "colgroup") {
+			if (name === "col") return true; // void, inserted in the colgroup
+			popTo(i);
+			return tableStart(name);
+		}
+		// In the table itself: clear back to it, then insert (with implied containers)
+		popTo(i + 1);
+		if (name === "td" || name === "th") {
+			push("tbody", null, false);
+			push("tr", null, false);
+			push(name, null, false);
+		} else if (name === "tr") {
+			push("tbody", null, false);
+			push("tr", null, false);
+		} else if (name === "col") {
+			push("colgroup", null, false); // the colgroup the col lacks; col itself is void
+		} else {
+			push(name, null, false); // caption, colgroup, tbody, thead, tfoot
+		}
+		return true;
 	};
 	/**
 	 * Index of the <select> the parser is "in select" for — the current node
@@ -895,23 +1001,14 @@ function createTreeTracker() {
 			if (!selfClosing) push(name, name, false); // an empty <svg/> opens nothing
 			return !hostile;
 		}
+		// Table parts first: a <col> (void) still inserts the colgroup it lacks
+		if (TABLE_PARTS.has(name) && tableStart(name)) return !hostile;
 		// "<div/>" opens a div: the slash is only meaningful on void elements
 		if (VOID_ELEMENTS.has(name)) return !hostile;
 		const closes = IMPLICIT_CLOSERS[name];
 		if (closes) {
 			while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
 				popTo(stack.length - 1);
-			}
-		}
-		// Implied table containers: the parser inserts the <tbody> a <tr> lacks,
-		// and the <tbody> and <tr> a <td>/<th> lacks — elements the source does
-		// not spell out but the DOM (and its depth) does contain
-		if (name === "td" || name === "th" || name === "tr") {
-			let top = stack.length - 1;
-			if (top >= 0 && ns[top] === null && stack[top] === "table") push("tbody", null, false);
-			top = stack.length - 1;
-			if (name !== "tr" && top >= 0 && ns[top] === null && TABLE_SECTIONS.has(stack[top])) {
-				push("tr", null, false);
 			}
 		}
 		push(name, null, false);
