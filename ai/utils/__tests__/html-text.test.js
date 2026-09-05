@@ -257,6 +257,28 @@ describe("htmlToMarkdown", () => {
 		expect(extractHtmlTitle("<head><title>Ti</titles>tle</title></head>")).toBe("Ti</titles>tle");
 	});
 
+	it("honours quoted attribute values when finding the end of a tag", () => {
+		// A ">" and a fake closer hidden in a quoted attribute: the parser nests all the divs
+		const page = `<body>${'<div title="></div>">'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+		// Ordinary attributes with ">" inside still convert normally
+		const normal = htmlToMarkdown(
+			`<body><p><a title="a > b" href="/x">Link</a> <img alt='1 > 0' src="/i.png"></p></body>`,
+			{ baseUrl: "https://d.example/" }
+		);
+		expect(normal).toContain("[Link](https://d.example/x)");
+		expect(normal).toContain("![1 > 0](https://d.example/i.png)");
+		// A quote in attribute-name position is not a value delimiter (parser rule):
+		// these are separate divs, not one giant tag
+		const bare = `<body>${'<div ">'.repeat(100000)}Deep</body>`;
+		const startedBare = Date.now();
+		expect(htmlToMarkdown(bare)).toContain("Deep");
+		expect(Date.now() - startedBare).toBeLessThan(2000);
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

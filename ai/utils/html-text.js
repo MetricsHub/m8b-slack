@@ -238,7 +238,10 @@ function tokenizeHtml(html, onTag, onText) {
 		let nameEnd = nameStart + 1;
 		while (nameEnd < length && isTagNameChar(html.charCodeAt(nameEnd))) nameEnd++;
 
-		const gt = gtAfter(nameEnd);
+		// The tag ends at the first ">" outside a quoted attribute value (a ">"
+		// inside title="...>..." does not end the tag, as in the HTML tokenizer);
+		// closing tags carry no attributes, their first ">" ends them
+		const gt = closing ? gtAfter(nameEnd) : findTagEnd(html, nameEnd);
 		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
 		const name = html.slice(nameStart, nameEnd).toLowerCase();
 		// The "/>" slash only means something on void elements (and in foreign
@@ -288,6 +291,44 @@ function tokenizeHtml(html, onTag, onText) {
 			pos = closeEnd;
 		}
 	}
+}
+
+/**
+ * Index of the ">" that ends a start tag whose attributes begin at `from`, or
+ * -1 when the tag never ends. Follows the HTML tokenizer's attribute states:
+ * a quote opens a quoted value only right after "=", where it hides any ">"
+ * until the matching quote; a quote in attribute-name position is just a
+ * character. Every character is visited once, so the scan is linear and
+ * cannot be made to rescan.
+ */
+function findTagEnd(html, from) {
+	const length = html.length;
+	let state = 0; // 0 between/inside attribute names, 1 after "=", 2 unquoted value
+	for (let i = from; i < length; i++) {
+		const code = html.charCodeAt(i);
+		if (state === 1) {
+			if (code === 34 || code === 39) {
+				// Quoted value: skip to the matching quote (none → unterminated tag)
+				const close = html.indexOf(code === 34 ? '"' : "'", i + 1);
+				if (close === -1) return -1;
+				i = close;
+				state = 0;
+				continue;
+			}
+			if (code === 32 || (code >= 9 && code <= 13)) continue; // whitespace before the value
+			if (code === 62) return i; // ">" right after "=": empty value, tag ends
+			state = 2; // unquoted value starts
+			continue;
+		}
+		if (state === 2) {
+			if (code === 62) return i;
+			if (code === 32 || (code >= 9 && code <= 13)) state = 0;
+			continue;
+		}
+		if (code === 62) return i;
+		if (code === 61) state = 1; // "="
+	}
+	return -1;
 }
 
 /**

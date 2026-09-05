@@ -103,13 +103,30 @@ function parseHostList(value) {
 	return String(value || "")
 		.split(",")
 		.map((entry) =>
-			entry
-				.trim()
-				.toLowerCase()
-				.replace(/^\*?\.+/, "")
-				.replace(/\.+$/, "")
+			canonicalHostname(
+				entry
+					.trim()
+					.toLowerCase()
+					.replace(/^\*?\.+/, "")
+					.replace(/\.+$/, "")
+			)
 		)
 		.filter(Boolean);
+}
+
+/**
+ * Hostname as the URL parser would spell it (lowercase, IDN in Punycode), so
+ * that a configured "évil.example" matches the "xn--vil-9la.example" a URL
+ * carries. Entries the URL parser rejects are kept verbatim (they then match
+ * nothing, which is the safe direction for an allow list).
+ */
+function canonicalHostname(host) {
+	if (!host) return host;
+	try {
+		return new URL(`http://${host}/`).hostname.replace(/\.+$/, "");
+	} catch {
+		return host;
+	}
 }
 
 /**
@@ -291,11 +308,13 @@ class FetchUrlError extends Error {
 	/**
 	 * @param {string} message - Model-facing explanation
 	 * @param {string} [hint] - Optional model-facing follow-up advice
+	 * @param {number} [status] - HTTP status behind the error, when there is one
 	 */
-	constructor(message, hint) {
+	constructor(message, hint, status) {
 		super(message);
 		this.name = "FetchUrlError";
 		this.hint = hint;
+		this.status = status;
 	}
 }
 
@@ -623,7 +642,12 @@ async function readBodyCapped(response, maxBytes) {
  * GET a URL, following redirects manually so that every hop goes through the
  * address policy. Returns the final response (not consumed) and its URL.
  */
-async function guardedGet(rawUrl, headers, runtime, { derivedHost = false } = {}) {
+async function guardedGet(
+	rawUrl,
+	headers,
+	runtime,
+	{ derivedHost = false, reviseHeaders = null } = {}
+) {
 	const { config, fetchImpl, lookup, dispatcher, logger } = runtime;
 	let url = validateUrlPolicy(rawUrl, config, { derivedHost });
 	let hops = 0;
@@ -680,6 +704,9 @@ async function guardedGet(rawUrl, headers, runtime, { derivedHost = false } = {}
 					)
 				);
 			}
+			// Same-origin hops may still change what the credentials apply to (a
+			// renamed GitHub repository): the caller gets the last word
+			if (reviseHeaders) requestHeaders = reviseHeaders(nextUrl, requestHeaders);
 			url = nextUrl;
 			continue;
 		}
@@ -1028,7 +1055,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
  *
  * @param {URL} url - Parsed URL
  * @returns {{kind: "issue"|"pull", owner: string, repo: string, number: number}
- *   | {kind: "blob", owner: string, repo: string, ref: string, path: string, rawUrl: string}
+ *   | {kind: "blob", owner: string, repo: string, ref: string, path: string, segments: string[], rawUrl: string}
  *   | null}
  */
 export function parseGitHubUrl(url) {
@@ -1065,6 +1092,7 @@ export function parseGitHubUrl(url) {
 			repo: repo.replace(/\.git$/, ""),
 			ref: decode(ref),
 			path: pathSegments.map(decode).join("/"),
+			segments: rest.map(decode),
 			rawUrl: `https://raw.githubusercontent.com/${owner}/${repo}/${rest.join("/")}`,
 		};
 	}
@@ -1114,7 +1142,20 @@ async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } 
 	if (tokenInScope) {
 		headers.Authorization = `Bearer ${runtime.config.githubToken}`;
 	}
-	const { response } = await guardedGet(url, headers, runtime, { derivedHost: true });
+	// A same-origin redirect can land on another repository (renamed or
+	// transferred): the token follows only if that repository is in scope too
+	const reviseHeaders = (nextUrl, current) => {
+		if (!current.Authorization) return current;
+		const [, nextOwner = "", nextRepo = ""] =
+			nextUrl.pathname.match(/^\/repos\/([^/]+)\/([^/]+)/) || [];
+		if (githubTokenInScope(runtime, nextOwner, nextRepo)) return current;
+		const { Authorization: _dropped, ...rest } = current;
+		return rest;
+	};
+	const { response } = await guardedGet(url, headers, runtime, {
+		derivedHost: true,
+		reviseHeaders,
+	});
 	if (!response.ok) {
 		await response.body?.cancel?.().catch(() => {});
 		const remaining = response.headers?.get?.("x-ratelimit-remaining");
@@ -1125,7 +1166,8 @@ async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } 
 				hint = `The bot's GITHUB_TOKEN is not scoped to ${owner}/${repo} (GITHUB_TOKEN_REPOS), so the request was anonymous.`;
 			throw new FetchUrlError(
 				`GitHub returned 404 for ${path}: ${what} does not exist, or the repository is private`,
-				hint
+				hint,
+				404
 			);
 		}
 		if ((response.status === 403 || response.status === 429) && remaining === "0") {
@@ -1333,29 +1375,48 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 		return result;
 	}
 
-	const encodedPath = target.path
-		.split("/")
-		.map((segment) => encodeURIComponent(segment))
-		.join("/");
-	const { bytes } = await githubRequest(
-		`/repos/${target.owner}/${target.repo}/contents/${encodedPath}?ref=${encodeURIComponent(target.ref)}`,
-		runtime,
-		{ accept: "application/vnd.github.raw+json", what: "the file" }
-	);
-	if (looksBinary(bytes)) {
-		throw new FetchUrlError(
-			`Refused: ${target.path} is a binary file (only text files can be read)`
-		);
+	// A blob URL does not say where the ref ends and the path starts
+	// ("/blob/feature/foo/docs/guide.md" may be branch "feature/foo"). Try the
+	// splits in order — one segment first (the common case), then longer refs —
+	// until the Contents API knows the file; a 404 means "try the next split".
+	const segments = target.segments || [target.ref, ...target.path.split("/")];
+	const encode = (parts) => parts.map((segment) => encodeURIComponent(segment)).join("/");
+	const attempts = Math.min(segments.length - 1, MAX_BLOB_REF_SPLITS);
+	let lastNotFound = null;
+	for (let refSegments = 1; refSegments <= attempts; refSegments++) {
+		const ref = segments.slice(0, refSegments).join("/");
+		const path = segments.slice(refSegments).join("/");
+		let bytes;
+		try {
+			({ bytes } = await githubRequest(
+				`/repos/${target.owner}/${target.repo}/contents/${encode(segments.slice(refSegments))}?ref=${encodeURIComponent(ref)}`,
+				runtime,
+				{ accept: "application/vnd.github.raw+json", what: "the file" }
+			));
+		} catch (e) {
+			if (e instanceof FetchUrlError && e.status === 404 && refSegments < attempts) {
+				lastNotFound = e;
+				continue;
+			}
+			throw e;
+		}
+		if (looksBinary(bytes)) {
+			throw new FetchUrlError(`Refused: ${path} is a binary file (only text files can be read)`);
+		}
+		return buildResult({
+			requestedUrl,
+			finalUrl: requestedUrl,
+			source: "github",
+			title: path,
+			contentType: "text/plain",
+			text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
+		});
 	}
-	return buildResult({
-		requestedUrl,
-		finalUrl: requestedUrl,
-		source: "github",
-		title: target.path,
-		contentType: "text/plain",
-		text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
-	});
+	throw lastNotFound || new FetchUrlError(`GitHub blob URL has no file path: ${requestedUrl}`);
 }
+
+/** Ref/path splits tried for a GitHub blob URL (branch names with up to this many slashes) */
+const MAX_BLOB_REF_SPLITS = 4;
 
 // ---------------------------------------------------------------------------
 // Entry point

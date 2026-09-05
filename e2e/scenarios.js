@@ -35,6 +35,7 @@
  */
 
 import { getProvider } from "../ai/providers/index.js";
+import { isFetchUrlEnabled } from "../ai/services/fetch-url.js";
 
 /**
  * Whether the active provider can see image attachments (used to skip the
@@ -205,8 +206,7 @@ export const SCENARIOS = [
 			"reported or requested). It must NOT claim that the repository is private or that the page " +
 			"could not be read, and must not describe an HTTP monitoring/protocol check instead of the " +
 			"issue. An honest 'the issue does not exist (404)' is acceptable only if the tool said so.",
-		skipUnless: () =>
-			!getProvider().capabilities.hostedWebSearch && process.env.FETCH_URL_ENABLED !== "false",
+		skipUnless: () => !getProvider().capabilities.hostedWebSearch && isFetchUrlEnabled(),
 		skipReason: "needs a function-only provider with fetch_url enabled",
 		timeoutMs: 240000,
 	},

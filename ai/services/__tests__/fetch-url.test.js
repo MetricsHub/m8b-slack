@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals
 import {
 	executeFetchUrl,
 	findLlmsTxtEntry,
+	getFetchUrlConfig,
 	getFetchUrlTool,
 	githubTokenAllowedFor,
 	isBlockedAddress,
@@ -116,6 +117,24 @@ describe("fetch_url configuration", () => {
 		const result = await executeFetchUrl({ url: "https://example.com/" });
 		expect(result.ok).toBe(false);
 		expect(result.error).toContain("disabled");
+	});
+
+	it("canonicalizes internationalized host-list entries the way URLs spell them", () => {
+		process.env.FETCH_URL_BLOCKED_HOSTS = "évil.example, Docs.Example.COM., *.münchen.de";
+		process.env.FETCH_URL_ALLOWED_HOSTS = "bücher.example";
+		const config = getFetchUrlConfig();
+		expect(config.blockedHosts).toEqual([
+			"xn--vil-9la.example",
+			"docs.example.com",
+			"xn--mnchen-3ya.de",
+		]);
+		expect(config.allowedHosts).toEqual(["xn--bcher-kva.example"]);
+		// A URL to the Unicode spelling carries the Punycode host: the block entry matches
+		expect(() => validateUrlPolicy("https://évil.example/page", config)).toThrow(/blocked/);
+		expect(() => validateUrlPolicy("https://sub.münchen.de/", config)).toThrow(/blocked/);
+		expect(validateUrlPolicy("https://bücher.example/", config).hostname).toBe(
+			"xn--bcher-kva.example"
+		);
 	});
 
 	it("rejects a missing url", async () => {
@@ -501,6 +520,34 @@ describe("transport hardening", () => {
 		expect(seen[1]).toBeUndefined();
 	});
 
+	it("drops the GitHub token when a same-origin redirect lands on an out-of-scope repository", async () => {
+		// A renamed/transferred repository: GitHub redirects /repos/acme/tool to /repos/other/tool
+		const seen = [];
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response("", {
+					status: 301,
+					headers: { location: "https://api.github.com/repos/other/tool/issues/12" },
+				});
+			},
+			"https://api.github.com/repos/other/tool/issues/12": (init) => {
+				seen.push(init.headers.Authorization);
+				return response(JSON.stringify({ number: 12, title: "T", state: "open" }), {
+					contentType: "application/json",
+				});
+			},
+			"https://api.github.com/repos/acme/tool/issues/12/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+			}),
+		};
+		await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ routes, config: { githubToken: "ghp_secret", githubTokenRepos: ["acme/*"] } }
+		);
+		expect(seen).toEqual(["Bearer ghp_secret", undefined]);
+	});
+
 	it("keeps credentials on a same-origin redirect", async () => {
 		const seen = [];
 		const routes = {
@@ -794,6 +841,7 @@ describe("GitHub", () => {
 			repo: "tool",
 			ref: "main",
 			path: "src/a.js",
+			segments: ["main", "src", "a.js"],
 			rawUrl: "https://raw.githubusercontent.com/acme/tool/main/src/a.js",
 		});
 		// Percent-encoded path segments are decoded once
@@ -980,6 +1028,37 @@ describe("GitHub", () => {
 		);
 		expect(binary.result.ok).toBe(false);
 		expect(binary.result.error).toContain("binary file");
+	});
+
+	it("resolves slash-containing refs when reading token-scoped blobs", async () => {
+		const requested = [];
+		const routes = {
+			// ref=feature is tried first (the common single-segment case) and does not exist
+			"https://api.github.com/repos/acme/tool/contents/foo/docs/guide.md?ref=feature": (init) => {
+				requested.push("feature");
+				expect(init.headers.Authorization).toBe("Bearer ghp_test");
+				return notFound();
+			},
+			"https://api.github.com/repos/acme/tool/contents/docs/guide.md?ref=feature%2Ffoo": () => {
+				requested.push("feature/foo");
+				return response("# On feature/foo", { contentType: "text/plain" });
+			},
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/tool/blob/feature/foo/docs/guide.md" },
+			{ routes, config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		);
+		expect(requested).toEqual(["feature", "feature/foo"]);
+		expect(result).toMatchObject({ ok: true, source: "github", title: "docs/guide.md" });
+		expect(result.content).toBe("# On feature/foo");
+
+		// Nothing matches at any split: the last 404 is reported, with its hint
+		const missing = await run(
+			{ url: "https://github.com/acme/tool/blob/a/b/c.md" },
+			{ config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		);
+		expect(missing.result.ok).toBe(false);
+		expect(missing.result.error).toContain("404");
 	});
 
 	it("still honours the host policy on github.com itself", async () => {
