@@ -693,8 +693,13 @@ async function guardedGet(
 				throw new FetchUrlError(`Invalid redirect target: ${location.slice(0, 200)}`);
 			}
 			logger?.info?.(`[FETCH_URL] ${url.hostname} redirected (${status}) to ${next}`);
-			// Redirect targets are never trusted, whatever the origin of the hop
-			const nextUrl = validateUrlPolicy(next, config);
+			// Redirect targets are never trusted, whatever the origin of the hop. A
+			// derived host (api.github.com) keeps its allow-list exemption while the
+			// redirect stays on that same host (repository rename); any other host
+			// goes through the full policy
+			const nextUrl = validateUrlPolicy(next, config, {
+				derivedHost: derivedHost && new URL(next).hostname === url.hostname,
+			});
 			// Credentials never follow a redirect to another origin (the GitHub
 			// token is for api.github.com only), as browsers and curl behave
 			if (nextUrl.origin !== url.origin) {
@@ -1115,6 +1120,20 @@ function githubTokenInScope(runtime, owner, repo) {
 }
 
 /**
+ * Owner and repository named by an API path (/repos/{owner}/{repo}/...), or
+ * the fallback for paths that do not name them (/repositories/{id}/...).
+ *
+ * @param {string} path - API path
+ * @param {{owner: string, repo: string}|null} fallback - Repository the request started from
+ * @returns {{owner: string, repo: string}}
+ */
+function repoOfApiPath(path, fallback) {
+	const match = path.match(/^\/repos\/([^/]+)\/([^/]+)/);
+	if (match) return { owner: match[1], repo: match[2] };
+	return { owner: fallback?.owner || "", repo: fallback?.repo || "" };
+}
+
+/**
  * One GitHub API request. Returns the body bytes and the response headers;
  * HTTP errors become model-facing FetchUrlErrors with actionable hints.
  *
@@ -1123,9 +1142,15 @@ function githubTokenInScope(runtime, owner, repo) {
  * @param {Object} [options]
  * @param {string} [options.accept] - Media type (default: JSON)
  * @param {string} [options.what] - Noun for the 404 message (default: "the issue")
+ * @param {{owner: string, repo: string}|null} [options.scopeRepo] - Repository the request
+ *   started from, for follow-up URLs that do not name one (/repositories/{id}/...)
  * @returns {Promise<{bytes: Uint8Array, headers: Headers}>}
  */
-async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } = {}) {
+async function githubRequest(
+	pathOrUrl,
+	runtime,
+	{ accept, what = "the issue", scopeRepo = null } = {}
+) {
 	const url = pathOrUrl.startsWith("/") ? `${GITHUB_API_ORIGIN}${pathOrUrl}` : pathOrUrl;
 	if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
 		throw new FetchUrlError(`Refused: GitHub pagination pointed outside ${GITHUB_API_ORIGIN}`);
@@ -1136,8 +1161,10 @@ async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } 
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
 	// The token is the bot's, shared by every Slack user who can talk to it:
-	// only spend it on repositories the operator scoped it to
-	const [, owner = "", repo = ""] = path.match(/^\/repos\/([^/]+)\/([^/]+)/) || [];
+	// only spend it on repositories the operator scoped it to. GitHub may spell
+	// follow-up URLs (pagination, redirects) as /repositories/{id}/...: those
+	// inherit the repository the request started from.
+	const { owner, repo } = repoOfApiPath(path, scopeRepo);
 	const tokenInScope = githubTokenInScope(runtime, owner, repo);
 	if (tokenInScope) {
 		headers.Authorization = `Bearer ${runtime.config.githubToken}`;
@@ -1146,9 +1173,8 @@ async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } 
 	// transferred): the token follows only if that repository is in scope too
 	const reviseHeaders = (nextUrl, current) => {
 		if (!current.Authorization) return current;
-		const [, nextOwner = "", nextRepo = ""] =
-			nextUrl.pathname.match(/^\/repos\/([^/]+)\/([^/]+)/) || [];
-		if (githubTokenInScope(runtime, nextOwner, nextRepo)) return current;
+		const next = repoOfApiPath(nextUrl.pathname, { owner, repo });
+		if (githubTokenInScope(runtime, next.owner, next.repo)) return current;
 		const { Authorization: _dropped, ...rest } = current;
 		return rest;
 	};
@@ -1212,10 +1238,12 @@ function nextPageLink(headers) {
  */
 async function githubList(path, runtime) {
 	const items = [];
+	// Later pages may be spelled /repositories/{id}/...: they keep this scope
+	const scopeRepo = repoOfApiPath(path, null);
 	let next = path;
 	let pages = 0;
 	while (next) {
-		const { bytes, headers } = await githubRequest(next, runtime);
+		const { bytes, headers } = await githubRequest(next, runtime, { scopeRepo });
 		let page;
 		try {
 			page = JSON.parse(new TextDecoder("utf-8").decode(bytes));
@@ -1376,30 +1404,22 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 	}
 
 	// A blob URL does not say where the ref ends and the path starts
-	// ("/blob/feature/foo/docs/guide.md" may be branch "feature/foo"). Try the
-	// splits in order — one segment first (the common case), then longer refs —
-	// until the Contents API knows the file; a 404 means "try the next split".
+	// ("/blob/feature/foo/docs/guide.md" may be branch "feature/foo"). The
+	// single-segment split is tried first (branch, tag or SHA: the common case);
+	// when it does not exist, the refs API lists the branches and tags starting
+	// with that first segment and the longest one matching the URL wins. Any
+	// number of slashes in a ref, at most four requests.
 	const segments = target.segments || [target.ref, ...target.path.split("/")];
+	const base = `/repos/${target.owner}/${target.repo}`;
 	const encode = (parts) => parts.map((segment) => encodeURIComponent(segment)).join("/");
-	const attempts = Math.min(segments.length - 1, MAX_BLOB_REF_SPLITS);
-	let lastNotFound = null;
-	for (let refSegments = 1; refSegments <= attempts; refSegments++) {
+	const readAt = async (refSegments) => {
 		const ref = segments.slice(0, refSegments).join("/");
 		const path = segments.slice(refSegments).join("/");
-		let bytes;
-		try {
-			({ bytes } = await githubRequest(
-				`/repos/${target.owner}/${target.repo}/contents/${encode(segments.slice(refSegments))}?ref=${encodeURIComponent(ref)}`,
-				runtime,
-				{ accept: "application/vnd.github.raw+json", what: "the file" }
-			));
-		} catch (e) {
-			if (e instanceof FetchUrlError && e.status === 404 && refSegments < attempts) {
-				lastNotFound = e;
-				continue;
-			}
-			throw e;
-		}
+		const { bytes } = await githubRequest(
+			`${base}/contents/${encode(segments.slice(refSegments))}?ref=${encodeURIComponent(ref)}`,
+			runtime,
+			{ accept: "application/vnd.github.raw+json", what: "the file" }
+		);
 		if (looksBinary(bytes)) {
 			throw new FetchUrlError(`Refused: ${path} is a binary file (only text files can be read)`);
 		}
@@ -1411,12 +1431,51 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 			contentType: "text/plain",
 			text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
 		});
+	};
+
+	try {
+		return await readAt(1);
+	} catch (e) {
+		if (!(e instanceof FetchUrlError && e.status === 404) || segments.length < 3) throw e;
+		const refSegments = await resolveGitHubRefSegments(base, segments, runtime);
+		if (refSegments === null) throw e;
+		return await readAt(refSegments);
 	}
-	throw lastNotFound || new FetchUrlError(`GitHub blob URL has no file path: ${requestedUrl}`);
 }
 
-/** Ref/path splits tried for a GitHub blob URL (branch names with up to this many slashes) */
-const MAX_BLOB_REF_SPLITS = 4;
+/**
+ * Number of leading URL segments that form an existing branch or tag name
+ * with at least one slash (the single-segment case is handled before), or
+ * null when none matches. Uses the refs API with the first segment as prefix.
+ */
+async function resolveGitHubRefSegments(base, segments, runtime) {
+	const prefix = encodeURIComponent(segments[0]);
+	const names = [];
+	for (const kind of ["heads", "tags"]) {
+		try {
+			const refs = await githubApi(`${base}/git/matching-refs/${kind}/${prefix}`, runtime);
+			for (const entry of Array.isArray(refs) ? refs : []) {
+				const name = String(entry?.ref || "").replace(new RegExp(`^refs/${kind}/`), "");
+				if (name) names.push(name);
+			}
+		} catch (e) {
+			if (!(e instanceof FetchUrlError && e.status === 404)) throw e;
+		}
+	}
+	let best = null;
+	for (const name of names) {
+		const parts = name.split("/");
+		// The ref must be a proper prefix of the URL segments, leaving a file path
+		if (parts.length < 2 || parts.length >= segments.length) continue;
+		if (
+			parts.every((part, index) => part === segments[index]) &&
+			(best === null || parts.length > best)
+		) {
+			best = parts.length;
+		}
+	}
+	return best;
+}
 
 // ---------------------------------------------------------------------------
 // Entry point

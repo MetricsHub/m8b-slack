@@ -548,6 +548,46 @@ describe("transport hardening", () => {
 		expect(seen).toEqual(["Bearer ghp_secret", undefined]);
 	});
 
+	it("keeps the derived-host exemption on a same-host redirect (repository rename)", async () => {
+		// Only github.com is allowed; api.github.com is reached as a derived host,
+		// and GitHub's rename redirect stays on api.github.com
+		const routes = {
+			"https://api.github.com/repos/acme/old-name/issues/12": response("", {
+				status: 301,
+				headers: { location: "https://api.github.com/repos/acme/tool/issues/12" },
+			}),
+			"https://api.github.com/repos/acme/tool/issues/12": response(
+				JSON.stringify({ number: 12, title: "Renamed", state: "open" }),
+				{ contentType: "application/json" }
+			),
+			"https://api.github.com/repos/acme/old-name/issues/12/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+			}),
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/old-name/issues/12" },
+			{ routes, config: { allowedHosts: ["github.com"] } }
+		);
+		expect(result.ok).toBe(true);
+		expect(result.title).toBe("Renamed");
+
+		// Leaving the derived host puts the full policy back
+		const away = await run(
+			{ url: "https://github.com/acme/old-name/issues/12" },
+			{
+				routes: {
+					"https://api.github.com/repos/acme/old-name/issues/12": response("", {
+						status: 302,
+						headers: { location: "https://mirror.example.net/x" },
+					}),
+				},
+				config: { allowedHosts: ["github.com"] },
+			}
+		);
+		expect(away.result.ok).toBe(false);
+		expect(away.result.error).toContain("FETCH_URL_ALLOWED_HOSTS");
+	});
+
 	it("keeps credentials on a same-origin redirect", async () => {
 		const seen = [];
 		const routes = {
@@ -1032,31 +1072,59 @@ describe("GitHub", () => {
 
 	it("resolves slash-containing refs when reading token-scoped blobs", async () => {
 		const requested = [];
+		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });
+		const base = "https://api.github.com/repos/acme/tool";
 		const routes = {
 			// ref=feature is tried first (the common single-segment case) and does not exist
-			"https://api.github.com/repos/acme/tool/contents/foo/docs/guide.md?ref=feature": (init) => {
+			[`${base}/contents/foo/docs/guide.md?ref=feature`]: (init) => {
 				requested.push("feature");
 				expect(init.headers.Authorization).toBe("Bearer ghp_test");
 				return notFound();
 			},
-			"https://api.github.com/repos/acme/tool/contents/docs/guide.md?ref=feature%2Ffoo": () => {
+			// The refs API lists what starts with "feature": the longest URL prefix wins
+			[`${base}/git/matching-refs/heads/feature`]: () => {
+				requested.push("refs");
+				return json([
+					{ ref: "refs/heads/feature" },
+					{ ref: "refs/heads/feature/foo" },
+					{ ref: "refs/heads/feature/foo/docs/guide.md/impossible" },
+				]);
+			},
+			[`${base}/contents/docs/guide.md?ref=feature%2Ffoo`]: () => {
 				requested.push("feature/foo");
 				return response("# On feature/foo", { contentType: "text/plain" });
 			},
+			// Five-segment branch name: no cap on the number of slashes
+			[`${base}/contents/alice/features/new/ui/README.md?ref=users`]: notFound(),
+			[`${base}/git/matching-refs/heads/users`]: json([
+				{ ref: "refs/heads/users/alice/features/new/ui" },
+			]),
+			[`${base}/git/matching-refs/tags/users`]: json([]),
+			[`${base}/contents/README.md?ref=users%2Falice%2Ffeatures%2Fnew%2Fui`]: response(
+				"# Deep ref",
+				{
+					contentType: "text/plain",
+				}
+			),
 		};
+		const config = { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] };
 		const { result } = await run(
 			{ url: "https://github.com/acme/tool/blob/feature/foo/docs/guide.md" },
-			{ routes, config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+			{ routes, config }
 		);
-		expect(requested).toEqual(["feature", "feature/foo"]);
+		// tags lookup 404s (not routed) and is tolerated
+		expect(requested).toEqual(["feature", "refs", "feature/foo"]);
 		expect(result).toMatchObject({ ok: true, source: "github", title: "docs/guide.md" });
 		expect(result.content).toBe("# On feature/foo");
 
-		// Nothing matches at any split: the last 404 is reported, with its hint
-		const missing = await run(
-			{ url: "https://github.com/acme/tool/blob/a/b/c.md" },
-			{ config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		const deep = await run(
+			{ url: "https://github.com/acme/tool/blob/users/alice/features/new/ui/README.md" },
+			{ routes, config }
 		);
+		expect(deep.result).toMatchObject({ ok: true, title: "README.md", content: "# Deep ref" });
+
+		// No branch or tag matches: the original 404 is reported, with its hint
+		const missing = await run({ url: "https://github.com/acme/tool/blob/a/b/c.md" }, { config });
 		expect(missing.result.ok).toBe(false);
 		expect(missing.result.error).toContain("404");
 	});
@@ -1130,6 +1198,42 @@ describe("GitHub", () => {
 		expect(outOfScope.result.ok).toBe(false);
 		expect(seen.outOfScope).toBeUndefined();
 		expect(outOfScope.result.hint).toContain("GITHUB_TOKEN_REPOS");
+	});
+
+	it("keeps the scoped token on pagination links spelled /repositories/{id}/...", async () => {
+		const seen = [];
+		const json = (value, headers = {}) =>
+			response(JSON.stringify(value), { contentType: "application/json", headers });
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/4": (init) => {
+				seen.push(init.headers.Authorization);
+				return json(issue);
+			},
+			"https://api.github.com/repos/acme/tool/issues/4/comments?per_page=100": (init) => {
+				seen.push(init.headers.Authorization);
+				return json(
+					[{ user: { login: "c1" }, created_at: "2026-09-01T00:00:00Z", body: "page one" }],
+					{
+						link: '<https://api.github.com/repositories/123456/issues/4/comments?per_page=100&page=2>; rel="next"',
+					}
+				);
+			},
+			"https://api.github.com/repositories/123456/issues/4/comments?per_page=100&page=2": (
+				init
+			) => {
+				seen.push(init.headers.Authorization);
+				return json([
+					{ user: { login: "c2" }, created_at: "2026-09-02T00:00:00Z", body: "page two" },
+				]);
+			},
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/tool/issues/4" },
+			{ routes, config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		);
+		expect(result.ok).toBe(true);
+		expect(result.content).toContain("page two");
+		expect(seen).toEqual(["Bearer ghp_test", "Bearer ghp_test", "Bearer ghp_test"]);
 	});
 
 	it("follows Link pagination on comment and review lists and reports truncation", async () => {

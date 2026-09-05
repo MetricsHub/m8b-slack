@@ -239,9 +239,10 @@ function tokenizeHtml(html, onTag, onText) {
 		while (nameEnd < length && isTagNameChar(html.charCodeAt(nameEnd))) nameEnd++;
 
 		// The tag ends at the first ">" outside a quoted attribute value (a ">"
-		// inside title="...>..." does not end the tag, as in the HTML tokenizer);
-		// closing tags carry no attributes, their first ">" ends them
-		const gt = closing ? gtAfter(nameEnd) : findTagEnd(html, nameEnd);
+		// inside title="...>..." does not end the tag, as in the HTML tokenizer).
+		// End tags get the same treatment: the tokenizer parses (and discards)
+		// attributes on malformed closers, so `</span title=">">` is one closer
+		const gt = findTagEnd(html, nameEnd);
 		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
 		const name = html.slice(nameStart, nameEnd).toLowerCase();
 		// The "/>" slash only means something on void elements (and in foreign
@@ -277,7 +278,7 @@ function tokenizeHtml(html, onTag, onText) {
 				if (onText(html.slice(pos, bodyEnd)) === false) return;
 			}
 			if (close === -1) return;
-			const closeGt = gtAfter(close);
+			const closeGt = findTagEnd(html, close + 2 + name.length);
 			const closeEnd = closeGt === -1 ? length : closeGt + 1;
 			const closer = {
 				name,
@@ -461,8 +462,18 @@ function estimateNesting(html) {
 					if (foreignDepth === 0) foreign = null;
 					return true;
 				}
-				if (closing || !FOREIGN_BREAKOUT.has(name)) return true;
-				foreign = null; // the breakout closed the foreign subtree: fall through
+				if (closing) return true;
+				if (FOREIGN_INTEGRATION.has(name)) {
+					// HTML integration point (foreignObject, desc, annotation-xml, ...):
+					// its children are parsed as HTML. Conservative: count it and
+					// everything after it as HTML (the svg closer, when it comes, pops
+					// nothing — its name is not on the stack)
+					foreign = null;
+				} else if (!FOREIGN_BREAKOUT.has(name)) {
+					return true;
+				} else {
+					foreign = null; // the breakout closed the foreign subtree: fall through
+				}
 			}
 			if (closing) {
 				const index = stack.lastIndexOf(name);
@@ -505,6 +516,23 @@ function estimateNesting(html) {
  * indentation of all its ancestors, so a small page could expand a lot.
  */
 const PREFIXING = new Set(["ul", "ol", "blockquote"]);
+
+/**
+ * Elements inside svg/math whose children the HTML parser builds as HTML
+ * (integration points): svg foreignObject/desc/title, MathML annotation-xml
+ * and the text elements. Counted conservatively as HTML from there on.
+ */
+const FOREIGN_INTEGRATION = new Set([
+	"foreignobject",
+	"desc",
+	"title",
+	"annotation-xml",
+	"mi",
+	"mo",
+	"mn",
+	"ms",
+	"mtext",
+]);
 
 /** Deepest list/blockquote nesting the DOM route accepts (real pages stay far below) */
 const MAX_PREFIX_DEPTH = 16;

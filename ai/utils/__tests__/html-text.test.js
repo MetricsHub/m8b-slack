@@ -279,6 +279,29 @@ describe("htmlToMarkdown", () => {
 		expect(Date.now() - startedBare).toBeLessThan(2000);
 	});
 
+	it("honours quoted attributes on closing tags too", () => {
+		// The tokenizer parses (and discards) attributes on malformed end tags: the
+		// quoted "></div>" belongs to the </span> closer, so every div stays open
+		const page = `<body>${'<div></span title="></div>">'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+	});
+
+	it("counts HTML inside SVG integration points (foreignObject) towards depth", () => {
+		const page = `<body><svg><foreignObject>${"<x>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// An ordinary SVG with a description keeps converting normally
+		const svg = `<body><p>Before</p><svg><desc>Chart</desc>${"<path d='M0 0'/>".repeat(50)}</svg><p>After</p></body>`;
+		const normal = htmlToMarkdown(svg);
+		expect(normal).toContain("Before");
+		expect(normal).toContain("After");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
