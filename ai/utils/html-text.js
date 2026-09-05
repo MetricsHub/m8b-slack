@@ -1,11 +1,16 @@
 /**
- * Minimal HTML → Markdown-ish text conversion for the fetch_url tool.
+ * HTML → Markdown conversion for the fetch_url tool.
  *
- * Deliberately dependency-free: the goal is readable text for a language
- * model, not a faithful rendering. Scripts, styles, navigation, footers and
- * asides are dropped; headings, paragraphs, lists, code blocks, links and
- * tables are kept in a Markdown-like form.
+ * The conversion itself is Turndown (with the GFM plugin for tables and
+ * strikethrough). What this module adds is the part specific to feeding a
+ * language model: a pre-pass that drops page furniture (scripts, styles,
+ * navigation, footers, asides — nested ones included, on broken markup too)
+ * and narrows the document to its main content region, link/image resolution
+ * against the page URL, and a compact list/whitespace style.
  */
+
+import gfmPlugin from "@joplin/turndown-plugin-gfm";
+import TurndownService from "turndown";
 
 /** Elements whose entire content is noise for a reader */
 const DROP_ELEMENTS = [
@@ -68,7 +73,8 @@ const NAMED_ENTITIES = {
 };
 
 /**
- * Decode HTML character references (named, decimal, hexadecimal).
+ * Decode HTML character references (named, decimal, hexadecimal) in a text
+ * fragment, without a DOM. Used for the <title>; Turndown handles the body.
  *
  * @param {string} text - Text with HTML entities
  * @returns {string} Decoded text
@@ -143,18 +149,14 @@ export function extractHtmlTitle(html) {
 	const source = String(html ?? "");
 	const title = source.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
 	const raw = title?.[1] || source.match(/<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i)?.[1] || "";
-	return normalizeInline(decodeHtmlEntities(raw.replace(/<[^>]+>/g, " "))).trim();
+	return decodeHtmlEntities(raw.replace(/<[^>]+>/g, " "))
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
-function normalizeInline(text) {
-	return text.replace(/[ \t\r\f\v]+/g, " ").replace(/ ?\n ?/g, "\n");
-}
-
-function resolveHref(href, baseUrl) {
-	const clean = decodeHtmlEntities(href).trim();
-	if (!clean || /^(javascript|data|mailto|tel):/i.test(clean) || clean.startsWith("#")) {
-		return null;
-	}
+function resolveUrl(href, baseUrl) {
+	const clean = String(href || "").trim();
+	if (!clean || /^(?:javascript|data|vbscript):/i.test(clean)) return null;
 	if (!baseUrl) return clean;
 	try {
 		return new URL(clean, baseUrl).toString();
@@ -164,138 +166,89 @@ function resolveHref(href, baseUrl) {
 }
 
 /**
- * Convert an HTML table (already free of nested tables) to a Markdown table.
+ * Build a Turndown service tuned for model consumption.
+ *
+ * @param {string|undefined} baseUrl - Page URL used to resolve relative links
  */
-function tableToMarkdown(tableHtml) {
-	const rows = [...tableHtml.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)].map((row) =>
-		[...row[1].matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]\s*>/gi)].map((cell) =>
-			normalizeInline(
-				decodeHtmlEntities(cell[1].replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, ""))
-			)
-				.replace(/\s*\n\s*/g, " ")
-				.replace(/\|/g, "\\|")
-				.trim()
-		)
-	);
-	const nonEmpty = rows.filter((cells) => cells.length > 0);
-	if (nonEmpty.length === 0) return "";
+function createConverter(baseUrl) {
+	const service = new TurndownService({
+		headingStyle: "atx",
+		hr: "---",
+		bulletListMarker: "-",
+		codeBlockStyle: "fenced",
+		emDelimiter: "*",
+		strongDelimiter: "**",
+		linkStyle: "inlined",
+		br: "",
+	});
+	service.use(gfmPlugin.gfm);
+	service.remove(DROP_ELEMENTS);
 
-	const width = Math.max(...nonEmpty.map((cells) => cells.length));
-	const pad = (cells) => [...cells, ...Array(width - cells.length).fill("")];
-	const line = (cells) => `| ${pad(cells).join(" | ")} |`;
-	const [header, ...body] = nonEmpty;
-	return `\n\n${[line(header), `| ${Array(width).fill("---").join(" | ")} |`, ...body.map(line)].join("\n")}\n\n`;
+	// Links: absolute URLs, no duplicate of the label, no javascript: targets
+	service.addRule("absoluteLinks", {
+		filter: (node) => node.nodeName === "A" && Boolean(node.getAttribute("href")),
+		replacement: (content, node) => {
+			const label = content.replace(/\s+/g, " ").trim();
+			if (!label) return "";
+			const target = resolveUrl(node.getAttribute("href"), baseUrl);
+			if (!target || target.startsWith("#") || label === target) return label;
+			return `[${label}](${target})`;
+		},
+	});
+
+	// Images: keep the alt text and an absolute URL; drop decorative ones
+	service.addRule("absoluteImages", {
+		filter: "img",
+		replacement: (_content, node) => {
+			const alt = String(node.getAttribute("alt") || "")
+				.replace(/\s+/g, " ")
+				.trim();
+			const src = resolveUrl(node.getAttribute("src"), baseUrl);
+			if (!alt && !src) return "";
+			return src ? `![${alt}](${src})` : `[image: ${alt}]`;
+		},
+	});
+
+	return service;
 }
 
 /**
- * Convert an HTML document to Markdown-ish plain text.
+ * Convert an HTML document to Markdown.
  *
  * @param {string} html - Raw HTML document or fragment
  * @param {Object} [options]
  * @param {string} [options.baseUrl] - Page URL used to resolve relative links
- * @returns {string} Readable text with Markdown headings, lists, links, code blocks and tables
+ * @returns {string} Markdown text
  */
 export function htmlToMarkdown(html, { baseUrl } = {}) {
-	let text = String(html ?? "");
+	let source = String(html ?? "");
+	if (!source.trim()) return "";
 
-	// Comments and CDATA first: they may contain tags that would confuse the rest
-	text = text.replace(/<!--[\s\S]*?-->/g, " ").replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " ");
-	text = text.replace(/<!doctype[^>]*>/gi, " ");
-
-	// Noise elements (nested-safe)
+	// Pre-pass: comments, page furniture (nested-safe, tolerant of unterminated
+	// tags), then the main content region
+	source = source.replace(/<!--[\s\S]*?-->/g, " ").replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " ");
 	for (const tag of DROP_ELEMENTS) {
-		text = dropElement(text, tag);
+		source = dropElement(source, tag);
 	}
-	text = selectContentRegion(text);
+	source = selectContentRegion(source);
 
-	// Protect preformatted blocks: their whitespace must survive the collapsing
-	// below, and their inner tags (syntax highlighting spans) are just noise
+	let markdown = createConverter(baseUrl).turndown(source);
+
+	// Post-pass: compact list markers (Turndown pads them to a 4-column
+	// indent), punctuation glued back to the word it follows, no runs of
+	// blank lines. Fenced code blocks are left untouched (private-use code
+	// points delimit the placeholders; real text never contains them).
 	const codeBlocks = [];
-	text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_match, inner) => {
-		const language =
-			inner.match(/<code\b[^>]*class="[^"]*(?:language|lang)-([\w#+-]+)/i)?.[1] || "";
-		const code = decodeHtmlEntities(inner.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, ""))
-			.replace(/^\n+|\n+$/g, "")
-			.trimEnd();
-		codeBlocks.push(`\n\n\`\`\`${language}\n${code}\n\`\`\`\n\n`);
-		return `\uE000PRE${codeBlocks.length - 1}\uE000`;
+	markdown = markdown.replace(/```[\s\S]*?```/g, (block) => {
+		codeBlocks.push(block);
+		return `${codeBlocks.length - 1}`;
 	});
-
-	// Tables (innermost first so nested layout tables degrade gracefully)
-	const tablePattern = /<table\b(?:(?!<table\b)[\s\S])*?<\/table\s*>/gi;
-	let previous;
-	do {
-		previous = text;
-		text = text.replace(tablePattern, (table) => tableToMarkdown(table));
-	} while (text !== previous);
-
-	// Block structure
-	text = text.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi, (_m, level, inner) => {
-		const heading = inner
-			.replace(/<[^>]+>/g, "")
-			.replace(/\s+/g, " ")
-			.trim();
-		return heading ? `\n\n${"#".repeat(Number(level))} ${heading}\n\n` : "\n\n";
-	});
-	text = text.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote\s*>/gi, (_m, inner) => {
-		const quote = inner
-			.replace(/<[^>]+>/g, " ")
-			.replace(/\s+/g, " ")
-			.trim();
-		return quote ? `\n\n> ${quote}\n\n` : "\n\n";
-	});
-	text = text.replace(/<li\b[^>]*>/gi, "\n- ").replace(/<\/li\s*>/gi, "\n");
-	text = text.replace(/<(?:ul|ol|dl)\b[^>]*>|<\/(?:ul|ol|dl)\s*>/gi, "\n\n");
-	text = text.replace(/<dt\b[^>]*>/gi, "\n**").replace(/<\/dt\s*>/gi, "**\n");
-	text = text.replace(/<dd\b[^>]*>/gi, "\n  ").replace(/<\/dd\s*>/gi, "\n");
-	text = text.replace(/<hr\b[^>]*>/gi, "\n\n---\n\n");
-	text = text.replace(/<br\s*\/?>/gi, "\n");
-	text = text.replace(
-		/<\/?(?:p|div|section|article|header|main|figure|figcaption|details|summary|address|tr|thead|tbody|tfoot)\b[^>]*>/gi,
-		"\n\n"
-	);
-
-	// Inline semantics
-	text = text.replace(/<img\b[^>]*\balt=["']([^"']*)["'][^>]*>/gi, (_m, alt) => {
-		const label = alt.trim();
-		return label ? ` [image: ${label}] ` : " ";
-	});
-	text = text.replace(
-		/<a\b[^>]*\bhref=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a\s*>/gi,
-		(_m, href, inner) => {
-			const label = decodeHtmlEntities(inner.replace(/<[^>]+>/g, " "))
-				.replace(/\s+/g, " ")
-				.trim();
-			const target = resolveHref(href, baseUrl);
-			if (!label) return " ";
-			if (!target || label === target) return ` ${label} `;
-			return ` [${label}](${target}) `;
-		}
-	);
-	text = text.replace(/<(?:strong|b)\b[^>]*>([\s\S]*?)<\/(?:strong|b)\s*>/gi, (_m, inner) => {
-		const content = inner.trim();
-		return content ? `**${content}**` : "";
-	});
-	text = text.replace(/<(?:em|i)\b[^>]*>([\s\S]*?)<\/(?:em|i)\s*>/gi, (_m, inner) => {
-		const content = inner.trim();
-		return content ? `*${content}*` : "";
-	});
-	text = text.replace(/<code\b[^>]*>([\s\S]*?)<\/code\s*>/gi, (_m, inner) => {
-		const content = inner.replace(/<[^>]+>/g, "").trim();
-		return content ? `\`${content}\`` : "";
-	});
-
-	// Everything else: strip tags, decode entities, collapse whitespace
-	text = text.replace(/<[^>]+>/g, " ");
-	text = decodeHtmlEntities(text);
-	text = text
-		.replace(/[ \t\r\f\v]+/g, " ")
-		.replace(/ *\n */g, "\n")
+	markdown = markdown
+		.replace(/^(\s*)-\s{2,}(?=\S)/gm, "$1- ")
+		.replace(/^(\s*\d+\.)\s{2,}(?=\S)/gm, "$1 ")
 		.replace(/ +([,.;:!?)\]])/g, "$1")
-		.replace(/\n{3,}/g, "\n\n");
+		.replace(/\n{3,}/g, "\n\n")
+		.replace(/(\d+)/g, (_m, index) => codeBlocks[Number(index)] || "");
 
-	// Restore code blocks
-	text = text.replace(/\uE000PRE(\d+)\uE000/g, (_m, index) => codeBlocks[Number(index)] || "");
-
-	return text.replace(/\n{3,}/g, "\n\n").trim();
+	return markdown.trim();
 }

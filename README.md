@@ -529,8 +529,10 @@ app-side `web_search` only returns titles and snippets, and the Python sandbox h
 So the local modes get a `fetch_url` function tool that reads the URLs users paste (and
 `web_search` results in full). It negotiates the cheapest faithful rendition first — an
 `Accept: text/markdown` request, then the sibling `.md` resource and the site's `/llms.txt`
-index (the [llms.txt](https://llmstxt.org) convention) — and otherwise reduces the HTML page to
-Markdown-ish text (no scripts, styles, navigation or footers). GitHub issue and pull request
+index (the [llms.txt](https://llmstxt.org) convention) — and otherwise converts the HTML page to
+Markdown with [Turndown](https://github.com/mixmark-io/turndown) (GFM tables included) after
+dropping scripts, styles, navigation, footers and asides and narrowing to the main content
+region. GitHub issue and pull request
 URLs are read through the REST API (body, comments, reviews; optional `GITHUB_TOKEN` for
 private repositories and a higher rate limit), `blob` URLs through their raw counterpart. The
 tool output names the variant used (`source: markdown | llms.txt | html | text | github`).

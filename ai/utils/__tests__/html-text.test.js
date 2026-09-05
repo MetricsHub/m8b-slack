@@ -1,5 +1,5 @@
 /**
- * Tests for the dependency-free HTML → Markdown-ish text conversion.
+ * Tests for the HTML → Markdown conversion (Turndown + model-oriented pre/post passes).
  */
 
 import { describe, expect, it } from "@jest/globals";
@@ -29,6 +29,7 @@ echo "&lt;ok&gt;"</code></pre>
 </table>
 <blockquote>Do not run as a service user.</blockquote>
 <img src="/x.png" alt="Architecture diagram">
+<script>inline()</script>
 </main>
 <footer>Copyright &copy; 2026 Example</footer>
 </body></html>`;
@@ -38,42 +39,41 @@ describe("htmlToMarkdown", () => {
 
 	it("drops scripts, styles, navigation and footers (nested ones included)", () => {
 		expect(text).not.toContain("window.track");
+		expect(text).not.toContain("inline()");
 		expect(text).not.toContain("color: red");
 		expect(text).not.toContain("Home");
 		expect(text).not.toContain("nested");
 		expect(text).not.toContain("Copyright");
 	});
 
-	it("keeps headings, paragraphs and lists as Markdown", () => {
+	it("keeps headings, paragraphs, lists and quotes as Markdown", () => {
 		expect(text).toContain("# Install & Configure");
 		expect(text).toContain("## Steps");
 		expect(text).toContain("- Unpack the `archive`");
 		expect(text).toContain("- Run **setup** as *root*");
 		expect(text).toContain("> Do not run as a service user.");
-		expect(text).toContain("[image: Architecture diagram]");
 	});
 
-	it("resolves relative links against the page URL", () => {
-		expect(text).toContain("[latest release](https://docs.example.com/releases/latest)");
+	it("resolves relative links and images against the page URL", () => {
+		expect(text).toContain(
+			"Download the [latest release](https://docs.example.com/releases/latest), then run the installer."
+		);
+		expect(text).toContain("![Architecture diagram](https://docs.example.com/x.png)");
 	});
 
-	it("preserves whitespace and entities inside code blocks", () => {
+	it("preserves whitespace and entities inside fenced code blocks", () => {
 		expect(text).toContain('```bash\n./setup   --prefix=/opt   && echo   done\necho "<ok>"\n```');
 	});
 
-	it("renders tables as Markdown tables with escaped pipes", () => {
-		expect(text).toContain("| Option | Default |");
-		expect(text).toContain("| --- | --- |");
-		expect(text).toContain("| port | 8080 \\| 8443 |");
+	it("renders tables as GFM tables with escaped pipes", () => {
+		expect(text).toMatch(/^\| Option +\| Default +\|$/m);
+		expect(text).toMatch(/^\| -+ +\| -+ +\|$/m);
+		expect(text).toMatch(/^\| port +\| 8080 \\\| 8443 +\|$/m);
 	});
 
-	it("collapses whitespace outside code blocks and keeps punctuation attached", () => {
+	it("keeps the output compact: no blank-line runs, no padded list markers", () => {
 		expect(text).not.toMatch(/\n{3,}/);
-		expect(text).toContain(
-			"Download the [latest release](https://docs.example.com/releases/latest), then run the installer. This paragraph is\nlong enough"
-		);
-		const outsideCode = text.replace(/```[\s\S]*?```/g, "");
-		expect(outsideCode).not.toMatch(/[^\n] {2,}[^\n]/);
+		expect(text).not.toMatch(/^-\s{2,}\S/m);
 	});
 
 	it("falls back to the body when there is no single main region", () => {
@@ -83,6 +83,21 @@ describe("htmlToMarkdown", () => {
 
 	it("converts <br> and <hr> and drops empty markup", () => {
 		expect(htmlToMarkdown("<p>a<br>b</p><hr><p><b></b>c</p>")).toBe("a\nb\n\n---\n\nc");
+	});
+
+	it("skips javascript: links and duplicate label/URL links", () => {
+		const out = htmlToMarkdown(
+			'<p><a href="javascript:void(0)">Click</a> <a href="https://x.example/">https://x.example/</a> <a href="#top">top</a></p>'
+		);
+		expect(out).toBe("Click https://x.example/ top");
+	});
+
+	it("handles tables without a header row", () => {
+		const out = htmlToMarkdown(
+			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
+		);
+		expect(out).toMatch(/\| a +\| b +\|/);
+		expect(out).toMatch(/\| 1 +\| 2 +\|/);
 	});
 
 	it("survives unterminated noise elements", () => {

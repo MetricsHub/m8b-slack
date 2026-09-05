@@ -43,12 +43,14 @@
 		"node": ">=20.0.0"
 	},
 	"dependencies": {
+		"@joplin/turndown-plugin-gfm": "^1.0.67",
 		"@slack/bolt": "^5.0.0",
 		"@slack/web-api": "^8.0.0",
 		"dotenv": "~17.2.3",
 		"mcp-client": "^1.13.1",
 		"openai": "^6.48.0",
 		"pyodide": "^314.0.5",
+		"turndown": "^7.2.4",
 		"undici": "^7.20.0"
 	},
 	"overrides": {
