@@ -599,32 +599,32 @@ function estimateNesting(html) {
 	let depth = 0;
 	let prefixDepth = 0;
 	let prefixes = 0; // list/blockquote ancestors currently open
-	// Foreign content (svg, math) honours "/>" and is dropped by the converter
-	// anyway: skipped as a whole so inline icons and charts never count. HTML
-	// "breakout" tags inside it pop the foreign content in the parser and are
-	// processed as ordinary HTML, so they are counted.
-	let foreign = null;
-	let foreignDepth = 0;
+	// Foreign content (svg, math) is COUNTED like everything else: the parser
+	// builds it and Turndown recurses into it before dropping the svg node, so
+	// thousands of nested <g> cost as much as nested <div>. Two foreign rules
+	// matter: "/>" really closes an element there (inline icons stay shallow),
+	// and an HTML "breakout" start tag pops the foreign subtree in the parser.
+	let foreignOpen = 0; // svg/math elements currently on the stack
+	const popTo = (index) => {
+		for (let i = index; i < stack.length; i++) {
+			if (PREFIXING.has(stack[i])) prefixes--;
+			if (stack[i] === "svg" || stack[i] === "math") foreignOpen--;
+		}
+		stack.length = index;
+	};
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing }) => {
-			if (foreign) {
-				if (name === foreign && !(selfClosing && !closing)) {
-					foreignDepth += closing ? -1 : 1;
-					if (foreignDepth === 0) foreign = null;
-					return true;
-				}
-				if (closing) return true;
-				if (FOREIGN_INTEGRATION.has(name)) {
-					// HTML integration point (foreignObject, desc, annotation-xml, ...):
-					// its children are parsed as HTML. Conservative: count it and
-					// everything after it as HTML (the svg closer, when it comes, pops
-					// nothing — its name is not on the stack)
-					foreign = null;
-				} else if (!FOREIGN_BREAKOUT.has(name)) {
-					return true;
-				} else {
-					foreign = null; // the breakout closed the foreign subtree: fall through
+			if (foreignOpen > 0 && !closing) {
+				if (selfClosing) return true; // "<path/>" is an empty element in foreign content
+				if (FOREIGN_BREAKOUT.has(name)) {
+					// The breakout closes the foreign subtree: pop to below the innermost svg/math
+					for (let i = stack.length - 1; i >= 0; i--) {
+						if (stack[i] === "svg" || stack[i] === "math") {
+							popTo(i);
+							break;
+						}
+					}
 				}
 			}
 			// </body> and </html> only change the parser's insertion mode: nothing is
@@ -669,25 +669,20 @@ function estimateNesting(html) {
 						// bound (`<b><i><div></i></b>` repeated keeps nesting, as in the parser).
 						return true;
 					}
-					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;
-					stack.length = index;
+					popTo(index);
 				}
 				return true;
 			}
 			if (name === "svg" || name === "math") {
-				if (!selfClosing) {
-					foreign = name;
-					foreignDepth = 1;
-				}
-				return true;
+				if (selfClosing) return true; // an empty <svg/> opens nothing
+				foreignOpen++; // counted like any element below
 			}
 			// "<div/>" opens a div: the slash is only meaningful on void elements
 			if (VOID_ELEMENTS.has(name)) return true;
 			const closes = IMPLICIT_CLOSERS[name];
 			if (closes) {
 				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
-					if (PREFIXING.has(stack[stack.length - 1])) prefixes--;
-					stack.pop();
+					popTo(stack.length - 1);
 				}
 			}
 			stack.push(name);
@@ -838,23 +833,6 @@ const FORMATTING_ELEMENTS = new Set([
 	"strong",
 	"tt",
 	"u",
-]);
-
-/**
- * Elements inside svg/math whose children the HTML parser builds as HTML
- * (integration points): svg foreignObject/desc/title, MathML annotation-xml
- * and the text elements. Counted conservatively as HTML from there on.
- */
-const FOREIGN_INTEGRATION = new Set([
-	"foreignobject",
-	"desc",
-	"title",
-	"annotation-xml",
-	"mi",
-	"mo",
-	"mn",
-	"ms",
-	"mtext",
 ]);
 
 /** Deepest list/blockquote nesting the DOM route accepts (real pages stay far below) */

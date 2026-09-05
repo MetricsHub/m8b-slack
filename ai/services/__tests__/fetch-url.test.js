@@ -470,6 +470,17 @@ describe("limits", () => {
 		expect(plain.result.fullTextFile).toBeUndefined();
 	});
 
+	it("ignores meta charset declarations inside comments and script bodies", async () => {
+		const utf8 = Buffer.from(
+			'<html><head><!-- <meta charset="windows-1252"> --><script>var s = \'<meta charset="windows-1252">\';</script><title>Café</title></head><body><p>Café</p></body></html>',
+			"utf8"
+		);
+		const routes = { "https://example.com/inert": response(utf8, { contentType: "text/html" }) };
+		const { result } = await run({ url: "https://example.com/inert" }, { routes });
+		expect(result.title).toBe("Café");
+		expect(result.content).toContain("Café");
+	});
+
 	it("does not mistake 'charset=' inside another attribute's value for a declaration", async () => {
 		const utf8 = Buffer.from(
 			'<html><head><meta name="description" content="Example of charset=windows-1252 pages"><title>Café</title></head><body><p>Café</p></body></html>',
@@ -1322,6 +1333,32 @@ describe("GitHub", () => {
 		}
 	});
 
+	it("decodes token-scoped UTF-16 blobs through the BOM-aware decoder", async () => {
+		const utf16 = Buffer.concat([
+			Buffer.from([0xff, 0xfe]),
+			Buffer.from("# Notes en UTF-16", "utf16le"),
+		]);
+		const routes = {
+			"https://api.github.com/repos/acme/tool/contents/NOTES.md?ref=main": response(utf16, {
+				contentType: "application/octet-stream",
+			}),
+			"https://api.github.com/repos/acme/tool/git/matching-refs/heads/main?per_page=100": response(
+				"[]",
+				{ contentType: "application/json" }
+			),
+			"https://api.github.com/repos/acme/tool/git/matching-refs/tags/main?per_page=100": response(
+				"[]",
+				{ contentType: "application/json" }
+			),
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/tool/blob/main/NOTES.md" },
+			{ routes, config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		);
+		expect(result.ok).toBe(true);
+		expect(result.content).toBe("# Notes en UTF-16");
+	});
+
 	it("reads blobs of token-scoped repositories through the API raw media type", async () => {
 		const routes = {
 			"https://api.github.com/repos/acme/tool/contents/docs/guide%20v2.md?ref=main": (init) => {
@@ -1482,7 +1519,10 @@ describe("GitHub", () => {
 		expect(githubTokenAllowedFor(["acme/tool"], "acme", "tool")).toBe(true);
 		expect(githubTokenAllowedFor(["acme/tool"], "Acme", "Tool")).toBe(true);
 		expect(githubTokenAllowedFor(["acme/*"], "acme", "other")).toBe(true);
-		expect(githubTokenAllowedFor(["acme"], "acme", "other")).toBe(true);
+		// Only "owner/repo" and "owner/*" are accepted: a bare owner (or the "owner/"
+		// typo, normalized to it) is a malformed entry and grants nothing
+		expect(githubTokenAllowedFor(["acme"], "acme", "other")).toBe(false);
+		expect(githubTokenAllowedFor(["acme"], "acme", "tool")).toBe(false);
 		expect(githubTokenAllowedFor(["acme/tool"], "acme", "other")).toBe(false);
 		expect(githubTokenAllowedFor(["acme/*"], "evil", "tool")).toBe(false);
 	});

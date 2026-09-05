@@ -528,6 +528,28 @@ describe("htmlToMarkdown", () => {
 		expect(out).toContain("[Guide](https://d.example/docs/guide)");
 	});
 
+	it("ends a tag at the '>' that closes an unquoted attribute value", () => {
+		// <body class=page> then a flood of <div>: the tag must end at its ">"
+		const page = `<body class=page>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		expect(htmlToMarkdown("<body class=page><p>Kept</p></body>")).toBe("Kept");
+	});
+
+	it("counts foreign (svg/math) descendants towards nesting depth", () => {
+		// Turndown recurses into the svg subtree before dropping it: deep <g> nesting costs
+		const page = `<body><svg>${"<g>".repeat(100000)}<text>Deep</text></svg></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary inline SVG (shallow, self-closed shapes) still converts normally
+		const icon = `<body><p>Before</p><svg><g><g><path d="M0 0"/><circle r="1"/></g></g></svg><p>After</p></body>`;
+		expect(htmlToMarkdown(icon)).toBe("Before\n\nAfter");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

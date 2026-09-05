@@ -173,7 +173,10 @@ export function githubTokenAllowedFor(scope, owner, repo) {
 	if (!Array.isArray(scope) || scope.length === 0) return true;
 	const full = `${owner}/${repo}`.toLowerCase();
 	const ownerKey = String(owner).toLowerCase();
-	return scope.some((entry) => entry === full || entry === `${ownerKey}/*` || entry === ownerKey);
+	// Only the documented forms count: "owner/repo" and "owner/*". A bare owner
+	// (or the "owner/" typo, normalized to "owner") is a malformed entry and
+	// grants nothing — a nonempty scope must fail closed, never widen
+	return scope.some((entry) => entry === full || entry === `${ownerKey}/*`);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +493,13 @@ function isTextualType(type) {
  * @returns {string|null}
  */
 function metaCharset(head) {
-	const tags = head.matchAll(/<meta\b([^>]*)>/gi);
+	// Inert markup does not declare anything: a <meta> inside a comment or a
+	// script/style body is not part of the document (the sample is 4 KB, so
+	// these passes are cheap)
+	const live = head
+		.replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
+		.replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, " ");
+	const tags = live.matchAll(/<meta\b([^>]*)>/gi);
 	for (const tag of tags) {
 		const attrs = {};
 		const attrPattern = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
@@ -1521,7 +1530,8 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 			source: "github",
 			title: path,
 			contentType: "text/plain",
-			text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
+			// Same decoder as web pages: a UTF-16 byte-order mark is honoured
+			text: decodeBody(bytes, null, "text/plain"),
 		});
 	};
 
