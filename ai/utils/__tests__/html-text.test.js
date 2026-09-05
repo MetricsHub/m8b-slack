@@ -104,6 +104,31 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<p>Visible</p><script>var x = 1;")).toBe("Visible");
 	});
 
+	it("removes deeply nested noise elements in the DOM within the depth cap", () => {
+		const depth = 400;
+		const nested = `<body><p>Before</p>${"<nav>".repeat(depth)}menu${"</nav>".repeat(depth)}<p>After</p></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(nested);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toBe("Before\n\nAfter");
+	});
+
+	it("refuses hostile nesting depth up front and degrades to a fast tag strip", () => {
+		// Attacker-controlled pages: the HTML tree builder is quadratic in depth
+		// and the converter recurses per level, so depth is bounded before parsing
+		for (const page of [
+			`<body><p>Before</p>${"<nav>".repeat(20000)}menu${"</nav>".repeat(20000)}<p>After</p></body>`,
+			`<body><p>Before</p>${"<nav>".repeat(20000)}menu <p>After</p>`, // unterminated
+			`<body><p>Before</p>${"<div>".repeat(200000)}After${"</div>".repeat(200000)}</body>`,
+		]) {
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(out).toContain("Before");
+			expect(out).toContain("After");
+		}
+	});
+
 	it("handles null and empty input", () => {
 		expect(htmlToMarkdown("")).toBe("");
 		expect(htmlToMarkdown(null)).toBe("");

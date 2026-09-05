@@ -12,6 +12,7 @@ import {
 	findLlmsTxtEntry,
 	getFetchUrlTool,
 	isBlockedAddress,
+	looksBinary,
 	MAX_CONTENT_CHARS,
 	markdownSiblingUrl,
 	parseGitHubUrl,
@@ -155,6 +156,8 @@ describe("address policy", () => {
 			"ff02::1",
 			"::ffff:127.0.0.1",
 			"::ffff:c0a8:0101",
+			"::ffff:0:169.254.169.254",
+			"::ffff:0:a9fe:a9fe",
 			"64:ff9b::10.0.0.1",
 			"2001:db8::1",
 			"2002:7f00:0001::1",
@@ -165,6 +168,7 @@ describe("address policy", () => {
 		for (const address of [
 			"2606:2800:220:1:248:1893:25c8:1946",
 			"::ffff:8.8.8.8",
+			"::ffff:0:8.8.8.8",
 			"64:ff9b::8.8.8.8",
 		]) {
 			expect(isBlockedAddress(address)).toBe(false);
@@ -303,6 +307,56 @@ describe("limits", () => {
 		expect(result.ok).toBe(false);
 		expect(result.error).toContain("application/pdf");
 		expect(result.error).toContain("not a text document");
+	});
+
+	it("refuses binary bodies served without or with a wrong Content-Type", async () => {
+		const png = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.alloc(64, 0),
+		]);
+		const routes = {
+			"https://store.example.com/blob": response(
+				Buffer.from("%PDF-1.7\n%\xe2\xe3\xcf\xd3", "latin1"),
+				{
+					contentType: null,
+				}
+			),
+			"https://store.example.com/image": response(png, { contentType: "text/plain" }),
+			"https://store.example.com/notes": response("just text, no header", { contentType: null }),
+			"https://docs.example.com/page": response(HTML_PAGE),
+			"https://docs.example.com/page.md": response(png, { contentType: "text/markdown" }),
+		};
+		const untyped = await run({ url: "https://store.example.com/blob" }, { routes });
+		expect(untyped.result.ok).toBe(false);
+		expect(untyped.result.error).toContain("binary document without a Content-Type");
+
+		const mislabelled = await run({ url: "https://store.example.com/image" }, { routes });
+		expect(mislabelled.result.ok).toBe(false);
+		expect(mislabelled.result.error).toContain("labelled text/plain");
+
+		// Untyped genuine text is still accepted
+		const text = await run({ url: "https://store.example.com/notes" }, { routes });
+		expect(text.result).toMatchObject({
+			ok: true,
+			source: "text",
+			content: "just text, no header",
+		});
+
+		// A binary blob on the sibling .md path is skipped, not returned as Markdown
+		const page = await run({ url: "https://docs.example.com/page" }, { routes });
+		expect(page.result.source).toBe("html");
+	});
+
+	it("sniffs binary content by signature, NUL bytes and control-character density", () => {
+		expect(looksBinary(Buffer.from("%PDF-1.4 ..."))).toBe(true);
+		expect(looksBinary(Buffer.from([0x1f, 0x8b, 0x08, 0x00]))).toBe(true);
+		expect(looksBinary(Buffer.from("PK\x03\x04rest", "latin1"))).toBe(true);
+		expect(looksBinary(Buffer.from("abc\x00def", "latin1"))).toBe(true);
+		expect(looksBinary(Buffer.from("\x01\x02\x03\x04\x05\x06\x07\x08 text", "latin1"))).toBe(true);
+		expect(looksBinary(Buffer.from("﻿BOM then text"))).toBe(false);
+		expect(looksBinary(Buffer.from("tabs\tand\nnewlines\r\nand\x1b[0mANSI are text"))).toBe(false);
+		expect(looksBinary(Buffer.from("Café — naïve UTF-8 ✓"))).toBe(false);
+		expect(looksBinary(new Uint8Array(0))).toBe(false);
 	});
 
 	it("caps the text handed to the model and says so", async () => {
@@ -621,11 +675,28 @@ describe("GitHub", () => {
 			},
 			{ user: { login: "dave" }, state: "PENDING", body: "" },
 		];
+		const reviewComments = [
+			{
+				user: { login: "carol" },
+				path: "src/config.js",
+				line: 42,
+				created_at: "2026-09-01T07:50:00Z",
+				body: "Guard against an empty file here too.",
+			},
+			{
+				user: { login: "erin" },
+				path: "README.md",
+				original_line: 3,
+				created_at: "2026-09-01T07:55:00Z",
+				body: "Typo: 'recieve'.",
+			},
+		];
 		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });
 		const routes = {
 			"https://api.github.com/repos/acme/tool/pulls/7": json(pull),
 			"https://api.github.com/repos/acme/tool/issues/7/comments?per_page=100": json([]),
 			"https://api.github.com/repos/acme/tool/pulls/7/reviews?per_page=100": json(reviews),
+			"https://api.github.com/repos/acme/tool/pulls/7/comments?per_page=100": json(reviewComments),
 		};
 		const { result, fetchImpl } = await run(
 			{ url: "https://github.com/acme/tool/pull/7" },
@@ -639,7 +710,13 @@ describe("GitHub", () => {
 		expect(result.content).toContain("## Reviews (1)");
 		expect(result.content).toContain("@carol: approved (2026-09-01) — LGTM");
 		expect(result.content).not.toContain("dave");
+		// Inline review comments (their own endpoint) carry the actual feedback
+		expect(result.content).toContain("## Review comments (2)");
+		expect(result.content).toContain("### @carol on src/config.js:42 — 2026-09-01");
+		expect(result.content).toContain("Guard against an empty file here too.");
+		expect(result.content).toContain("### @erin on README.md:3 — 2026-09-01");
 		expect(result.content).not.toContain("## Comments");
+		expect(fetchImpl).toHaveBeenCalledTimes(4);
 		// No token configured: no Authorization header at all
 		expect(fetchImpl.mock.calls.every((call) => !call[1].headers.Authorization)).toBe(true);
 	});
@@ -678,5 +755,25 @@ describe("GitHub", () => {
 		);
 		expect(result.ok).toBe(false);
 		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("keeps the block list authoritative for derived hosts (blocked always wins)", async () => {
+		// raw.githubusercontent.com and api.github.com are exempt from the ALLOW
+		// list (derived from a checked github.com URL) but never from the block list
+		const raw = await run(
+			{ url: "https://github.com/acme/tool/blob/main/README.md" },
+			{ config: { blockedHosts: ["raw.githubusercontent.com"] } }
+		);
+		expect(raw.result.ok).toBe(false);
+		expect(raw.result.error).toContain("raw.githubusercontent.com is blocked");
+		expect(raw.fetchImpl).not.toHaveBeenCalled();
+
+		const api = await run(
+			{ url: "https://github.com/acme/tool/issues/12" },
+			{ config: { blockedHosts: ["api.github.com"] } }
+		);
+		expect(api.result.ok).toBe(false);
+		expect(api.result.error).toContain("api.github.com is blocked");
+		expect(api.fetchImpl).not.toHaveBeenCalled();
 	});
 });

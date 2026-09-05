@@ -215,6 +215,10 @@ function isBlockedIpv6(address) {
 	if (groups.slice(0, 5).every((g) => g === 0) && (groups[5] === 0xffff || groups[5] === 0)) {
 		return isBlockedIpv4(embeddedV4(6));
 	}
+	// ::ffff:0:a.b.c.d (IPv4-translatable, RFC 6145 / SIIT)
+	if (groups.slice(0, 4).every((g) => g === 0) && groups[4] === 0xffff && groups[5] === 0) {
+		return isBlockedIpv4(embeddedV4(6));
+	}
 	// 64:ff9b::/96 (NAT64) and 64:ff9b:1::/48 (local-use NAT64)
 	if (groups[0] === 0x64 && groups[1] === 0xff9b) {
 		return groups[2] === 1 || isBlockedIpv4(embeddedV4(6));
@@ -274,12 +278,13 @@ class FetchUrlError extends Error {
  * @param {string} rawUrl - URL to validate
  * @param {{allowedHosts: string[], blockedHosts: string[]}} policy - Host lists
  * @param {Object} [options]
- * @param {boolean} [options.skipHostPolicy] - Only check the scheme and literal
- *   address (for hosts derived by the tool itself, such as api.github.com)
+ * @param {boolean} [options.derivedHost] - The host was derived by the tool itself
+ *   from an already-checked URL (api.github.com, raw.githubusercontent.com): it
+ *   need not be on the allow list, but an explicit block entry still wins
  * @returns {URL} Parsed URL
  * @throws {FetchUrlError} When the URL is refused
  */
-export function validateUrlPolicy(rawUrl, policy, { skipHostPolicy = false } = {}) {
+export function validateUrlPolicy(rawUrl, policy, { derivedHost = false } = {}) {
 	let url;
 	try {
 		url = new URL(String(rawUrl));
@@ -307,13 +312,16 @@ export function validateUrlPolicy(rawUrl, policy, { skipHostPolicy = false } = {
 		throw new FetchUrlError(`Refused: ${hostname} is a loopback address`);
 	}
 
-	if (!skipHostPolicy) {
-		if (hostMatches(hostname, policy.blockedHosts)) {
-			throw new FetchUrlError(`Refused: ${hostname} is blocked by FETCH_URL_BLOCKED_HOSTS`);
-		}
-		if (policy.allowedHosts.length > 0 && !hostMatches(hostname, policy.allowedHosts)) {
-			throw new FetchUrlError(`Refused: ${hostname} is not in FETCH_URL_ALLOWED_HOSTS`);
-		}
+	// Blocked always wins, derived hosts included
+	if (hostMatches(hostname, policy.blockedHosts)) {
+		throw new FetchUrlError(`Refused: ${hostname} is blocked by FETCH_URL_BLOCKED_HOSTS`);
+	}
+	if (
+		!derivedHost &&
+		policy.allowedHosts.length > 0 &&
+		!hostMatches(hostname, policy.allowedHosts)
+	) {
+		throw new FetchUrlError(`Refused: ${hostname} is not in FETCH_URL_ALLOWED_HOSTS`);
 	}
 	return url;
 }
@@ -394,6 +402,10 @@ async function getGuardedDispatcher() {
 					},
 				})
 		);
+		// A failed initialization must not be cached: the next call retries
+		guardedDispatcherPromise.catch(() => {
+			guardedDispatcherPromise = null;
+		});
 	}
 	return guardedDispatcherPromise;
 }
@@ -428,6 +440,64 @@ function decodeBody(bytes, charset, type) {
 	} catch {
 		return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 	}
+}
+
+/** Magic numbers of binary formats commonly served with a missing or wrong Content-Type */
+const BINARY_SIGNATURES = [
+	[0x25, 0x50, 0x44, 0x46], // %PDF
+	[0x89, 0x50, 0x4e, 0x47], // PNG
+	[0xff, 0xd8, 0xff], // JPEG
+	[0x47, 0x49, 0x46, 0x38], // GIF8
+	[0x50, 0x4b, 0x03, 0x04], // ZIP / OOXML / JAR
+	[0x1f, 0x8b], // gzip
+	[0x7f, 0x45, 0x4c, 0x46], // ELF
+	[0x4d, 0x5a], // MZ (Windows executable)
+	[0x52, 0x49, 0x46, 0x46], // RIFF (WebP, WAV, AVI)
+	[0x00, 0x00, 0x00, 0x1c, 0x66, 0x74, 0x79, 0x70], // MP4 ftyp
+	[0xd0, 0xcf, 0x11, 0xe0], // OLE (legacy Office)
+	[0x42, 0x5a, 0x68], // bzip2
+	[0xfd, 0x37, 0x7a, 0x58, 0x5a], // xz
+	[0x37, 0x7a, 0xbc, 0xaf], // 7z
+	[0x52, 0x61, 0x72, 0x21], // RAR
+];
+
+/**
+ * Whether a body is binary rather than text: a known signature, a NUL byte,
+ * or a high share of control characters in the first kilobytes. Guards
+ * against servers that omit Content-Type (object stores, download endpoints).
+ *
+ * @param {Uint8Array} bytes - Response body
+ * @returns {boolean}
+ */
+export function looksBinary(bytes) {
+	if (!bytes || bytes.byteLength === 0) return false;
+	// Skip a UTF-8 BOM
+	const start = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+	if (
+		BINARY_SIGNATURES.some((signature) =>
+			signature.every((byte, index) => bytes[start + index] === byte)
+		)
+	) {
+		return true;
+	}
+	const sample = bytes.subarray(start, start + 8192);
+	let control = 0;
+	for (const byte of sample) {
+		if (byte === 0) return true;
+		// Control characters other than tab, LF, VT, FF, CR and ESC
+		if (
+			byte < 0x20 &&
+			byte !== 0x09 &&
+			byte !== 0x0a &&
+			byte !== 0x0b &&
+			byte !== 0x0c &&
+			byte !== 0x0d &&
+			byte !== 0x1b
+		) {
+			control++;
+		}
+	}
+	return control > sample.byteLength * 0.05;
 }
 
 /**
@@ -480,9 +550,9 @@ async function readBodyCapped(response, maxBytes) {
  * GET a URL, following redirects manually so that every hop goes through the
  * address policy. Returns the final response (not consumed) and its URL.
  */
-async function guardedGet(rawUrl, headers, runtime, { skipHostPolicy = false } = {}) {
+async function guardedGet(rawUrl, headers, runtime, { derivedHost = false } = {}) {
 	const { config, fetchImpl, lookup, dispatcher, logger } = runtime;
-	let url = validateUrlPolicy(rawUrl, config, { skipHostPolicy });
+	let url = validateUrlPolicy(rawUrl, config, { derivedHost });
 	let hops = 0;
 
 	for (;;) {
@@ -680,6 +750,7 @@ async function tryMarkdownResource(candidateUrl, runtime) {
 			return null;
 		}
 		const bytes = await readBodyCapped(response, runtime.config.maxBytes);
+		if (looksBinary(bytes)) return null;
 		const text = decodeBody(bytes, charset, type);
 		// A "Markdown" file that is really an HTML error/SPA shell is useless
 		if (/^\s*<(?:!doctype|html|head|body)\b/i.test(text) || !text.trim()) return null;
@@ -692,13 +763,13 @@ async function tryMarkdownResource(candidateUrl, runtime) {
 	}
 }
 
-async function readWebPage(pageUrl, runtime, { skipHostPolicy = false } = {}) {
+async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	const requestedUrl = pageUrl.toString();
 	const { response, url: finalUrl } = await guardedGet(
 		requestedUrl,
 		{ Accept: PAGE_ACCEPT },
 		runtime,
-		{ skipHostPolicy }
+		{ derivedHost }
 	);
 
 	if (!response.ok) {
@@ -720,6 +791,12 @@ async function readWebPage(pageUrl, runtime, { skipHostPolicy = false } = {}) {
 	}
 
 	const bytes = await readBodyCapped(response, runtime.config.maxBytes);
+	// Servers that omit or mislabel Content-Type: the bytes have the last word
+	if (looksBinary(bytes)) {
+		throw new FetchUrlError(
+			`Refused: ${finalUrl.hostname} returned a binary document${type ? ` labelled ${type}` : " without a Content-Type"} (only Markdown, plain text and HTML pages can be read)`
+		);
+	}
 	const body = decodeBody(bytes, charset, type);
 	const contentType = type || "text/plain";
 
@@ -845,7 +922,7 @@ async function githubApi(path, runtime) {
 		headers.Authorization = `Bearer ${runtime.config.githubToken}`;
 	}
 	const { response } = await guardedGet(`https://api.github.com${path}`, headers, runtime, {
-		skipHostPolicy: true,
+		derivedHost: true,
 	});
 	if (!response.ok) {
 		await response.body?.cancel?.().catch(() => {});
@@ -900,10 +977,11 @@ function renderCommentList(heading, comments) {
  * @param {{kind: string, number: number}} target - Parsed GitHub target
  * @param {Object} item - Issue or pull request API object
  * @param {Array} comments - Issue-thread comments
- * @param {Array} [reviews] - Pull request reviews
+ * @param {Array} [reviews] - Pull request reviews (state + summary body)
+ * @param {Array} [reviewComments] - Pull request inline (line-level) review comments
  * @returns {string}
  */
-export function renderGitHubItem(target, item, comments, reviews = []) {
+export function renderGitHubItem(target, item, comments, reviews = [], reviewComments = []) {
 	const isPull = target.kind === "pull" || Boolean(item.pull_request);
 	const lines = [`# ${item.title || "(untitled)"} (#${item.number ?? target.number})`, ""];
 	const facts = [
@@ -945,6 +1023,22 @@ export function renderGitHubItem(target, item, comments, reviews = []) {
 		}
 	}
 
+	// Inline review comments carry the substance of a review; the reviews
+	// endpoint only has the verdict and the summary body
+	if (Array.isArray(reviewComments) && reviewComments.length > 0) {
+		lines.push(`## Review comments (${reviewComments.length})`, "");
+		for (const comment of reviewComments) {
+			const line = comment.line ?? comment.original_line;
+			const location = `${comment.path || "?"}${line ? `:${line}` : ""}`;
+			lines.push(
+				`### @${comment.user?.login || "unknown"} on ${location} — ${formatDate(comment.created_at)}`,
+				"",
+				(comment.body || "").trim() || "_(empty)_",
+				""
+			);
+		}
+	}
+
 	lines.push(renderCommentList("Comments", comments));
 	return lines.join("\n").trim();
 }
@@ -960,14 +1054,21 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 		`${base}/issues/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`,
 		runtime
 	);
-	const reviews =
-		target.kind === "pull" || item.pull_request
-			? await githubApi(`${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`, runtime)
-			: [];
+	const isPull = target.kind === "pull" || Boolean(item.pull_request);
+	const reviews = isPull
+		? await githubApi(`${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		: [];
+	// Line-level review comments live on their own endpoint
+	const reviewComments = isPull
+		? await githubApi(`${base}/pulls/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		: [];
 
 	const notes = [];
 	if (Array.isArray(comments) && comments.length >= GITHUB_PAGE_SIZE) {
 		notes.push(`Only the first ${GITHUB_PAGE_SIZE} comments are included.`);
+	}
+	if (Array.isArray(reviewComments) && reviewComments.length >= GITHUB_PAGE_SIZE) {
+		notes.push(`Only the first ${GITHUB_PAGE_SIZE} review comments are included.`);
 	}
 	return buildResult({
 		requestedUrl,
@@ -975,7 +1076,7 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 		source: "github",
 		title: item.title,
 		contentType: "text/markdown",
-		text: renderGitHubItem(target, item, comments, reviews),
+		text: renderGitHubItem(target, item, comments, reviews, reviewComments),
 		note: notes.length > 0 ? notes.join(" ") : undefined,
 	});
 }
@@ -1009,12 +1110,29 @@ export async function executeFetchUrl(args, logger, options = {}) {
 	}
 
 	const config = options.config || getFetchUrlConfig();
+
+	// Fail closed: without the guarded dispatcher the connect-time address
+	// check is gone, and an unguarded request would reopen the DNS-rebinding
+	// window. A test double for fetch brings its own transport.
+	let dispatcher = null;
+	if (!options.fetchImpl) {
+		try {
+			dispatcher = await getGuardedDispatcher();
+		} catch (e) {
+			logger?.error?.("[FETCH_URL] Guarded HTTP client unavailable", { error: String(e) });
+			return {
+				ok: false,
+				error: "fetch_url is unavailable: the guarded HTTP client could not be initialized.",
+			};
+		}
+	}
+
 	const runtime = {
 		config,
 		logger,
 		fetchImpl: options.fetchImpl || globalThis.fetch,
 		lookup: options.lookup || dns.promises.lookup,
-		dispatcher: options.fetchImpl ? null : await getGuardedDispatcher().catch(() => null),
+		dispatcher,
 	};
 
 	try {
@@ -1031,9 +1149,10 @@ export async function executeFetchUrl(args, logger, options = {}) {
 		}
 		if (github?.kind === "blob") {
 			logger?.info?.(`[FETCH_URL] GitHub blob → ${github.rawUrl}`);
-			// The raw host is derived from an already policy-checked github.com URL
+			// The raw host is derived from an already policy-checked github.com URL:
+			// exempt from the allow list, still subject to the block list
 			const result = await readWebPage(new URL(github.rawUrl), runtime, {
-				skipHostPolicy: true,
+				derivedHost: true,
 			});
 			result.url = url.toString();
 			return result;

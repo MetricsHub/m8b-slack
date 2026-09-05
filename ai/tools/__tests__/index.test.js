@@ -3,6 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
+import { _setServersForTests } from "../../mcp_registry.js";
 import { buildFunctionNamespaces, buildToolsArray, KNOWLEDGE_TOOL } from "../index.js";
 
 function makeTool(name) {
@@ -193,6 +194,41 @@ describe("buildToolsArray", () => {
 			const disabled = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
 			expect(disabled.map((t) => t.name)).not.toContain("fetch_url");
 		} finally {
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("lets an MCP server's own fetch_url win over the built-in reader", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "Agent-side page reader with internal access.",
+							inputSchema: {
+								type: "object",
+								properties: { url: { type: "string" } },
+								required: ["url"],
+							},
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			const tools = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			const readers = tools.filter((t) => t.name === "fetch_url");
+			expect(readers).toHaveLength(1);
+			expect(readers[0].description).toContain("Agent-side page reader");
+		} finally {
+			_setServersForTests([]);
 			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
 			else process.env.FETCH_URL_ENABLED = saved;
 		}

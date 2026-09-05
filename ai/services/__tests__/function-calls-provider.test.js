@@ -161,6 +161,38 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.hint).toContain("TRUNCATED");
 	});
 
+	it("keeps the staged-file reference reachable when the inline cap truncates", async () => {
+		// The middleware appends _file AFTER the bulky payload: a naive slice of
+		// the serialized object would drop the only pointer to the full data
+		const knowledgeBase = {
+			search: jest.fn(async () => ({
+				ok: true,
+				content: "z".repeat(100000),
+				_file: {
+					fileName: "fetch_url_123.json",
+					hint: "Full JSON available in the Python sandbox at /data/fetch_url_123.json.",
+				},
+			})),
+		};
+
+		const items = await processFunctionCall(
+			{ name: "search_knowledge_base", call_id: "call_1", arguments: '{"query":"big"}' },
+			makeContext({
+				knowledgeBase,
+				provider: { ...ollamaProvider, maxToolOutputChars: 30000 },
+			})
+		);
+
+		expect(items[0].output.length).toBeLessThanOrEqual(31000);
+		const output = parseOutput(items);
+		expect(output.truncated).toBe(true);
+		expect(output._file).toEqual({
+			fileName: "fetch_url_123.json",
+			hint: "Full JSON available in the Python sandbox at /data/fetch_url_123.json.",
+		});
+		expect(output.hint).toContain("/data/fetch_url_123.json");
+	});
+
 	it("does not truncate outputs when the provider has no inline cap", async () => {
 		const knowledgeBase = {
 			search: jest.fn(async () => ({

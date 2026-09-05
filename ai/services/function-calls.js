@@ -153,12 +153,16 @@ export async function processFunctionCall(functionCall, context) {
 
 			// Application-side page reader (function-only providers). Through the
 			// middleware so a long page is staged for run_python instead of being
-			// truncated blindly by the provider inline cap
+			// truncated blindly by the provider inline cap. An MCP server that
+			// exports its own fetch_url keeps it (the built-in is not offered then)
 			case "fetch_url":
 				output = await executeWithMiddleware(
 					name,
 					args,
-					async (_name, cleanArgs) => executeFetchUrl(cleanArgs, logger),
+					async (_name, cleanArgs) =>
+						getOpenAiFunctionTools().some((tool) => tool.name === "fetch_url")
+							? handleMcpFunctionCall(_name, cleanArgs, logger)
+							: executeFetchUrl(cleanArgs, logger),
 					middlewareOptions
 				);
 				break;
@@ -251,13 +255,20 @@ export async function processFunctionCall(functionCall, context) {
 				const kept = finalOutputStr.slice(0, Math.max(charCap - 600, 1000));
 				finalOutputStr = `${kept}\n\n[TRUNCATED: showing ${kept.length} of ${originalChars} chars. ${truncationHint}]`;
 			} else {
-				finalOutputStr = JSON.stringify({
+				// The staged/uploaded full copy (middleware `_file`) is what lets the
+				// model recover the truncated data: keep it out of the sliced blob
+				// and inside the envelope, with room reserved for it
+				const fileRef = output && typeof output === "object" ? output._file : undefined;
+				const fileRefChars = fileRef ? JSON.stringify(fileRef).length : 0;
+				const envelope = {
 					ok: output?.ok ?? true,
 					truncated: true,
 					originalChars: finalOutputStr.length,
-					data: finalOutputStr.slice(0, Math.max(charCap - 500, 1000)),
-					hint: truncationHint,
-				});
+					data: finalOutputStr.slice(0, Math.max(charCap - 500 - fileRefChars, 1000)),
+					hint: fileRef?.hint ? `${truncationHint} ${fileRef.hint}` : truncationHint,
+				};
+				if (fileRef) envelope._file = fileRef;
+				finalOutputStr = JSON.stringify(envelope);
 			}
 		}
 	}

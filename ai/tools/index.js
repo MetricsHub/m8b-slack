@@ -199,9 +199,11 @@ export function buildFunctionToolsArray({
 	}
 
 	// Application-side page reader (hosted web search reads pages itself;
-	// here the model needs an explicit tool). Removed by FETCH_URL_ENABLED=false
+	// here the model needs an explicit tool). Removed by FETCH_URL_ENABLED=false.
+	// An MCP server exporting its own fetch_url wins: the built-in would only
+	// shadow it (duplicate names in the tool list, calls intercepted app-side)
 	const fetchUrlTool = getFetchUrlTool();
-	if (fetchUrlTool) {
+	if (fetchUrlTool && !tools.some((tool) => tool.name === fetchUrlTool.name)) {
 		tools.push(fetchUrlTool);
 	}
 

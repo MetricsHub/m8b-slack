@@ -3,10 +3,11 @@
  *
  * The conversion itself is Turndown (with the GFM plugin for tables and
  * strikethrough). What this module adds is the part specific to feeding a
- * language model: a pre-pass that drops page furniture (scripts, styles,
- * navigation, footers, asides — nested ones included, on broken markup too)
- * and narrows the document to its main content region, link/image resolution
- * against the page URL, and a compact list/whitespace style.
+ * language model: narrowing the document to its main content region, dropping
+ * page furniture (scripts, styles, navigation, footers, asides) in the DOM,
+ * link/image resolution against the page URL, and a compact list/whitespace
+ * style. Pages are attacker-controlled: every pass here is linear in the page
+ * size, and a DOM failure (pathological nesting) degrades to a tag strip.
  */
 
 import gfmPlugin from "@joplin/turndown-plugin-gfm";
@@ -26,6 +27,7 @@ const DROP_ELEMENTS = [
 	"video",
 	"audio",
 	"head",
+	"title",
 	"nav",
 	"footer",
 	"aside",
@@ -108,35 +110,92 @@ function safeFromCodePoint(code) {
 }
 
 /**
- * Remove every occurrence of an element, nested instances included. Innermost
- * matches go first so `<nav>…<nav>…</nav>…</nav>` disappears entirely.
+ * Narrow the document to the region worth reading: a single <main>, else a
+ * single <article>, else the <body>, else everything. Plain index scans only:
+ * linear in the page size whatever the nesting depth (the page is
+ * attacker-controlled; noise elements are removed later, in the DOM).
  */
-function dropElement(html, tag) {
-	const pattern = new RegExp(`<${tag}\\b(?:(?!<${tag}\\b)[\\s\\S])*?</${tag}\\s*>`, "gi");
-	let previous;
-	let current = html;
-	do {
-		previous = current;
-		current = current.replace(pattern, " ");
-	} while (current !== previous);
-	// Unterminated opening tag: drop to the end (a broken page is still noise)
-	return current.replace(new RegExp(`<${tag}\\b[\\s\\S]*$`, "i"), " ");
+function selectContentRegion(html) {
+	const lower = html.toLowerCase();
+	for (const tag of ["main", "article"]) {
+		const opens = html.match(new RegExp(`<${tag}\\b`, "gi"));
+		if (!opens || opens.length !== 1) continue;
+		const start = lower.indexOf(`<${tag}`);
+		const end = lower.lastIndexOf(`</${tag}`);
+		const region = end > start ? html.slice(start, end) : html.slice(start);
+		if (region.replace(/<[^>]+>/g, "").trim().length > 200) return region;
+	}
+	const bodyStart = lower.indexOf("<body");
+	if (bodyStart === -1) return html;
+	const bodyEnd = lower.lastIndexOf("</body");
+	return bodyEnd > bodyStart ? html.slice(bodyStart, bodyEnd) : html.slice(bodyStart);
 }
 
 /**
- * Pick the content region worth reading: a single <main>, else a single
- * <article>, else the <body>, else the whole document.
+ * Deepest element nesting the DOM route accepts. The HTML tree builder walks
+ * the open-element stack per tag (quadratic in depth) and Turndown recurses
+ * per level; browsers cap the DOM at a few hundred levels for the same
+ * reason. Real pages sit far below this; only hostile ones exceed it.
  */
-function selectContentRegion(html) {
-	for (const tag of ["main", "article"]) {
-		const pattern = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}\\s*>`, "gi");
-		const matches = [...html.matchAll(pattern)];
-		if (matches.length === 1 && matches[0][1].replace(/<[^>]+>/g, "").trim().length > 200) {
-			return matches[0][1];
+const MAX_DOM_DEPTH = 512;
+
+/** Elements that never have a closing tag */
+const VOID_ELEMENTS = new Set([
+	"area",
+	"base",
+	"br",
+	"col",
+	"embed",
+	"hr",
+	"img",
+	"input",
+	"link",
+	"meta",
+	"param",
+	"source",
+	"track",
+	"wbr",
+]);
+
+/**
+ * Estimate the maximum element nesting depth with a single linear tag scan
+ * (no parsing: an upper bound is all that is needed to refuse hostile input).
+ */
+function estimateMaxNestingDepth(html) {
+	let depth = 0;
+	let max = 0;
+	const tags = /<(\/?)([a-z][a-z0-9-]*)[^>]*?(\/?)>/gi;
+	for (const match of html.matchAll(tags)) {
+		const [, closing, name, selfClosing] = match;
+		if (closing) {
+			depth = Math.max(0, depth - 1);
+		} else if (!selfClosing && !VOID_ELEMENTS.has(name.toLowerCase())) {
+			depth++;
+			if (depth > max) {
+				max = depth;
+				if (max > MAX_DOM_DEPTH) return max;
+			}
 		}
 	}
-	const body = html.match(/<body\b[^>]*>([\s\S]*?)(?:<\/body\s*>|$)/i);
-	return body ? body[1] : html;
+	return max;
+}
+
+/**
+ * Last-resort conversion when the DOM route is refused (hostile nesting
+ * depth) or fails (parser error, stack exhaustion): strip tags, keep the
+ * text. Linear; navigation/footer content is not removed in this mode.
+ */
+function stripTagsFallback(html) {
+	return decodeHtmlEntities(
+		html
+			.replace(/<(script|style|noscript|template|svg)\b[\s\S]*?<\/\1\s*>/gi, " ")
+			.replace(/<\/(?:p|div|li|h[1-6]|tr|br|section|article)\b[^>]*>|<br\b[^>]*>/gi, "\n")
+			.replace(/<[^>]+>/g, " ")
+	)
+		.replace(/[ \t\r\f\v]+/g, " ")
+		.replace(/ *\n */g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
 }
 
 /**
@@ -224,15 +283,25 @@ export function htmlToMarkdown(html, { baseUrl } = {}) {
 	let source = String(html ?? "");
 	if (!source.trim()) return "";
 
-	// Pre-pass: comments, page furniture (nested-safe, tolerant of unterminated
-	// tags), then the main content region
-	source = source.replace(/<!--[\s\S]*?-->/g, " ").replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " ");
-	for (const tag of DROP_ELEMENTS) {
-		source = dropElement(source, tag);
-	}
+	// Region first (linear string scan), then a real HTML parse: the DOM handles
+	// comments, broken markup and unterminated tags; DROP_ELEMENTS are removed
+	// as nodes, whatever their nesting
 	source = selectContentRegion(source);
 
-	let markdown = createConverter(baseUrl).turndown(source);
+	// Hostile nesting depth: the parser's cost grows quadratically with it and
+	// the converter recurses per level. Refuse the DOM route up front.
+	if (estimateMaxNestingDepth(source) > MAX_DOM_DEPTH) {
+		return stripTagsFallback(source);
+	}
+
+	let markdown;
+	try {
+		markdown = createConverter(baseUrl).turndown(source);
+	} catch {
+		// Parser failure or stack exhaustion on input the estimate let through:
+		// degrade to plain text rather than fail the whole read
+		return stripTagsFallback(source);
+	}
 
 	// Post-pass: compact list markers (Turndown pads them to a 4-column
 	// indent), punctuation glued back to the word it follows, no runs of
