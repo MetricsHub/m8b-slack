@@ -2,7 +2,7 @@
  * Tool definitions for OpenAI function calling.
  */
 
-import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
+import { getMcpServerCount, getOpenAiFunctionTools, isHostRoutedMcpTool } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
 import { getFetchUrlTool, isFetchUrlEnabled } from "../services/fetch-url.js";
 import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
@@ -203,8 +203,16 @@ export function buildFunctionToolsArray({
 	// An MCP server exporting its own fetch_url wins: the built-in would only
 	// shadow it (duplicate names in the tool list, calls intercepted app-side)
 	const fetchUrlTool = getFetchUrlTool();
-	if (fetchUrlTool && !tools.some((tool) => tool.name === fetchUrlTool.name)) {
-		tools.push(fetchUrlTool);
+	if (fetchUrlTool) {
+		// An MCP fetch_url can only be driven through this bot when it declares a
+		// host-routing argument (every MCP call is routed to an agent by host key).
+		// A URL-only MCP reader is unusable here: the built-in wins and the MCP
+		// definition is dropped so the model never sees two of them.
+		if (!isHostRoutedMcpTool("fetch_url")) {
+			const kept = tools.filter((tool) => tool.name !== "fetch_url");
+			tools.length = 0;
+			tools.push(...kept, fetchUrlTool);
+		}
 	} else if (!isFetchUrlEnabled()) {
 		// The switch removes page reading entirely, an MCP-provided reader
 		// included (it may reach internal URLs, and the prompt's fetched-content

@@ -340,6 +340,54 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><p>A</p><!-- never closed <p>B</p></body>")).toBe("A");
 	});
 
+	it("respects scope boundaries: an end tag below an open <object> is ignored", () => {
+		// The parser keeps both elements open per repetition; the estimate must too
+		const page = `<body>${"<div><object></div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary tables (td/th are boundaries too) still convert on the DOM route
+		const table = htmlToMarkdown(
+			"<body><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></body>"
+		);
+		expect(table).toMatch(/\| 1 +\| 2 +\|/);
+	});
+
+	it("consumes the complete tag name, underscores included", () => {
+		// "<x_y>" is the element x_y: each "</x>" is unmatched and the chain nests
+		const page = `<body>${"<x_y></x>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("finds raw-text closers without a length-changing lowercase copy", () => {
+		// "İ" lowercases to two code units: an index from a lowercased copy would drift
+		const page = `<body><script>${"İ".repeat(5000)}</script>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Case-insensitive closer, on the original indices
+		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
+	});
+
+	it("skips <base> elements without href when looking for the document base", () => {
+		const page = `<html><head><base target="_blank"><base href="/docs/v2/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/index.html" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs/v2/guide)");
+	});
+
+	it("leaves blank lines inside fenced code blocks untouched", () => {
+		const page =
+			"<body><p>Intro</p><pre><code>line 1\n\n\n\nline 5</code></pre><p>Outro</p></body>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("```\nline 1\n\n\n\nline 5\n```");
+		expect(out.startsWith("Intro\n\n```")).toBe(true);
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

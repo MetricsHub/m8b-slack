@@ -622,7 +622,12 @@ describe("transport hardening", () => {
 				{ contentType: "text/plain" }
 			),
 			"https://preamble.example.com/": response(
-				`Some preamble\n<html><body><p>${"Paragraph. ".repeat(30)}</p></body></html>`,
+				`\n<!-- generated -->\n<!DOCTYPE html><html><body><p>${"Paragraph. ".repeat(30)}</p></body></html>`,
+				{ contentType: "text/plain" }
+			),
+			// A tutorial that merely mentions markup is the plain text it claims to be
+			"https://tutorial.example.com/notes.txt": response(
+				`Step 1: open the file.\nStep 2: write <html><body>Hello</body></html> into it.\nStep 3: <script>alert(1)</script> is not allowed.`,
 				{ contentType: "text/plain" }
 			),
 		};
@@ -635,6 +640,10 @@ describe("transport hardening", () => {
 		const preamble = await run({ url: "https://preamble.example.com/" }, { routes });
 		expect(preamble.result.source).toBe("html");
 		expect(preamble.result.content).not.toContain("<html>");
+
+		const tutorial = await run({ url: "https://tutorial.example.com/notes.txt" }, { routes });
+		expect(tutorial.result.source).toBe("text");
+		expect(tutorial.result.content).toContain("<script>alert(1)</script> is not allowed");
 	});
 });
 
@@ -1085,7 +1094,7 @@ describe("GitHub", () => {
 				return notFound();
 			},
 			// The refs API lists what starts with "feature": the longest URL prefix wins
-			[`${base}/git/matching-refs/heads/feature`]: () => {
+			[`${base}/git/matching-refs/heads/feature?per_page=100`]: () => {
 				requested.push("refs");
 				return json([
 					{ ref: "refs/heads/feature" },
@@ -1099,10 +1108,20 @@ describe("GitHub", () => {
 			},
 			// Five-segment branch name: no cap on the number of slashes
 			[`${base}/contents/alice/features/new/ui/README.md?ref=users`]: notFound(),
-			[`${base}/git/matching-refs/heads/users`]: json([
+			// The matching ref sits on the SECOND page of the refs listing
+			[`${base}/git/matching-refs/heads/users?per_page=100`]: response(
+				JSON.stringify([{ ref: "refs/heads/users/alice" }, { ref: "refs/heads/users/bob" }]),
+				{
+					contentType: "application/json",
+					headers: {
+						link: `<${base}/git/matching-refs/heads/users?per_page=100&page=2>; rel="next"`,
+					},
+				}
+			),
+			[`${base}/git/matching-refs/heads/users?per_page=100&page=2`]: json([
 				{ ref: "refs/heads/users/alice/features/new/ui" },
 			]),
-			[`${base}/git/matching-refs/tags/users`]: json([]),
+			[`${base}/git/matching-refs/tags/users?per_page=100`]: json([]),
 			[`${base}/contents/README.md?ref=users%2Falice%2Ffeatures%2Fnew%2Fui`]: response(
 				"# Deep ref",
 				{

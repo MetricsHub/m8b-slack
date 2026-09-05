@@ -165,14 +165,9 @@ const IMPLICIT_CLOSERS = {
 	tfoot: ["td", "th", "tr", "tbody", "thead", "tfoot"],
 };
 
-function isTagNameChar(code) {
-	return (
-		(code >= 97 && code <= 122) || // a-z
-		(code >= 65 && code <= 90) || // A-Z
-		(code >= 48 && code <= 57) || // 0-9
-		code === 45 || // -
-		code === 58 // :
-	);
+/** Characters that end a tag name in the HTML tokenizer: ASCII whitespace, "/", ">", NUL */
+function isTagNameTerminator(code) {
+	return code === 32 || (code >= 9 && code <= 13) || code === 47 || code === 62 || code === 0;
 }
 
 /**
@@ -190,7 +185,6 @@ function isTagNameChar(code) {
  */
 function tokenizeHtml(html, onTag, onText) {
 	const length = html.length;
-	let lower = null; // lowercased copy, built once, only when a raw-text element shows up
 	let pos = 0;
 	// Cache: no ">" exists in [nextGtFrom, nextGt); nextGt === -1 means none at all
 	// after nextGtFrom. A query inside that span is answered without scanning, and
@@ -234,8 +228,10 @@ function tokenizeHtml(html, onTag, onText) {
 			pos = lt + 1;
 			continue;
 		}
+		// Tag name state: everything up to ASCII whitespace, "/", ">" or NUL is
+		// the name ("<x_y>" is the element x_y, not x)
 		let nameEnd = nameStart + 1;
-		while (nameEnd < length && isTagNameChar(html.charCodeAt(nameEnd))) nameEnd++;
+		while (nameEnd < length && !isTagNameTerminator(html.charCodeAt(nameEnd))) nameEnd++;
 
 		// The tag ends at the first ">" outside a quoted attribute value (a ">"
 		// inside title="...>..." does not end the tag, as in the HTML tokenizer).
@@ -258,20 +254,7 @@ function tokenizeHtml(html, onTag, onText) {
 			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
 			// a script is script text, as in the HTML tokenizer. Each miss resumes
 			// past the previous candidate, so the search stays linear.
-			if (lower === null) lower = html.toLowerCase();
-			let close = lower.indexOf(`</${name}`, pos);
-			while (close !== -1) {
-				const after = lower.charCodeAt(close + 2 + name.length);
-				if (
-					Number.isNaN(after) ||
-					after === 62 ||
-					after === 47 ||
-					after === 32 ||
-					(after >= 9 && after <= 13)
-				)
-					break;
-				close = lower.indexOf(`</${name}`, close + 1);
-			}
+			const close = findRawTextCloser(html, name, pos);
 			const bodyEnd = close === -1 ? length : close;
 			if (RCDATA_ELEMENTS.has(name) && bodyEnd > pos) {
 				if (onText(html.slice(pos, bodyEnd)) === false) return;
@@ -290,6 +273,38 @@ function tokenizeHtml(html, onTag, onText) {
 			if (onTag(closer) === false) return;
 			pos = closeEnd;
 		}
+	}
+}
+
+/**
+ * Index of the "</name" closer of a raw-text element, searched from `from`
+ * with an ASCII case-insensitive comparison on the original string (no
+ * lowercased copy: lowercasing can change string length — "İ" becomes two
+ * code units — and shift every index). The closer must be followed by ">",
+ * "/", whitespace or the end of input. Each "</" is examined once.
+ *
+ * @returns {number} Index of "</", or -1
+ */
+function findRawTextCloser(html, name, from) {
+	const length = html.length;
+	let search = from;
+	for (;;) {
+		const lt = html.indexOf("</", search);
+		if (lt === -1) return -1;
+		let matches = true;
+		for (let i = 0; i < name.length; i++) {
+			let code = html.charCodeAt(lt + 2 + i);
+			if (code >= 65 && code <= 90) code += 32; // ASCII upper → lower
+			if (code !== name.charCodeAt(i)) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) {
+			const after = lt + 2 + name.length;
+			if (after >= length || isTagNameTerminator(html.charCodeAt(after))) return lt;
+		}
+		search = lt + 2;
 	}
 }
 
@@ -522,7 +537,18 @@ function estimateNesting(html) {
 				}
 			}
 			if (closing) {
-				const index = stack.lastIndexOf(name);
+				// Pop to the matching open element, unless a scope boundary (object,
+				// table, td, template, ...) sits above it: the parser then ignores
+				// the end tag and everything stays open. The stack is capped, so this
+				// walk is bounded.
+				let index = -1;
+				for (let i = stack.length - 1; i >= 0; i--) {
+					if (stack[i] === name) {
+						index = i;
+						break;
+					}
+					if (SCOPE_BOUNDARY.has(stack[i])) break;
+				}
 				if (index !== -1) {
 					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;
 					stack.length = index;
@@ -562,6 +588,24 @@ function estimateNesting(html) {
  * indentation of all its ancestors, so a small page could expand a lot.
  */
 const PREFIXING = new Set(["ul", "ol", "blockquote"]);
+
+/**
+ * Elements that bound "has an element in scope" in the HTML parser: an end
+ * tag whose element sits below one of these on the stack is ignored (so
+ * `<div><object></div>` keeps both open and keeps nesting).
+ */
+const SCOPE_BOUNDARY = new Set([
+	"applet",
+	"caption",
+	"html",
+	"table",
+	"td",
+	"th",
+	"marquee",
+	"object",
+	"template",
+	"select",
+]);
 
 /**
  * Elements inside svg/math whose children the HTML parser builds as HTML
@@ -761,15 +805,17 @@ function documentBaseUrl(html, responseUrl) {
 		html,
 		({ name, closing, attrs }) => {
 			if (name === "base" && !closing) {
+				// A <base> without href (target only) does not count: keep looking
 				const href = attributeValue(attrs, "href");
-				if (href && !/^(?:javascript|data|vbscript):/i.test(href.trim())) {
+				if (href === null) return true;
+				if (!/^(?:javascript|data|vbscript):/i.test(href.trim())) {
 					try {
 						base = responseUrl ? new URL(href.trim(), responseUrl).toString() : href.trim();
 					} catch {
 						// Malformed base: keep the response URL
 					}
 				}
-				return false;
+				return false; // the first <base href> wins, as in browsers
 			}
 			// <base> belongs in <head>: past it (or into the body) there is none
 			return !((name === "head" && closing) || name === "body");
@@ -927,5 +973,7 @@ function tidyMarkdown(markdown) {
 		else prose.push(line);
 	}
 	flush();
-	return out.join("\n").replace(/\n{3,}/g, "\n\n");
+	// No normalization over the recombined text: blank lines inside fenced
+	// code blocks are content (prose segments were normalized in flush)
+	return out.join("\n");
 }

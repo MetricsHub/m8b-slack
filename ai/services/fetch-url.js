@@ -977,10 +977,15 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	const contentType = type || "text/plain";
 
 	// One HTML predicate for every branch: declared HTML, or an untyped /
-	// text/plain body that is really markup (misconfigured servers)
+	// text/plain body that STARTS like an HTML document (misconfigured servers).
+	// Only the leading structure counts: a tutorial or source file that merely
+	// contains "<html>" somewhere is the plain text it claims to be
 	const looksHtml =
 		HTML_TYPES.has(type) ||
-		((!type || type === "text/plain") && /^\s*<(?:!doctype|html)\b|<html\b|<body\b/i.test(body));
+		((!type || type === "text/plain") &&
+			/^\s*(?:<!--[\s\S]*?-->\s*)?<(?:!doctype\s+html|html|head|body)\b/i.test(
+				body.slice(0, 4096)
+			));
 
 	// 1. The server answered our Accept header with Markdown or plain text
 	if (MARKDOWN_TYPES.has(type) || (type === "text/plain" && !looksHtml)) {
@@ -1455,8 +1460,12 @@ async function resolveGitHubRefSegments(base, segments, runtime) {
 	const names = [];
 	for (const kind of ["heads", "tags"]) {
 		try {
-			const refs = await githubApi(`${base}/git/matching-refs/${kind}/${prefix}`, runtime);
-			for (const entry of Array.isArray(refs) ? refs : []) {
+			// Paginated like every other list: a busy prefix can span several pages
+			const { items: refs } = await githubList(
+				`${base}/git/matching-refs/${kind}/${prefix}?per_page=${GITHUB_PAGE_SIZE}`,
+				runtime
+			);
+			for (const entry of refs) {
 				const name = String(entry?.ref || "").replace(new RegExp(`^refs/${kind}/`), "");
 				if (name) names.push(name);
 			}

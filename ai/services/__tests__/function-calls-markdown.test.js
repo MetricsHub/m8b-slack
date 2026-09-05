@@ -46,6 +46,7 @@ jest.unstable_mockModule("../../mcp_registry.js", () => ({
 	getOpenAiFunctionTools: () => [{ name: "GetMetricsFromCacheForHost" }],
 	executeMcpFunctionCall: jest.fn(async () => makeTelemetryResult()),
 	getMcpServers: () => [],
+	isHostRoutedMcpTool: () => false,
 	refreshHostsForServer: jest.fn(async () => ({ ok: true })),
 }));
 

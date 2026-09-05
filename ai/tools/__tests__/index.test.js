@@ -212,10 +212,11 @@ describe("buildToolsArray", () => {
 						"fetch_url",
 						{
 							description: "Agent-side page reader with internal access.",
+							// Host-routed like every MCP tool here: it CAN be driven through the bot
 							inputSchema: {
 								type: "object",
-								properties: { url: { type: "string" } },
-								required: ["url"],
+								properties: { url: { type: "string" }, hosts: { type: "array" } },
+								required: ["url", "hosts"],
 							},
 						},
 					],
@@ -227,6 +228,45 @@ describe("buildToolsArray", () => {
 			const readers = tools.filter((t) => t.name === "fetch_url");
 			expect(readers).toHaveLength(1);
 			expect(readers[0].description).toContain("Agent-side page reader");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("keeps the built-in reader when an MCP fetch_url is URL-only (not host-routed)", () => {
+		// Every MCP call is routed to an agent by host key: a reader without a host
+		// argument cannot be driven through this bot, so it must not shadow the built-in
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "URL-only reader.",
+							inputSchema: {
+								type: "object",
+								properties: { url: { type: "string" } },
+								required: ["url"],
+							},
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			const readers = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).filter(
+				(t) => t.name === "fetch_url"
+			);
+			expect(readers).toHaveLength(1);
+			expect(readers[0].description).not.toContain("URL-only reader");
+			expect(readers[0].parameters.required).toEqual(["url"]);
 		} finally {
 			_setServersForTests([]);
 			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;

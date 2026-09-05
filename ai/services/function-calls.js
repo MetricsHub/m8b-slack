@@ -6,7 +6,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeMcpFunctionCall, getOpenAiFunctionTools } from "../mcp_registry.js";
+import {
+	executeMcpFunctionCall,
+	getOpenAiFunctionTools,
+	isHostRoutedMcpTool,
+} from "../mcp_registry.js";
 import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
@@ -167,8 +171,11 @@ export async function processFunctionCall(functionCall, context) {
 				output = await executeWithMiddleware(
 					name,
 					args,
+					// An MCP fetch_url takes over only when it is host-routed like every
+					// other MCP tool here; a URL-only MCP reader cannot be driven through
+					// this bot, so the built-in serves the call
 					async (_name, cleanArgs) =>
-						getOpenAiFunctionTools().some((tool) => tool.name === "fetch_url")
+						isHostRoutedMcpTool("fetch_url")
 							? handleMcpFunctionCall(_name, cleanArgs, logger)
 							: executeFetchUrl(cleanArgs, logger),
 					middlewareOptions

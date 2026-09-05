@@ -393,6 +393,25 @@ export function getMcpServerCount() {
 }
 
 /**
+ * Whether an MCP tool of that name is exported by a registered server AND
+ * declares a host-routing argument of its own (hosts / hostname / host).
+ * Every MCP call is routed to an agent by host key, so a tool without one
+ * cannot be driven through this bot at all.
+ *
+ * @param {string} name - Tool name
+ * @returns {boolean}
+ */
+export function isHostRoutedMcpTool(name) {
+	for (const server of state.servers) {
+		const def = server.tools?.get?.(name);
+		if (!def) continue;
+		const props = def?.inputSchema?.properties;
+		return Boolean(props && ("hosts" in props || "hostname" in props || "host" in props));
+	}
+	return false;
+}
+
+/**
  * Return the registered MetricsHub agents (connection settings only, no
  * client/tool state). Used by the REST API client (ai/services/metricshub-api.js)
  * which talks to the same agents on the same origin with the same token.
