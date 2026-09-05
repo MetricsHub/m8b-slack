@@ -422,6 +422,39 @@ function hasHostRoutingParam(def) {
 	return Boolean(props && ("hosts" in props || "hostname" in props || "host" in props));
 }
 
+/** Arguments the router fills in itself: never "missing" on the caller's side */
+const ROUTING_FIELDS = new Set(["hosts", "host", "hostname", "hostnames"]);
+
+/**
+ * Why `name` cannot be called on `server` with these arguments, or null when
+ * it can. The schema the model saw is ONE server's (the host-routed definition
+ * wins the deduplication); with mixed agent versions another server may not
+ * export the tool at all, export it without a host-routing argument, or
+ * require arguments the advertised schema does not know. Such a call is
+ * refused for that server's hosts with an explanation instead of being sent
+ * to an implementation that would reject or misread it.
+ *
+ * @param {{server_label: string, tools: Map<string, any>}} server - Destination server
+ * @param {string} name - Tool name
+ * @param {Object} args - Call arguments
+ * @returns {string|null}
+ */
+function toolIncompatibility(server, name, args) {
+	const def = server.tools?.get?.(name);
+	if (!def) return `Agent ${server.server_label} does not provide the tool ${name}`;
+	if (!hasHostRoutingParam(def)) {
+		return `Agent ${server.server_label} exports a version of ${name} without a host argument, which cannot be routed by host`;
+	}
+	const required = Array.isArray(def.inputSchema?.required) ? def.inputSchema.required : [];
+	const missing = required.filter(
+		(field) => !ROUTING_FIELDS.has(field) && (args?.[field] === undefined || args?.[field] === null)
+	);
+	if (missing.length > 0) {
+		return `Agent ${server.server_label}'s version of ${name} requires ${missing.join(", ")}, which the call did not provide`;
+	}
+	return null;
+}
+
 /**
  * Return the registered MetricsHub agents (connection settings only, no
  * client/tool state). Used by the REST API client (ai/services/metricshub-api.js)
@@ -734,6 +767,15 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 				ok: false,
 				error: "Failed to connect to MCP server",
 			});
+			continue;
+		}
+
+		// The tool as THIS server exports it (its tool list is fresh after the
+		// connection check) must accept the call built from the advertised schema
+		const incompatible = toolIncompatibility(server, name, args);
+		if (incompatible) {
+			console.log(`[MCP] Tool '${name}' not sent to ${server.server_label}: ${incompatible}`);
+			results.push({ server_label: server.server_label, ok: false, error: incompatible });
 			continue;
 		}
 

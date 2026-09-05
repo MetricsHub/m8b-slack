@@ -1419,6 +1419,78 @@ describe("GitHub", () => {
 		}
 	});
 
+	it("resolves slash-containing refs for public blobs once the raw URL 404s", async () => {
+		const requested = [];
+		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });
+		const api = "https://api.github.com/repos/acme/tool";
+		const routes = {
+			// The single-segment split is tried first on the raw host (no API budget spent)
+			"https://raw.githubusercontent.com/acme/tool/feature/foo/docs/guide.md": () => {
+				requested.push("raw");
+				return notFound();
+			},
+			// Then the refs API, anonymously: the longest matching branch or tag wins
+			[`${api}/git/matching-refs/heads/feature?per_page=100`]: (init) => {
+				requested.push("refs");
+				expect(init.headers.Authorization).toBeUndefined();
+				return json([{ ref: "refs/heads/feature" }, { ref: "refs/heads/feature/foo" }]);
+			},
+			[`${api}/git/matching-refs/tags/feature?per_page=100`]: json([]),
+			// ...and the file is re-read under the explicit refs/heads form
+			"https://raw.githubusercontent.com/acme/tool/refs/heads/feature/foo/docs/guide.md": () => {
+				requested.push("retry");
+				return response("# On feature/foo", { contentType: "text/plain" });
+			},
+		};
+		const config = { allowedHosts: ["github.com"] };
+		const url = "https://github.com/acme/tool/blob/feature/foo/docs/guide.md";
+		const { result } = await run({ url }, { routes, config });
+		expect(requested).toEqual(["raw", "refs", "retry"]);
+		expect(result).toMatchObject({
+			ok: true,
+			source: "text",
+			url,
+			finalUrl: "https://raw.githubusercontent.com/acme/tool/refs/heads/feature/foo/docs/guide.md",
+			content: "# On feature/foo",
+		});
+
+		// A tag with a slash is read the same way, under refs/tags
+		const tagged = await run(
+			{ url: "https://github.com/acme/tool/blob/release/v2/README.md" },
+			{
+				routes: {
+					[`${api}/git/matching-refs/heads/release?per_page=100`]: json([]),
+					[`${api}/git/matching-refs/tags/release?per_page=100`]: json([
+						{ ref: "refs/tags/release/v2" },
+					]),
+					"https://raw.githubusercontent.com/acme/tool/refs/tags/release/v2/README.md": response(
+						"# v2",
+						{ contentType: "text/plain" }
+					),
+				},
+				config,
+			}
+		);
+		expect(tagged.result).toMatchObject({ ok: true, content: "# v2" });
+
+		// The refs API cannot answer (anonymous rate limit): the original 404 stands
+		const limited = await run(
+			{ url },
+			{
+				routes: {
+					[`${api}/git/matching-refs/heads/feature?per_page=100`]: response("", {
+						status: 403,
+						contentType: "application/json",
+						headers: { "x-ratelimit-remaining": "0" },
+					}),
+				},
+				config,
+			}
+		);
+		expect(limited.result.ok).toBe(false);
+		expect(limited.result.error).toContain("HTTP 404");
+	});
+
 	it("decodes token-scoped UTF-16 blobs through the BOM-aware decoder", async () => {
 		const utf16 = Buffer.concat([
 			Buffer.from([0xff, 0xfe]),

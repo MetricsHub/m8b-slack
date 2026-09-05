@@ -433,6 +433,12 @@ describe("htmlToMarkdown", () => {
 		const page = `<html><head><base href="/docs&amp;api/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
 		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" });
 		expect(out).toContain("[Guide](https://docs.example.com/docs&api/guide)");
+		// The complete named set, as the parser decodes it: "&colon;" is ":" and the
+		// base is absolute, so links resolve against it, not the response origin
+		const named = `<html><head><base href="https&colon;//cdn.example/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(named, { baseUrl: "https://docs.example.com/" })).toContain(
+			"[Guide](https://cdn.example/docs/guide)"
+		);
 	});
 
 	it("accounts for the adoption agency on formatting end tags", () => {
@@ -717,7 +723,16 @@ describe("decodeHtmlEntities", () => {
 	it("decodes named, decimal and hexadecimal references", () => {
 		expect(
 			decodeHtmlEntities("&lt;a&gt; &amp; &quot;b&quot; &#39;c&#39; &#x41;&#66; &nbsp;x")
-		).toBe("<a> & \"b\" 'c' AB  x");
+		).toBe("<a> & \"b\" 'c' AB \u00a0x");
+	});
+
+	it("decodes the complete HTML named reference set with the parser's rules", () => {
+		// Names outside any small table, and the legacy semicolon-less forms
+		expect(decodeHtmlEntities("https&colon;//x/&hellip; &Aacute;&eacute; &amp&lt;b>")).toBe(
+			"https://x/… Áé &<b>"
+		);
+		// Quotes and markup-looking text inside the input are never interpreted
+		expect(decodeHtmlEntities('say "hi" <b>&amp;</b> &quot;')).toBe('say "hi" <b>&</b> "');
 	});
 
 	it("leaves unknown references untouched", () => {

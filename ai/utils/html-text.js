@@ -11,6 +11,8 @@
  */
 
 import gfmPlugin from "@joplin/turndown-plugin-gfm";
+// @ts-expect-error domino ships global-style typings that tsc cannot import as a module
+import domino from "@mixmark-io/domino";
 import TurndownService from "turndown";
 
 /** Elements whose entire content is noise for a reader */
@@ -83,7 +85,27 @@ const NAMED_ENTITIES = {
  * @returns {string} Decoded text
  */
 export function decodeHtmlEntities(text) {
-	return String(text ?? "").replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, ref) => {
+	const source = String(text ?? "");
+	if (!source.includes("&")) return source;
+	// The HTML parser's complete rules (every named reference, legacy
+	// semicolon-less forms, numeric overrides): the text is parsed as a quoted
+	// attribute value — its own quotes escaped — so nothing in it can be read as
+	// markup, and the decoded value is read back. Linear in the text length.
+	try {
+		const doc = domino.createDocument(
+			`<!DOCTYPE html><html><head><meta name="m8b" content="${source.replace(/"/g, "&quot;")}"></head></html>`
+		);
+		const decoded = doc.querySelector('meta[name="m8b"]')?.getAttribute("content");
+		if (typeof decoded === "string") return decoded;
+	} catch {
+		// Parser failure: the small table below still covers the common references
+	}
+	return decodeWithTable(source);
+}
+
+/** Table-driven fallback decoder (the common references only) */
+function decodeWithTable(text) {
+	return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, ref) => {
 		const lower = ref.toLowerCase();
 		if (lower.startsWith("#x")) {
 			const code = Number.parseInt(lower.slice(2), 16);

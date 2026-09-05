@@ -1066,7 +1066,8 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 			`HTTP ${response.status} from ${finalUrl.hostname}`,
 			response.status === 401 || response.status === 403
 				? "The page requires authentication the bot does not have."
-				: undefined
+				: undefined,
+			response.status
 		);
 	}
 
@@ -1535,22 +1536,49 @@ async function readGitHubItem(target, requestedUrl, runtime) {
  * stays confined to api.github.com and private files are readable.
  */
 async function readGitHubBlob(target, requestedUrl, runtime) {
+	// A blob URL does not say where the ref ends and the path starts
+	// ("/blob/feature/foo/docs/guide.md" may be branch "feature/foo"). The refs
+	// API lists the branches and tags starting with the first segment and the
+	// longest one matching the URL wins; any number of slashes in a ref.
+	const segments = target.segments || [target.ref, ...target.path.split("/")];
+	const base = `/repos/${target.owner}/${target.repo}`;
+
 	if (!githubTokenInScope(runtime, target.owner, target.repo)) {
 		// The raw host is derived from an already policy-checked github.com URL:
 		// exempt from the allow list, still subject to the block list
-		const result = await readWebPage(new URL(target.rawUrl), runtime, { derivedHost: true });
-		result.url = requestedUrl;
-		return result;
+		const readRaw = async (url) => {
+			const result = await readWebPage(new URL(url), runtime, { derivedHost: true });
+			result.url = requestedUrl;
+			return result;
+		};
+		try {
+			return await readRaw(target.rawUrl);
+		} catch (e) {
+			// The single-segment split (the common case) does not exist: the branch
+			// or tag may contain a slash. The refs API is asked anonymously — only
+			// now, since the anonymous budget is 60 requests an hour per address —
+			// and the file re-read under the explicit refs/heads|tags form that
+			// raw.githubusercontent.com accepts. When the API cannot answer (rate
+			// limit, outage), the original 404 stands.
+			if (!(e instanceof FetchUrlError && e.status === 404) || segments.length < 3) throw e;
+			const resolved = await resolveGitHubRefSegments(base, segments, runtime).catch((error) => {
+				const reason = error instanceof FetchUrlError ? error.message : "unexpected error";
+				runtime.logger?.warn?.(`[FETCH_URL] GitHub refs could not be listed: ${reason}`);
+				return null;
+			});
+			if (!resolved) throw e;
+			const ref = segments.slice(0, resolved.refSegments).join("/");
+			const path = segments.slice(resolved.refSegments).join("/");
+			runtime.logger?.info?.(`[FETCH_URL] GitHub blob ref resolved to ${resolved.kind} ${ref}`);
+			return await readRaw(
+				`https://raw.githubusercontent.com/${target.owner}/${target.repo}/refs/${resolved.kind}/${ref}/${path}`
+			);
+		}
 	}
 
-	// A blob URL does not say where the ref ends and the path starts
-	// ("/blob/feature/foo/docs/guide.md" may be branch "feature/foo"). The
-	// single-segment split is tried first (branch, tag or SHA: the common case);
-	// when it does not exist, the refs API lists the branches and tags starting
-	// with that first segment and the longest one matching the URL wins. Any
-	// number of slashes in a ref, at most four requests.
-	const segments = target.segments || [target.ref, ...target.path.split("/")];
-	const base = `/repos/${target.owner}/${target.repo}`;
+	// With the token: the single-segment split (branch, tag or SHA) is the
+	// fallback; the refs API is consulted first when the URL could name a
+	// multi-segment ref. At most four requests.
 	const encode = (parts) => parts.map((segment) => encodeURIComponent(segment)).join("/");
 	const readAt = async (refSegments) => {
 		const ref = segments.slice(0, refSegments).join("/");
@@ -1579,10 +1607,10 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 	// the longer branch even if "release" happens to contain v2/README.md too.
 	// The single-segment split remains the fallback (tags, SHAs, plain branches).
 	if (segments.length >= 3) {
-		const refSegments = await resolveGitHubRefSegments(base, segments, runtime);
-		if (refSegments !== null) {
+		const resolved = await resolveGitHubRefSegments(base, segments, runtime);
+		if (resolved !== null) {
 			try {
-				return await readAt(refSegments);
+				return await readAt(resolved.refSegments);
 			} catch (e) {
 				if (!(e instanceof FetchUrlError && e.status === 404)) throw e;
 			}
@@ -1592,9 +1620,16 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 }
 
 /**
- * Number of leading URL segments that form an existing branch or tag name
- * with at least one slash (the single-segment case is handled before), or
- * null when none matches. Uses the refs API with the first segment as prefix.
+ * The existing branch or tag whose name, with at least one slash (the
+ * single-segment case is handled separately), forms the longest prefix of the
+ * URL segments: how many segments it spans and whether it is a branch
+ * ("heads") or a tag ("tags"). Null when none matches. Uses the refs API with
+ * the first segment as prefix (anonymously when the token is out of scope).
+ *
+ * @param {string} base - "/repos/{owner}/{repo}"
+ * @param {string[]} segments - URL segments after "/blob/"
+ * @param {Object} runtime
+ * @returns {Promise<{refSegments: number, kind: "heads"|"tags"}|null>}
  */
 async function resolveGitHubRefSegments(base, segments, runtime) {
 	const prefix = encodeURIComponent(segments[0]);
@@ -1608,22 +1643,22 @@ async function resolveGitHubRefSegments(base, segments, runtime) {
 			);
 			for (const entry of refs) {
 				const name = String(entry?.ref || "").replace(new RegExp(`^refs/${kind}/`), "");
-				if (name) names.push(name);
+				if (name) names.push({ name, kind });
 			}
 		} catch (e) {
 			if (!(e instanceof FetchUrlError && e.status === 404)) throw e;
 		}
 	}
 	let best = null;
-	for (const name of names) {
+	for (const { name, kind } of names) {
 		const parts = name.split("/");
 		// The ref must be a proper prefix of the URL segments, leaving a file path
 		if (parts.length < 2 || parts.length >= segments.length) continue;
 		if (
 			parts.every((part, index) => part === segments[index]) &&
-			(best === null || parts.length > best)
+			(best === null || parts.length > best.refSegments)
 		) {
-			best = parts.length;
+			best = { refSegments: parts.length, kind: /** @type {"heads"|"tags"} */ (kind) };
 		}
 	}
 	return best;
