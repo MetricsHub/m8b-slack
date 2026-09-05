@@ -244,7 +244,7 @@ export const LOADING_MESSAGES = [
 	"First, my coffee...",
 	"Pfffff...",
 	"Okay, let's hack into the network...",
-	"Asking MetricsHub. Don't tell anyone, but I kind of like it.",
+	"Asking MetricsHub. My only friend.",
 	"Stop looking at me, freak!",
 ];
 
