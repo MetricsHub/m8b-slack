@@ -483,6 +483,42 @@ describe("htmlToMarkdown", () => {
 		expect(estimateNesting("<select><optgroup><option><hr><option>x").depth).toBe(3);
 	});
 
+	it("keeps CDATA opaque at integration points too (the current node is foreign)", () => {
+		// Inside <foreignObject> the children are HTML, but the tokenizer's CDATA
+		// rule looks at the current node's namespace, which is SVG: the fake
+		// <textarea> inside the section is text, the divs after it are live
+		const deep = "<div>".repeat(600);
+		expect(
+			estimateNesting(`<svg><foreignObject><![CDATA[x><textarea>]]></foreignObject></svg>${deep}`)
+				.depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(
+			estimateNesting(`<math><mi><![CDATA[x><textarea>]]></mi></math>${deep}`).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Below an HTML child of the integration point it is a bogus comment again, ending
+		// at the first ">": the <textarea> that follows is real RCDATA (four open elements)
+		expect(estimateNesting(`<svg><foreignObject><div><![CDATA[x><textarea>]]>${deep}`).depth).toBe(
+			4
+		);
+	});
+
+	it("hands the content of <plaintext> to text consumers", () => {
+		// The depth guard sends the page to the tag-strip fallback: the article
+		// that follows <plaintext> is text the DOM exposes, so it must survive
+		const page = `<body><p>Before</p>${"<div>".repeat(200000)}<plaintext>Actual article <text> here`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Before");
+		expect(out).toContain("Actual article <text> here");
+	});
+
+	it("does not select a MathML or SVG element named main as the content region", () => {
+		const filler = "Visible text. ".repeat(20);
+		const page = `<html><body><math><main>${filler}</main></math><p>Actual page content</p></body></html>`;
+		expect(htmlToMarkdown(page)).toContain("Actual page content");
+	});
+
 	it("keeps foreign CDATA sections opaque, as the parser does", () => {
 		// In svg/math "<![CDATA[" opens text through "]]>": the tags inside are not
 		// tokens (no breakout, no live <base>); in HTML it is a bogus comment

@@ -347,7 +347,11 @@ function tokenizeHtml(html, onTag, onText, options = {}) {
 		pos = gt + 1;
 
 		if (tag.rawText) {
-			if (name === "plaintext") return; // the rest of the document is text
+			if (name === "plaintext") {
+				// The rest of the document is text (the fallback converter shows it)
+				if (pos < length) onText(html.slice(pos));
+				return;
+			}
 			// Not markup until the matching closer (or the end of input). The closer
 			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
 			// a script is script text, as in the HTML tokenizer. Each miss resumes
@@ -727,6 +731,8 @@ function createTreeTracker() {
 	let hostile = false;
 
 	const isForeign = (i) => ns[i] !== null && !integration[i];
+	/** The current node is a foreign (svg/math) element, integration point or not */
+	const topIsForeign = () => stack.length > 0 && ns[stack.length - 1] !== null;
 	/** Namespace the next token is processed in: that of the current node */
 	const mode = () => {
 		const top = stack.length - 1;
@@ -1018,7 +1024,13 @@ function createTreeTracker() {
 	return {
 		handle,
 		/** Options for tokenizeHtml(): CDATA sections are opaque in foreign content */
-		tokenizerOptions: { inForeign: () => mode() !== "html" },
+		/**
+		 * Options for tokenizeHtml(): a CDATA section opens whenever the current
+		 * node is a foreign element — an integration point (foreignObject) INCLUDED,
+		 * its children being HTML notwithstanding: the tokenizer's rule looks at the
+		 * adjusted current node's namespace, not at the insertion mode
+		 */
+		tokenizerOptions: { inForeign: () => topIsForeign() },
 		/** Deepest nesting seen so far */
 		get depth() {
 			return depth;
@@ -1034,6 +1046,10 @@ function createTreeTracker() {
 		/** The next token is processed in foreign content (svg/math) */
 		get inForeign() {
 			return mode() !== "html";
+		},
+		/** The element just opened (the current node) is in the svg or MathML namespace */
+		get topIsForeign() {
+			return topIsForeign();
 		},
 		/** Inside a <template> (an inert fragment) */
 		get inTemplate() {
@@ -1093,7 +1109,8 @@ function selectContentRegion(html) {
 				const open = instances[name];
 				const after = tree.openCount(name);
 				for (let k = before[index]; k < after; k++) {
-					const accepted = !tree.dropped;
+					// A MathML/SVG element that happens to be named main is no region
+					const accepted = !tree.dropped && !tree.topIsForeign;
 					open.push(accepted);
 					if (accepted) {
 						mark.opens++;
@@ -1584,23 +1601,47 @@ export function startsLikeHtmlDocument(text) {
  * @param {string} head - Leading bytes of the document, decoded as latin1
  * @returns {string|null}
  */
+/**
+ * A meta-declared encoding label the decoder can use, or null: unknown labels
+ * are ignored (the prescan skips them), and a UTF-16 label is read as UTF-8 —
+ * an ASCII-readable <meta> cannot be in a UTF-16 document (the prescan's rule).
+ *
+ * @param {string|null|undefined} label
+ * @returns {string|null}
+ */
+function usableEncodingLabel(label) {
+	const trimmed = String(label ?? "").trim();
+	if (!trimmed) return null;
+	if (/^utf-?16(?:le|be)?$/i.test(trimmed)) return "utf-8";
+	try {
+		new TextDecoder(trimmed);
+		return trimmed;
+	} catch {
+		return null;
+	}
+}
+
 export function sniffMetaCharset(head) {
 	let found = null;
 	tokenizeHtml(
 		String(head ?? ""),
 		({ name, closing, attrs }) => {
 			if (closing || name !== "meta") return true;
-			const charset = attributeValue(attrs, "charset");
-			if (charset?.trim()) {
-				found = charset.trim();
+			// A label no decoder knows is skipped and the scan goes on, as the
+			// prescan does: a later usable declaration still counts
+			const charset = usableEncodingLabel(attributeValue(attrs, "charset"));
+			if (charset) {
+				found = charset;
 				return false;
 			}
 			const httpEquiv = attributeValue(attrs, "http-equiv");
 			const content = attributeValue(attrs, "content");
 			if (httpEquiv !== null && httpEquiv.trim().toLowerCase() === "content-type" && content) {
-				const inContent = content.match(/charset\s*=\s*["']?\s*([a-z0-9_-]+)/i);
+				const inContent = usableEncodingLabel(
+					content.match(/charset\s*=\s*["']?\s*([a-z0-9_-]+)/i)?.[1]
+				);
 				if (inContent) {
-					found = inContent[1];
+					found = inContent;
 					return false;
 				}
 			}

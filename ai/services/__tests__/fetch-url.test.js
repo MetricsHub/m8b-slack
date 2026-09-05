@@ -481,6 +481,27 @@ describe("limits", () => {
 		expect(result.content).toContain("Café");
 	});
 
+	it("skips meta charset labels no decoder knows and reads UTF-16 labels as UTF-8", async () => {
+		// The first declaration is unusable: the second one decides
+		const latin = Buffer.from(
+			'<html><head><meta charset="bogus"><meta charset="windows-1252"></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		// A UTF-16 label on an ASCII-readable document means UTF-8 (prescan rule)
+		const utf8 = Buffer.from(
+			'<html><head><meta charset="utf-16"></head><body><p>Café</p></body></html>',
+			"utf8"
+		);
+		const routes = {
+			"https://example.com/bogus": response(latin, { contentType: "text/html" }),
+			"https://example.com/utf16": response(utf8, { contentType: "text/html" }),
+		};
+		for (const url of ["https://example.com/bogus", "https://example.com/utf16"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.content).toContain("Café");
+		}
+	});
+
 	it("does not mistake '<!--' inside a quoted attribute for a comment when sniffing the charset", async () => {
 		// To the tokenizer the "<!--" in the title attribute is text: the meta that
 		// follows is live and the page is Windows-1252, not UTF-8
