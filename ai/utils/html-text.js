@@ -1269,7 +1269,7 @@ export function sniffMetaCharset(head) {
 /**
  * Effective base URL of a document: its first <base href> (resolved against
  * the response URL, as browsers do), else the response URL itself. One
- * tokenizer pass that stops at the first <base> or at the end of <head>.
+ * tokenizer pass that stops at the first live <base href>.
  *
  * @param {string} html - Full document
  * @param {string|undefined} responseUrl - URL the document was fetched from
@@ -1305,8 +1305,10 @@ function documentBaseUrl(html, responseUrl) {
 				}
 				return false; // the first <base href> wins, as in browsers
 			}
-			// <base> belongs in <head>: past it (or into the body) there is none
-			return !((name === "head" && closing) || name === "body");
+			// A <base> in the body still counts: the tree builder handles the start
+			// tag with the in-head rules wherever it appears, and the first <base
+			// href> in tree order sets the document base — so the scan goes on
+			return true;
 		},
 		() => undefined
 	);

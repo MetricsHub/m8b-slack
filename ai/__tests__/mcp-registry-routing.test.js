@@ -128,7 +128,8 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		const listed = byList.calls.filter((c) => c.name === "fetch_url").map((c) => c.args);
 		expect(listed).toEqual([{ url: "https://example.com/", hostnames: ["l-01", "l-02"] }]);
 
-		// A hostname the model supplied itself is kept (it may be an alias the agent knows)
+		// A hostname the model supplied itself is kept for a single-host bucket (it
+		// may be an alias the agent knows)...
 		await executeMcpFunctionCall("fetch_url", {
 			url: "https://example.com/",
 			hostname: "h-01.example.com",
@@ -138,6 +139,72 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 			url: "https://example.com/",
 			hostname: "h-01.example.com",
 		});
+		// ...but one value cannot cover several selected machines: rebuilt per host
+		const before = byName.calls.filter((c) => c.name === "fetch_url").length;
+		const multi = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			hostname: "h-01.example.com",
+			hosts: ["h-01", "h-02"],
+		});
+		expect(multi.results.filter((r) => r.ok)).toHaveLength(2);
+		expect(
+			byName.calls
+				.filter((c) => c.name === "fetch_url")
+				.slice(before)
+				.map((c) => c.args.hostname)
+		).toEqual(["h-01", "h-02"]);
+	});
+
+	it("validates every constraint of the destination schema (enum, items, nested)", async () => {
+		const constrained = fakeServer(
+			"constrained",
+			{ "c-01": host("c-01") },
+			{
+				fetch_url: {
+					description: "Summary only.",
+					inputSchema: {
+						$schema: "https://json-schema.org/draft/2020-12/schema",
+						type: "object",
+						properties: {
+							url: { type: "string" },
+							mode: { type: "string", enum: ["summary"] },
+							tags: { type: "array", items: { type: "string" } },
+							options: {
+								type: "object",
+								properties: { depth: { type: "integer" } },
+								required: ["depth"],
+							},
+							hosts: { type: "array", items: { type: "string" } },
+						},
+						required: ["url", "hosts"],
+					},
+				},
+			}
+		);
+		_setServersForTests([constrained]);
+		await refreshHostsForServer("constrained");
+		const call = (extra) =>
+			executeMcpFunctionCall("fetch_url", {
+				url: "https://example.com/",
+				hosts: ["c-01"],
+				...extra,
+			});
+
+		const enumViolation = await call({ mode: "full" });
+		expect(enumViolation.results[0].ok).toBe(false);
+		expect(enumViolation.results[0].error).toContain("mode");
+		expect(enumViolation.results[0].error).toContain("summary");
+		const itemsViolation = await call({ tags: ["a", 2] });
+		expect(itemsViolation.results[0].ok).toBe(false);
+		expect(itemsViolation.results[0].error).toContain("tags");
+		const nestedViolation = await call({ options: {} });
+		expect(nestedViolation.results[0].ok).toBe(false);
+		expect(nestedViolation.results[0].error).toContain("depth");
+		expect(constrained.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
+
+		const fits = await call({ mode: "summary", tags: ["a"], options: { depth: 1 } });
+		expect(fits.results[0]).toMatchObject({ server_label: "constrained", ok: true });
+		expect(constrained.calls.filter((c) => c.name === "fetch_url")).toHaveLength(1);
 	});
 
 	it("refuses servers whose definition rejects or retypes a supplied argument", async () => {
@@ -182,10 +249,12 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		});
 		const byServer = Object.fromEntries(out.results.map((r) => [r.server_label, r]));
 		expect(byServer.strict.ok).toBe(false);
-		expect(byServer.strict.error).toContain("does not accept mode");
+		expect(byServer.strict.error).toContain("rejects the call");
+		expect(byServer.strict.error).toContain("mode");
 		// The other agent takes unknown properties but types "limit" as an integer
 		expect(byServer.retyped.ok).toBe(false);
-		expect(byServer.retyped.error).toContain("different type for limit");
+		expect(byServer.retyped.error).toContain("rejects the call");
+		expect(byServer.retyped.error).toContain("limit");
 		expect(strict.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
 		expect(retyped.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
 
@@ -233,7 +302,8 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		expect(byServer.without.error).toContain("does not provide the tool fetch_url");
 		// "hostname" is a routing field the router fills in: only "mode" is missing
 		expect(byServer.stricter.ok).toBe(false);
-		expect(byServer.stricter.error).toContain("requires mode");
+		expect(byServer.stricter.error).toContain("rejects the call");
+		expect(byServer.stricter.error).toContain("mode");
 		expect(byServer.stricter.error).not.toContain("hostname");
 		expect(without.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
 		expect(stricter.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);

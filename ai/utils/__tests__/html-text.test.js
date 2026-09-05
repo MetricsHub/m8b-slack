@@ -380,6 +380,14 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("honours a <base href> placed after </head> or inside <body>", () => {
+		// Browsers process a base start tag with the in-head rules wherever it is
+		const page = `<html><head><title>T</title></head><body><base href="/docs/v2/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" })).toContain(
+			"[Guide](https://docs.example.com/docs/v2/guide)"
+		);
+	});
+
 	it("skips <base> elements without href when looking for the document base", () => {
 		const page = `<html><head><base target="_blank"><base href="/docs/v2/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
 		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/index.html" });

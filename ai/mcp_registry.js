@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { Ajv } from "ajv";
 
 // In-memory registry state
 const state = {
@@ -425,9 +426,6 @@ function hasHostRoutingParam(def) {
 /** Arguments the router fills in itself: never "missing" on the caller's side */
 const ROUTING_FIELDS = new Set(["hosts", "host", "hostname", "hostnames"]);
 
-/** Arguments handled app-side (routing, middleware filters): not the destination's business */
-const APP_SIDE_FIELDS = new Set([...ROUTING_FIELDS, "monitorTypes"]);
-
 /**
  * Argument sets for one destination server: the call's arguments with the
  * routing field THIS server declares filled from its bucket of host keys.
@@ -443,97 +441,120 @@ const APP_SIDE_FIELDS = new Set([...ROUTING_FIELDS, "monitorTypes"]);
  * @param {string[]} hosts - Host keys bucketed to this server
  * @returns {Object[]} One argument object per call to make
  */
+/**
+ * Argument sets for one destination server: the call's arguments with the
+ * routing field THIS server declares filled from its bucket of host keys.
+ * `hosts` (the advertised routing field) and any list-valued field
+ * (hostnames, or an array-typed hostname/host) always take the whole bucket.
+ * A single-valued field (hostname: string) gets one call per bucketed host;
+ * a value the model supplied for it is kept only when the bucket holds a
+ * single host — it may be an alias the agent knows better than the key — since
+ * one value cannot cover several machines. Routing fields the destination
+ * does not declare are dropped (an older schema with additionalProperties:
+ * false would reject them), and so is the app-side monitorTypes filter.
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Destination's tool definition
+ * @param {Object} args - Call arguments
+ * @param {string[]} hosts - Host keys bucketed to this server
+ * @returns {Object[]} One argument object per call to make
+ */
 function routedCalls(def, args, hosts) {
 	const props = def?.inputSchema?.properties || {};
 	const base = {};
 	for (const [key, value] of Object.entries(args || {})) {
+		if (key === "monitorTypes") continue;
 		if (!ROUTING_FIELDS.has(key) || key in props) base[key] = value;
 	}
 	if ("hosts" in props) return [{ ...base, hosts }];
 	const field = ["hostnames", "hostname", "host"].find((candidate) => candidate in props);
-	if (!field || (base[field] !== undefined && base[field] !== null)) return [base];
+	if (!field) return [base]; // unreachable: hasHostRoutingParam() was checked
 	const type = props[field]?.type;
 	const takesList =
 		type === "array" || (Array.isArray(type) && type.includes("array")) || field === "hostnames";
 	if (takesList) return [{ ...base, [field]: hosts }];
+	if (hosts.length === 1 && base[field] !== undefined && base[field] !== null) return [base];
 	return hosts.map((host) => ({ ...base, [field]: host }));
 }
 
 /**
- * Whether a value fits the JSON Schema `type` of a property (one type or a
- * list; no declared type means anything goes). Structural checks only.
+ * JSON Schema validator for a tool definition's input schema, compiled once
+ * per definition (strict mode off: server schemas may carry keywords or
+ * formats Ajv does not know; a "$schema" pointer is dropped so any draft
+ * compiles against the default meta-schema). Null when the schema cannot be
+ * compiled at all — the call is then sent as-is, as before this check existed.
  *
- * @param {*} value - Supplied argument
- * @param {{type?: string|string[]}|undefined} property - Property schema
- * @returns {boolean}
+ * @param {{inputSchema?: object}} def - Tool definition
+ * @returns {import("ajv").ValidateFunction|null}
  */
-function matchesSchemaType(value, property) {
-	const declared = property?.type;
-	if (!declared) return true;
-	const types = Array.isArray(declared) ? declared : [declared];
-	return types.some((type) => {
-		switch (type) {
-			case "integer":
-				return typeof value === "number" && Number.isInteger(value);
-			case "number":
-				return typeof value === "number";
-			case "array":
-				return Array.isArray(value);
-			case "null":
-				return value === null;
-			case "object":
-				return typeof value === "object" && value !== null && !Array.isArray(value);
-			default:
-				return typeof value === type; // string, boolean
-		}
-	});
+function schemaValidator(def) {
+	if (VALIDATORS.has(def)) return VALIDATORS.get(def) ?? null;
+	let validate = null;
+	try {
+		const { $schema: _draft, ...schema } = def?.inputSchema || {};
+		validate = ajv.compile(schema);
+	} catch (e) {
+		console.warn(`[MCP] Tool schema could not be compiled for validation: ${e?.message || e}`);
+	}
+	VALIDATORS.set(def, validate);
+	return validate;
+}
+
+const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
+/** @type {WeakMap<object, import("ajv").ValidateFunction|null>} */
+const VALIDATORS = new WeakMap();
+
+/**
+ * Human-readable summary of Ajv validation errors ("mode must be equal to one
+ * of the allowed values (summary); arguments must NOT have additional
+ * properties (extra)").
+ *
+ * @param {import("ajv").ErrorObject[]|null|undefined} errors
+ * @returns {string}
+ */
+function describeViolations(errors) {
+	return (errors || [])
+		.map((error) => {
+			const where = error.instancePath
+				? error.instancePath.replace(/^\//, "").replace(/\//g, ".")
+				: "arguments";
+			const params = error.params || {};
+			const detail = params.additionalProperty
+				? ` (${params.additionalProperty})`
+				: Array.isArray(params.allowedValues)
+					? ` (${params.allowedValues.join(", ")})`
+					: params.missingProperty
+						? ` (${params.missingProperty})`
+						: "";
+			return `${where} ${error.message}${detail}`;
+		})
+		.join("; ");
 }
 
 /**
- * Why `name` cannot be called on `server` with these arguments, or null when
- * it can. The schema the model saw is ONE server's (the host-routed definition
- * wins the deduplication); with mixed agent versions another server may not
- * export the tool at all, export it without a host-routing argument, or
- * require arguments the advertised schema does not know. Such a call is
- * refused for that server's hosts with an explanation instead of being sent
- * to an implementation that would reject or misread it.
+ * Why `name` cannot be sent to `server` with these (already routed)
+ * arguments, or null when it can. The schema the model saw is ONE server's
+ * (the host-routed definition wins the deduplication); with mixed agent
+ * versions another server may not export the tool at all, export it without
+ * a host-routing argument, or constrain the arguments differently (required
+ * or unknown properties, types, enums, item schemas, ...). The call built
+ * for this server is validated against ITS complete input schema, so it is
+ * refused with the validator's explanation instead of being sent to an
+ * implementation that would reject or misread it.
  *
  * @param {{server_label: string, tools: Map<string, any>}} server - Destination server
  * @param {string} name - Tool name
- * @param {Object} args - Call arguments
+ * @param {Object} callArgs - Arguments as they would be sent to this server
  * @returns {string|null}
  */
-function toolIncompatibility(server, name, args) {
+function toolIncompatibility(server, name, callArgs) {
 	const def = server.tools?.get?.(name);
 	if (!def) return `Agent ${server.server_label} does not provide the tool ${name}`;
 	if (!hasHostRoutingParam(def)) {
 		return `Agent ${server.server_label} exports a version of ${name} without a host argument, which cannot be routed by host`;
 	}
-	const required = Array.isArray(def.inputSchema?.required) ? def.inputSchema.required : [];
-	const missing = required.filter(
-		(field) => !ROUTING_FIELDS.has(field) && (args?.[field] === undefined || args?.[field] === null)
-	);
-	if (missing.length > 0) {
-		return `Agent ${server.server_label}'s version of ${name} requires ${missing.join(", ")}, which the call did not provide`;
-	}
-	// What the model supplied must exist on and fit THIS definition too: an
-	// optional property of the advertised schema may be unknown to an older
-	// implementation that refuses unknown properties, or typed differently
-	const props = def.inputSchema?.properties || {};
-	const supplied = Object.keys(args || {}).filter(
-		(key) => !APP_SIDE_FIELDS.has(key) && args[key] !== undefined
-	);
-	if (def.inputSchema?.additionalProperties === false) {
-		const unknown = supplied.filter((key) => !(key in props));
-		if (unknown.length > 0) {
-			return `Agent ${server.server_label}'s version of ${name} does not accept ${unknown.join(", ")}`;
-		}
-	}
-	const mismatched = supplied.filter(
-		(key) => key in props && !matchesSchemaType(args[key], props[key])
-	);
-	if (mismatched.length > 0) {
-		return `Agent ${server.server_label}'s version of ${name} expects a different type for ${mismatched.join(", ")}`;
+	const validate = schemaValidator(def);
+	if (validate && !validate(callArgs)) {
+		return `Agent ${server.server_label}'s version of ${name} rejects the call: ${describeViolations(validate.errors)}`;
 	}
 	return null;
 }
@@ -853,18 +874,17 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 			continue;
 		}
 
-		// The tool as THIS server exports it (its tool list is fresh after the
-		// connection check) must accept the call built from the advertised schema
-		const incompatible = toolIncompatibility(server, name, args);
-		if (incompatible) {
-			console.log(`[MCP] Tool '${name}' not sent to ${server.server_label}: ${incompatible}`);
-			results.push({ server_label: server.server_label, ok: false, error: incompatible });
-			continue;
-		}
-
 		// One call per argument set: the destination's own routing field is filled
-		// from its bucket (several calls when that field takes a single host)
+		// from its bucket (several calls when that field takes a single host). Each
+		// call, as it would be sent, must satisfy the tool as THIS server exports
+		// it (its tool list is fresh after the connection check)
 		for (const callArgs of routedCalls(server.tools.get(name), args, hs)) {
+			const incompatible = toolIncompatibility(server, name, callArgs);
+			if (incompatible) {
+				console.log(`[MCP] Tool '${name}' not sent to ${server.server_label}: ${incompatible}`);
+				results.push({ server_label: server.server_label, ok: false, error: incompatible });
+				continue;
+			}
 			try {
 				// Use a longer timeout (120 seconds) for tool calls as some operations can be slow
 				console.log(
