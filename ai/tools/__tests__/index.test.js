@@ -3,7 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
-import { _setServersForTests } from "../../mcp_registry.js";
+import { _setServersForTests, isHostRoutedMcpTool } from "../../mcp_registry.js";
 import { buildFunctionNamespaces, buildToolsArray, KNOWLEDGE_TOOL } from "../index.js";
 
 function makeTool(name) {
@@ -333,6 +333,51 @@ describe("buildToolsArray", () => {
 				.flatMap((namespace) => namespace.tools.map((t) => t.name));
 			expect(namespaced).not.toContain("fetch_url");
 			expect(namespaced).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("finds a host-routed MCP fetch_url on a later server (mixed agent versions)", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "old",
+				server_url: "https://old.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{ description: "URL-only.", inputSchema: { type: "object", properties: { url: {} } } },
+					],
+				]),
+			},
+			{
+				server_label: "new",
+				server_url: "https://new.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "Host-routed reader.",
+							inputSchema: { type: "object", properties: { url: {}, hosts: { type: "array" } } },
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			expect(isHostRoutedMcpTool("fetch_url")).toBe(true);
+			const readers = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).filter(
+				(t) => t.name === "fetch_url"
+			);
+			// The MCP reader wins (one definition), the built-in is not added alongside
+			expect(readers).toHaveLength(1);
+			expect(readers[0].parameters.properties).toHaveProperty("hosts");
 		} finally {
 			_setServersForTests([]);
 			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;

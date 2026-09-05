@@ -1620,6 +1620,25 @@ describe("GitHub", () => {
 		expect(seen).toEqual(["Bearer ghp_test", "Bearer ghp_test", "Bearer ghp_test"]);
 	});
 
+	it("keeps the issue when a supplementary list cannot be loaded", async () => {
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/12": response(JSON.stringify(issue), {
+				contentType: "application/json",
+			}),
+			// Comments: rate-limited
+			"https://api.github.com/repos/acme/tool/issues/12/comments?per_page=100": response("", {
+				status: 403,
+				headers: { "x-ratelimit-remaining": "0" },
+			}),
+		};
+		const { result } = await run({ url: "https://github.com/acme/tool/issues/12" }, { routes });
+		expect(result.ok).toBe(true);
+		expect(result.content).toContain("# Collector crashes on empty config (#12)");
+		expect(result.content).not.toContain("## Comments");
+		expect(result.note).toContain("comments could not be loaded");
+		expect(result.note).toContain("rate limit");
+	});
+
 	it("follows Link pagination on comment and review lists and reports truncation", async () => {
 		const json = (value, headers = {}) =>
 			response(JSON.stringify(value), { contentType: "application/json", headers });
@@ -1682,8 +1701,11 @@ describe("GitHub", () => {
 			{ url: "https://github.com/acme/tool/issues/3" },
 			{ routes }
 		);
-		expect(result.ok).toBe(false);
-		expect(result.error).toContain("outside https://api.github.com");
+		// The issue itself is still returned; the off-origin page is refused and noted
+		expect(result.ok).toBe(true);
+		expect(result.content).toContain("Collector crashes on empty config");
+		expect(result.note).toContain("comments could not be loaded");
+		expect(result.note).toContain("outside https://api.github.com");
 		expect(fetchImpl.mock.calls.some((call) => String(call[0]).includes("evil"))).toBe(false);
 	});
 });

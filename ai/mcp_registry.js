@@ -402,11 +402,11 @@ export function getMcpServerCount() {
  * @returns {boolean}
  */
 export function isHostRoutedMcpTool(name) {
+	// Every server is inspected: with mixed agent versions, a later server may
+	// export the host-routed definition the first one lacks
 	for (const server of state.servers) {
-		const def = server.tools?.get?.(name);
-		if (!def) continue;
-		const props = def?.inputSchema?.properties;
-		return Boolean(props && ("hosts" in props || "hostname" in props || "host" in props));
+		const props = server.tools?.get?.(name)?.inputSchema?.properties;
+		if (props && ("hosts" in props || "hostname" in props || "host" in props)) return true;
 	}
 	return false;
 }

@@ -1464,20 +1464,36 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 	const isPull = target.kind === "pull" || Boolean(item.pull_request);
 	const none = { items: [], truncated: false };
 	// Every list is paginated (Link: rel="next") up to GITHUB_MAX_PAGES pages
-	const comments = await githubList(
-		`${base}/issues/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`,
-		runtime
+	// The discussion lists are supplementary: when one cannot be loaded (rate
+	// limit, transient error) the item is still returned, with a note saying
+	// which list is missing, instead of failing the whole read
+	const notes = [];
+	const loadList = async (label, path) => {
+		try {
+			return await githubList(path, runtime);
+		} catch (e) {
+			const reason = e instanceof FetchUrlError ? e.message : "unexpected error";
+			runtime.logger?.warn?.(`[FETCH_URL] GitHub ${label} could not be loaded: ${reason}`);
+			notes.push(`The ${label} could not be loaded (${reason}).`);
+			return { items: [], truncated: false };
+		}
+	};
+	const comments = await loadList(
+		"comments",
+		`${base}/issues/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`
 	);
 	const reviews = isPull
-		? await githubList(`${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		? await loadList("reviews", `${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`)
 		: none;
 	// Line-level review comments live on their own endpoint
 	const reviewComments = isPull
-		? await githubList(`${base}/pulls/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		? await loadList(
+				"review comments",
+				`${base}/pulls/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`
+			)
 		: none;
 
 	const limit = GITHUB_PAGE_SIZE * GITHUB_MAX_PAGES;
-	const notes = [];
 	if (comments.truncated) notes.push(`Only the first ${limit} comments are included.`);
 	if (reviews.truncated) notes.push(`Only the first ${limit} reviews are included.`);
 	if (reviewComments.truncated) {
