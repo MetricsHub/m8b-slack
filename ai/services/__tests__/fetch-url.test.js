@@ -159,6 +159,7 @@ describe("address policy", () => {
 			"224.0.0.1",
 			"255.255.255.255",
 			"198.18.0.1",
+			"168.63.129.16", // Azure platform address (WireServer)
 		]) {
 			expect(isBlockedAddress(address)).toBe(true);
 		}
@@ -240,6 +241,30 @@ describe("address policy", () => {
 		expect(result.ok).toBe(false);
 		expect(result.error).toContain("192.168.0.10");
 		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("redacts the query string of redirect targets in the logs", async () => {
+		const routes = {
+			"https://example.com/download": response("", {
+				status: 302,
+				headers: { location: "https://cdn.example.com/file.txt?token=secret789" },
+			}),
+			"https://cdn.example.com/file.txt?token=secret789": response("content", {
+				contentType: "text/plain",
+			}),
+		};
+		const { result, logger } = await run({ url: "https://example.com/download" }, { routes });
+		expect(result.ok).toBe(true);
+		const logged = [
+			...logger.info.mock.calls,
+			...logger.debug.mock.calls,
+			...logger.warn.mock.calls,
+		]
+			.flat()
+			.map(String)
+			.join("\n");
+		expect(logged).toContain("redirected");
+		expect(logged).not.toContain("secret789");
 	});
 
 	it("follows public redirects (relative Location included) and caps the hop count", async () => {
@@ -391,8 +416,24 @@ describe("limits", () => {
 		const { result } = await run({ url: "https://example.com/huge.txt" }, { routes });
 		expect(result.ok).toBe(true);
 		expect(result.truncated).toBe(true);
-		expect(result.chars).toBe(MAX_CONTENT_CHARS);
+		expect(result.chars).toBeLessThanOrEqual(MAX_CONTENT_CHARS);
+		expect(result.chars).toBeGreaterThan(MAX_CONTENT_CHARS - 10);
 		expect(result.totalChars).toBe(MAX_CONTENT_CHARS + 500);
+
+		// The cap bounds the SERIALIZED size: a body of quotes doubles when JSON-escaped
+		const quotes = await run(
+			{ url: "https://example.com/quotes.txt" },
+			{
+				routes: {
+					"https://example.com/quotes.txt": response('"'.repeat(700000), {
+						contentType: "text/plain",
+					}),
+				},
+			}
+		);
+		expect(quotes.result.truncated).toBe(true);
+		expect(JSON.stringify(quotes.result.content).length).toBeLessThanOrEqual(MAX_CONTENT_CHARS);
+		expect(quotes.result.chars).toBeGreaterThan(MAX_CONTENT_CHARS / 2 - 10);
 	});
 
 	it("reports HTTP errors and network failures without throwing", async () => {
@@ -826,6 +867,17 @@ describe("content negotiation", () => {
 			expect(result.source).toBe("text");
 			expect(result.content).toContain("Café du marché");
 		}
+	});
+
+	it("accepts whitespace in the HTTP charset parameter", async () => {
+		const latin = Buffer.from("<html><body><p>Caf\xe9 du march\xe9</p></body></html>", "latin1");
+		const routes = {
+			"https://example.com/spaced-header": response(latin, {
+				contentType: "text/html; charset = windows-1252",
+			}),
+		};
+		const { result } = await run({ url: "https://example.com/spaced-header" }, { routes });
+		expect(result.content).toContain("Café du marché");
 	});
 
 	it("accepts whitespace around the meta charset assignment", async () => {

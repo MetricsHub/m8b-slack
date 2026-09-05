@@ -610,6 +610,16 @@ function estimateNesting(html) {
 					foreign = null; // the breakout closed the foreign subtree: fall through
 				}
 			}
+			// </body> and </html> only change the parser's insertion mode: nothing is
+			// popped, the open elements stay nested. Extra <body>/<html> start tags
+			// are ignored by the parser as well.
+			if (name === "body" || name === "html") {
+				if (!closing && !stack.includes(name)) {
+					stack.push(name);
+					if (stack.length > depth) depth = stack.length;
+				}
+				return true;
+			}
 			if (closing) {
 				// Pop to the matching open element, unless a scope boundary (object,
 				// table, td, template, ...) sits above it: the parser then ignores
@@ -916,13 +926,16 @@ function documentBaseUrl(html, responseUrl) {
 				// ("&amp;" in the source is "&" in the URL), as the parser does
 				const rawHref = attributeValue(attrs, "href");
 				if (rawHref === null) return true;
-				const href = decodeHtmlEntities(rawHref);
-				if (!/^(?:javascript|data|vbscript):/i.test(href.trim())) {
-					try {
-						base = responseUrl ? new URL(href.trim(), responseUrl).toString() : href.trim();
-					} catch {
-						// Malformed base: keep the response URL
+				const href = decodeHtmlEntities(rawHref).trim();
+				try {
+					// Judged on the parsed URL (tabs/newlines stripped by the parser):
+					// only an http(s) base can be a base for links
+					const parsed = responseUrl ? new URL(href, responseUrl) : new URL(href);
+					if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+						base = parsed.toString();
 					}
+				} catch {
+					// Malformed base: keep the response URL
 				}
 				return false; // the first <base href> wins, as in browsers
 			}
@@ -934,14 +947,22 @@ function documentBaseUrl(html, responseUrl) {
 	return base;
 }
 
+/** Schemes never emitted as link or image targets */
+const BLOCKED_SCHEMES = new Set(["javascript:", "data:", "vbscript:"]);
+
 function resolveUrl(href, baseUrl) {
 	const clean = String(href || "").trim();
-	if (!clean || /^(?:javascript|data|vbscript):/i.test(clean)) return null;
-	if (!baseUrl) return clean;
+	if (!clean) return null;
 	try {
-		return new URL(clean, baseUrl).toString();
+		// The scheme is judged on the PARSED URL: WHATWG parsing strips tabs and
+		// newlines, so "java\tscript:" becomes "javascript:" and must be caught
+		const url = baseUrl ? new URL(clean, baseUrl) : new URL(clean);
+		return BLOCKED_SCHEMES.has(url.protocol) ? null : url.toString();
 	} catch {
-		return clean;
+		// Unparsable (relative without a base, garbage): keep the raw text unless
+		// it spells a blocked scheme once the characters the parser drops are gone
+		const collapsed = clean.replace(/[\t\n\r]/g, "").toLowerCase();
+		return /^(?:javascript|data|vbscript)\s*:/.test(collapsed) ? null : clean;
 	}
 }
 

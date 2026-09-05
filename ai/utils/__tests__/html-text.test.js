@@ -453,6 +453,33 @@ describe("htmlToMarkdown", () => {
 		expect(typeof out).toBe("string");
 	});
 
+	it("does not let </body> or </html> reset the depth estimate", () => {
+		// The parser ignores extra <body> start tags and a </body> only changes the
+		// insertion mode: the divs stay open and keep nesting
+		const page = `${"<body><div></body>".repeat(100000)}Deep`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("judges blocked schemes on the parsed URL (tabs and newlines stripped)", () => {
+		const out = htmlToMarkdown(
+			`<body><p><a href="java&#x09;script:alert(1)">Click</a> <a href="jav&#10;ascript:x">Two</a> <img src="da&#x09;ta:image/png;base64,AAAA" alt="pic"></p></body>`,
+			{ baseUrl: "https://d.example/" }
+		);
+		expect(out).not.toContain("javascript:");
+		expect(out).not.toContain("data:");
+		expect(out).toContain("Click");
+		expect(out).toContain("Two");
+		// A <base> with a non-http(s) scheme is ignored
+		const based = htmlToMarkdown(
+			`<html><head><base href="java&#x09;script:void(0)/"></head><body><p><a href="guide">Guide</a></p></body></html>`,
+			{ baseUrl: "https://d.example/docs/" }
+		);
+		expect(based).toContain("[Guide](https://d.example/docs/guide)");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

@@ -204,6 +204,7 @@ const BLOCKED_IPV4 = [
 	"100.64.0.0/10", // carrier-grade NAT
 	"127.0.0.0/8", // loopback
 	"169.254.0.0/16", // link-local, cloud metadata (169.254.169.254)
+	"168.63.129.16/32", // Azure platform address (WireServer), guest-only
 	"172.16.0.0/12", // private
 	"192.0.0.0/24", // IETF protocol assignments
 	"192.0.2.0/24", // documentation
@@ -464,7 +465,9 @@ async function getGuardedDispatcher() {
 function parseContentType(header) {
 	const value = String(header || "").toLowerCase();
 	const [type, ...params] = value.split(";").map((part) => part.trim());
-	const charset = params.map((param) => param.match(/^charset=["']?([^"';]+)/)).find(Boolean)?.[1];
+	const charset = params
+		.map((param) => param.match(/^charset\s*=\s*["']?\s*([^"';\s]+)/))
+		.find(Boolean)?.[1];
 	return { type: type || "", charset: charset || null };
 }
 
@@ -700,7 +703,7 @@ async function guardedGet(
 			} catch {
 				throw new FetchUrlError(`Invalid redirect target: ${location.slice(0, 200)}`);
 			}
-			logger?.info?.(`[FETCH_URL] ${url.hostname} redirected (${status}) to ${next}`);
+			logger?.info?.(`[FETCH_URL] ${url.hostname} redirected (${status}) to ${redactUrl(next)}`);
 			// Redirect targets are never trusted, whatever the origin of the hop. A
 			// derived host (api.github.com) keeps its allow-list exemption while the
 			// redirect stays on that same host (repository rename); any other host
@@ -888,10 +891,17 @@ function finalizeContent(text) {
 	const clean = String(text || "")
 		.replace(/\r\n?/g, "\n")
 		.trim();
-	if (clean.length <= MAX_CONTENT_CHARS) {
-		return { content: clean, truncated: false, totalChars: clean.length };
+	// The cap bounds the SERIALIZED size (what the middleware measures against
+	// its hard limit): JSON escaping can double a text made of quotes or
+	// backslashes. Cut proportionally until the serialized form fits.
+	let content = clean;
+	let serialized = JSON.stringify(content).length;
+	while (serialized > MAX_CONTENT_CHARS && content.length > 0) {
+		const keep = Math.floor((content.length * MAX_CONTENT_CHARS) / serialized) - 1;
+		content = content.slice(0, Math.max(keep, 0));
+		serialized = JSON.stringify(content).length;
 	}
-	return { content: clean.slice(0, MAX_CONTENT_CHARS), truncated: true, totalChars: clean.length };
+	return { content, truncated: content.length < clean.length, totalChars: clean.length };
 }
 
 /**
