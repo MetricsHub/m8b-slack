@@ -44,6 +44,9 @@ const MAX_REDIRECTS = 5;
  */
 export const MAX_CONTENT_CHARS = 200000;
 
+/** Cap on the title reported alongside the content (characters) */
+const MAX_TITLE_CHARS = 300;
+
 /** GitHub API: comments/reviews fetched per issue or pull request */
 const GITHUB_PAGE_SIZE = 100;
 
@@ -482,7 +485,7 @@ function decodeBody(bytes, charset, type) {
 		// Sniff <meta charset> in the first bytes of the document
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
-			head.match(/<meta[^>]+charset=["']?\s*([a-z0-9_-]+)/i)?.[1] ||
+			head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_-]+)/i)?.[1] ||
 			head.match(/<\?xml[^>]+encoding=["']([a-z0-9_-]+)/i)?.[1] ||
 			null;
 	}
@@ -788,12 +791,13 @@ export function markdownSiblingUrl(url) {
  */
 function pagePathKey(rawUrl) {
 	try {
+		// Only the rendition suffixes are normalized: paths keep their case, since
+		// /Guide and /guide are different resources on case-sensitive sites
 		return new URL(rawUrl).pathname
 			.replace(/\.(?:md|markdown|txt)$/i, "")
 			.replace(/\/index(?:\.html?)?$/i, "/")
 			.replace(/\.html?$/i, "")
-			.replace(/\/+$/, "")
-			.toLowerCase();
+			.replace(/\/+$/, "");
 	} catch {
 		return null;
 	}
@@ -894,7 +898,8 @@ function buildResult({ requestedUrl, finalUrl, source, title, contentType, text,
 		url: requestedUrl,
 		finalUrl,
 		source,
-		title: title || undefined,
+		// Metadata, not content: a hostile <title> must not blow the output limit
+		title: title ? String(title).slice(0, MAX_TITLE_CHARS) : undefined,
 		contentType: contentType || undefined,
 		chars: content.length,
 		content,
@@ -1440,14 +1445,21 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 		});
 	};
 
-	try {
-		return await readAt(1);
-	} catch (e) {
-		if (!(e instanceof FetchUrlError && e.status === 404) || segments.length < 3) throw e;
+	// When the URL could name a multi-segment ref, ask the refs API first: with
+	// both "release" and "release/v2" existing, /blob/release/v2/README.md means
+	// the longer branch even if "release" happens to contain v2/README.md too.
+	// The single-segment split remains the fallback (tags, SHAs, plain branches).
+	if (segments.length >= 3) {
 		const refSegments = await resolveGitHubRefSegments(base, segments, runtime);
-		if (refSegments === null) throw e;
-		return await readAt(refSegments);
+		if (refSegments !== null) {
+			try {
+				return await readAt(refSegments);
+			} catch (e) {
+				if (!(e instanceof FetchUrlError && e.status === 404)) throw e;
+			}
+		}
 	}
+	return await readAt(1);
 }
 
 /**

@@ -388,6 +388,47 @@ describe("htmlToMarkdown", () => {
 		expect(out.startsWith("Intro\n\n```")).toBe(true);
 	});
 
+	it("folds only ASCII case in tag names, like the tokenizer", () => {
+		// "<xİ>" and "</xi̇>" are different elements to the parser: the chain nests
+		const page = `<body>${"<xİ></xi̇>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// ASCII case still folds
+		expect(htmlToMarkdown("<body><P>Mixed</p><DIV>Case</div></body>")).toBe("Mixed\n\nCase");
+	});
+
+	it("applies list-item scope to </li>: an intervening <ul> keeps the item open", () => {
+		const page = `<body>${"<li><ul></li>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("honours the script double-escaped state when finding the closer", () => {
+		// The first </script> is inside "<!--<script>": script text, not the closer
+		const decoy = `<main>${"Decoy text. ".repeat(40)}</main>`;
+		const page = `<body><script><!--<script></script>${decoy}--></script><article>${"Real text. ".repeat(40)}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real text.");
+		expect(out).not.toContain("Decoy text.");
+	});
+
+	it("does not count void dropped elements (<embed>) as open ancestors", () => {
+		const page = `<body><article>${"Earlier. ".repeat(40)}</article><embed src="x.swf"><main>${"Real main. ".repeat(40)}</main></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real main.");
+		expect(out).not.toContain("Earlier.");
+	});
+
+	it("decodes character references in <base href>", () => {
+		const page = `<html><head><base href="/docs&amp;api/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs&api/guide)");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

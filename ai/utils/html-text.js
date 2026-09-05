@@ -239,7 +239,9 @@ function tokenizeHtml(html, onTag, onText) {
 		// attributes on malformed closers, so `</span title=">">` is one closer
 		const gt = findTagEnd(html, nameEnd);
 		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
-		const name = html.slice(nameStart, nameEnd).toLowerCase();
+		// ASCII case folding only, as the tokenizer does: "<xİ>" and "</xi̇>" are
+		// different elements to the parser and must stay different here
+		const name = asciiLower(html.slice(nameStart, nameEnd));
 		// The "/>" slash only means something on void elements (and in foreign
 		// content); the HTML parser opens <div/> like <div>. Reported as a fact,
 		// consumers decide.
@@ -254,7 +256,8 @@ function tokenizeHtml(html, onTag, onText) {
 			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
 			// a script is script text, as in the HTML tokenizer. Each miss resumes
 			// past the previous candidate, so the search stays linear.
-			const close = findRawTextCloser(html, name, pos);
+			const close =
+				name === "script" ? findScriptCloser(html, pos) : findRawTextCloser(html, name, pos);
 			const bodyEnd = close === -1 ? length : close;
 			if (RCDATA_ELEMENTS.has(name) && bodyEnd > pos) {
 				if (onText(html.slice(pos, bodyEnd)) === false) return;
@@ -273,6 +276,75 @@ function tokenizeHtml(html, onTag, onText) {
 			if (onTag(closer) === false) return;
 			pos = closeEnd;
 		}
+	}
+}
+
+/** ASCII-only lowercasing (the HTML tokenizer folds A-Z and nothing else) */
+function asciiLower(text) {
+	return text.replace(/[A-Z]+/g, (upper) => upper.toLowerCase());
+}
+
+/**
+ * Whether `html` at `index` spells `needle` (an ASCII lowercase string) with
+ * ASCII case-insensitive comparison, followed by a tag-name terminator or the
+ * end of input.
+ */
+function matchesAsciiCI(html, index, needle) {
+	for (let i = 0; i < needle.length; i++) {
+		let code = html.charCodeAt(index + i);
+		if (code >= 65 && code <= 90) code += 32;
+		if (code !== needle.charCodeAt(i)) return false;
+	}
+	const after = index + needle.length;
+	return after >= html.length || isTagNameTerminator(html.charCodeAt(after));
+}
+
+/**
+ * Index of the "</script" that closes a script element whose body starts at
+ * `from`, following the tokenizer's script data states: after "<!--" the
+ * data is "escaped", a "<script" inside it enters the "double escaped" state
+ * where "</script" does NOT close the element (it only leaves double escaped),
+ * and "-->" ends the escape. Linear: every "<" is examined once and the
+ * "-->" lookup is cached.
+ *
+ * @returns {number} Index of the closing "</script", or -1
+ */
+function findScriptCloser(html, from) {
+	const length = html.length;
+	let pos = from;
+	let escaped = false;
+	let doubleEscaped = false;
+	let nextDashes = -2; // cached indexOf("-->") result, valid while pos <= nextDashes
+	for (;;) {
+		const lt = html.indexOf("<", pos);
+		if (escaped) {
+			if (nextDashes !== -1 && nextDashes < pos) nextDashes = html.indexOf("-->", pos);
+			if (nextDashes !== -1 && (lt === -1 || nextDashes < lt)) {
+				escaped = false;
+				doubleEscaped = false;
+				pos = nextDashes + 3;
+				continue;
+			}
+		}
+		if (lt === -1) return -1;
+		if (html.charCodeAt(lt + 1) === 47 && matchesAsciiCI(html, lt + 2, "script")) {
+			if (!doubleEscaped) return lt;
+			doubleEscaped = false; // back to the escaped state; the element stays open
+			pos = lt + 8;
+			continue;
+		}
+		if (!escaped && html.startsWith("<!--", lt)) {
+			escaped = true;
+			pos = lt + 4;
+			continue;
+		}
+		if (escaped && !doubleEscaped && matchesAsciiCI(html, lt + 1, "script")) {
+			doubleEscaped = true;
+			pos = lt + 7;
+			continue;
+		}
+		pos = lt + 1;
+		if (pos >= length) return -1;
 	}
 }
 
@@ -438,6 +510,8 @@ function selectContentRegion(html) {
 		html,
 		({ name, closing, selfClosing, start }) => {
 			if (DROP_ELEMENT_SET.has(name)) {
+				// A void dropped element (<embed>) has no content and never closes
+				if (VOID_ELEMENTS.has(name)) return;
 				const open = openDropped.get(name) || 0;
 				if (closing) {
 					if (open > 0) {
@@ -541,13 +615,15 @@ function estimateNesting(html) {
 				// table, td, template, ...) sits above it: the parser then ignores
 				// the end tag and everything stays open. The stack is capped, so this
 				// walk is bounded.
+				// </li> uses list-item scope (ul/ol are boundaries too), </p> button scope
+				const extraBoundary = name === "li" ? LIST_SCOPE : name === "p" ? BUTTON_SCOPE : null;
 				let index = -1;
 				for (let i = stack.length - 1; i >= 0; i--) {
 					if (stack[i] === name) {
 						index = i;
 						break;
 					}
-					if (SCOPE_BOUNDARY.has(stack[i])) break;
+					if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
 				}
 				if (index !== -1) {
 					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;
@@ -606,6 +682,10 @@ const SCOPE_BOUNDARY = new Set([
 	"template",
 	"select",
 ]);
+
+/** Additional boundaries of list-item scope (</li>) and button scope (</p>) */
+const LIST_SCOPE = new Set(["ul", "ol"]);
+const BUTTON_SCOPE = new Set(["button"]);
 
 /**
  * Elements inside svg/math whose children the HTML parser builds as HTML
@@ -729,7 +809,7 @@ function stripTagsFallback(html) {
 				}
 				return true;
 			}
-			if (!closing && !emptyForeign && FALLBACK_DROP.has(name)) {
+			if (!closing && !emptyForeign && FALLBACK_DROP.has(name) && !VOID_ELEMENTS.has(name)) {
 				skipping = name;
 				skipDepth = 1;
 				return true;
@@ -805,9 +885,12 @@ function documentBaseUrl(html, responseUrl) {
 		html,
 		({ name, closing, attrs }) => {
 			if (name === "base" && !closing) {
-				// A <base> without href (target only) does not count: keep looking
-				const href = attributeValue(attrs, "href");
-				if (href === null) return true;
+				// A <base> without href (target only) does not count: keep looking.
+				// Attribute values are raw source: character references are decoded
+				// ("&amp;" in the source is "&" in the URL), as the parser does
+				const rawHref = attributeValue(attrs, "href");
+				if (rawHref === null) return true;
+				const href = decodeHtmlEntities(rawHref);
 				if (!/^(?:javascript|data|vbscript):/i.test(href.trim())) {
 					try {
 						base = responseUrl ? new URL(href.trim(), responseUrl).toString() : href.trim();

@@ -281,10 +281,15 @@ export function buildToolsArray({
 
 	// MCP function tools. Keep host discovery immediately callable; defer the larger
 	// per-host schemas until GPT-5.6 determines that it needs them.
+	// FETCH_URL_ENABLED=false removes page reading everywhere: an MCP-provided
+	// fetch_url is not advertised here either (its calls are refused anyway)
+	const mcpFunctionTools = isFetchUrlEnabled()
+		? getOpenAiFunctionTools()
+		: getOpenAiFunctionTools().filter((tool) => tool.name !== "fetch_url");
 	const mcpNamespaces = buildFunctionNamespaces({
 		name: "metricshub",
 		description: "MetricsHub infrastructure discovery, monitoring, and diagnostics.",
-		functionTools: getOpenAiFunctionTools(),
+		functionTools: mcpFunctionTools,
 		immediateToolNames: IMMEDIATE_MCP_TOOLS,
 	});
 	tools.push(...mcpNamespaces);

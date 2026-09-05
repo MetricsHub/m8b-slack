@@ -798,6 +798,26 @@ describe("content negotiation", () => {
 		}
 	});
 
+	it("accepts whitespace around the meta charset assignment", async () => {
+		const latin = Buffer.from(
+			'<html><head><meta charset = "windows-1252"><title>Caf\xe9</title></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		const routes = { "https://example.com/spaced": response(latin, { contentType: "text/html" }) };
+		const { result } = await run({ url: "https://example.com/spaced" }, { routes });
+		expect(result.title).toBe("Café");
+		expect(result.content).toContain("Café");
+	});
+
+	it("caps a hostile title so the body is still delivered", async () => {
+		const page = `<html><head><title>${"T".repeat(500000)}</title></head><body><p>${"Body. ".repeat(30)}</p></body></html>`;
+		const routes = { "https://example.com/long-title": response(page) };
+		const { result } = await run({ url: "https://example.com/long-title" }, { routes });
+		expect(result.ok).toBe(true);
+		expect(result.title.length).toBeLessThanOrEqual(300);
+		expect(result.content).toContain("Body.");
+	});
+
 	it("unwraps Slack link syntax", async () => {
 		const routes = {
 			"https://example.com/page": response("plain", { contentType: "text/plain" }),
@@ -836,6 +856,16 @@ describe("markdownSiblingUrl / findLlmsTxtEntry", () => {
 		expect(llmsTxtLinks(flood)).toEqual([]);
 		expect(Date.now() - started).toBeLessThan(1000);
 		expect(findLlmsTxtEntry(flood, new URL("https://d.example/x"))).toBeNull();
+	});
+
+	it("keeps path case when matching llms.txt entries (case-sensitive sites)", () => {
+		const index = "- [g](https://d.example/guide.md)\n- [G](https://d.example/Guide.md)";
+		expect(findLlmsTxtEntry(index, new URL("https://d.example/Guide"))).toBe(
+			"https://d.example/Guide.md"
+		);
+		expect(findLlmsTxtEntry(index, new URL("https://d.example/guide"))).toBe(
+			"https://d.example/guide.md"
+		);
 	});
 
 	it("matches llms.txt entries by page path, tolerating .html and trailing slashes", () => {
@@ -1134,8 +1164,9 @@ describe("GitHub", () => {
 			{ url: "https://github.com/acme/tool/blob/feature/foo/docs/guide.md" },
 			{ routes, config }
 		);
-		// tags lookup 404s (not routed) and is tolerated
-		expect(requested).toEqual(["feature", "refs", "feature/foo"]);
+		// The refs API is consulted first (longest matching ref wins); the tags
+		// lookup 404s (not routed) and is tolerated; the one-segment split is never tried
+		expect(requested).toEqual(["refs", "feature/foo"]);
 		expect(result).toMatchObject({ ok: true, source: "github", title: "docs/guide.md" });
 		expect(result.content).toBe("# On feature/foo");
 
@@ -1149,6 +1180,26 @@ describe("GitHub", () => {
 		const missing = await run({ url: "https://github.com/acme/tool/blob/a/b/c.md" }, { config });
 		expect(missing.result.ok).toBe(false);
 		expect(missing.result.error).toContain("404");
+	});
+
+	it("falls back to the single-segment ref when no longer branch matches the URL", async () => {
+		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });
+		const base = "https://api.github.com/repos/acme/tool";
+		const requested = [];
+		const routes = {
+			[`${base}/git/matching-refs/heads/main?per_page=100`]: json([{ ref: "refs/heads/main" }]),
+			[`${base}/git/matching-refs/tags/main?per_page=100`]: json([]),
+			[`${base}/contents/docs/guide.md?ref=main`]: () => {
+				requested.push("main");
+				return response("# Main", { contentType: "text/plain" });
+			},
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/tool/blob/main/docs/guide.md" },
+			{ routes, config: { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] } }
+		);
+		expect(requested).toEqual(["main"]);
+		expect(result).toMatchObject({ ok: true, title: "docs/guide.md", content: "# Main" });
 	});
 
 	it("still honours the host policy on github.com itself", async () => {
