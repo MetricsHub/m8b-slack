@@ -380,6 +380,64 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("keeps <mglyph> and <malignmark> in MathML inside text integration points", () => {
+		const deep = "<x>".repeat(600);
+		// Children of <mtext> are HTML, except these two: a <textarea> below them
+		// is a foreign element again and its content is markup that nests
+		expect(estimateNesting(`<math><mtext><mglyph><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<math><mtext><malignmark><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// Any other child is HTML: the textarea is RCDATA and nothing nests below it
+		expect(estimateNesting(`<math><mtext><b><textarea>${deep}</textarea>`).depth).toBe(4);
+		// Outside MathML the names mean nothing special
+		expect(estimateNesting(`<svg><foreignObject><mglyph><textarea>${deep}</textarea>`).depth).toBe(
+			4
+		);
+	});
+
+	it("keeps <hr> inside an open <select>", () => {
+		// <hr> in a select closes an open option/optgroup and is inserted (void):
+		// the select stays open, so a <base> after it is still ignored
+		const page = `<html><body><select><hr><base href="/preview/"></select><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(estimateNesting("<select><optgroup><option><hr><option>x").depth).toBe(3);
+	});
+
+	it("keeps foreign CDATA sections opaque, as the parser does", () => {
+		// In svg/math "<![CDATA[" opens text through "]]>": the tags inside are not
+		// tokens (no breakout, no live <base>); in HTML it is a bogus comment
+		// ending at the first ">"
+		const page = `<html><body><svg><![CDATA[x><div><base href="/preview/">]]></svg><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(estimateNesting(`<svg><![CDATA[${"<div>".repeat(600)}]]>`).depth).toBe(1);
+		expect(estimateNesting(`<div><![CDATA[${"<div>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// An unterminated CDATA section swallows the rest of the document
+		expect(estimateNesting(`<svg><![CDATA[${"<div>".repeat(600)}`).depth).toBe(1);
+	});
+
+	it("does not treat the vertical tab as whitespace in tag names or attributes", () => {
+		// U+000B is not tokenizer whitespace: "<input\u000b>" is the element
+		// "input\u000b", non-void, and hundreds of them nest
+		expect(estimateNesting("<input\u000b>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<div\u000bx>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Real whitespace still ends the name: <input\t> and <br > are void
+		expect(estimateNesting("<input\t>".repeat(600) + "<br >".repeat(600)).depth).toBe(0);
+		// In attributes too: "href\u000b" is not the href attribute
+		const page = `<html><head><base href\u000b="/decoy/" href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
 	it("treats iframe, noembed and noframes fallback content as raw text", () => {
 		// The DOM parser never sees markup inside them: a decoy <base> or <title>
 		// there is text, and nothing nests

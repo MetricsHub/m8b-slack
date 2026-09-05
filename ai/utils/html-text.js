@@ -196,9 +196,18 @@ const IMPLICIT_CLOSERS = {
 	tfoot: ["td", "th", "tr", "tbody", "thead", "tfoot"],
 };
 
+/**
+ * ASCII whitespace as the HTML tokenizer defines it: tab, LF, FF, CR and
+ * space — NOT the vertical tab (U+000B), which is an ordinary character there
+ * ("<input\u000b>" is the non-void element "input\u000b", not an <input>).
+ */
+function isTokenizerWhitespace(code) {
+	return code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
+}
+
 /** Characters that end a tag name in the HTML tokenizer: ASCII whitespace, "/", ">", NUL */
 function isTagNameTerminator(code) {
-	return code === 32 || (code >= 9 && code <= 13) || code === 47 || code === 62 || code === 0;
+	return isTokenizerWhitespace(code) || code === 47 || code === 62 || code === 0;
 }
 
 /**
@@ -216,8 +225,11 @@ function isTagNameTerminator(code) {
  *   follows is tokenized as raw text/RCDATA — clear it for a tag that opens in
  *   foreign content, where the parser never switches state.
  * @param {(text: string) => (boolean|void)} onText
+ * @param {{inForeign?: () => boolean}} [options] - `inForeign` tells whether the
+ *   parser would be in foreign content (svg/math) at this point; there, and only
+ *   there, "<![CDATA[" opens a CDATA section that runs to "]]>"
  */
-function tokenizeHtml(html, onTag, onText) {
+function tokenizeHtml(html, onTag, onText, options = {}) {
 	const length = html.length;
 	let pos = 0;
 	// Cache: no ">" exists in [nextGtFrom, nextGt); nextGt === -1 means none at all
@@ -242,9 +254,16 @@ function tokenizeHtml(html, onTag, onText) {
 
 		const next = html.charCodeAt(lt + 1);
 		if (next === 33 || next === 63) {
-			// <!-- comment -->, <!doctype>, <![CDATA[ ]]>, <?xml ?>
+			// <!-- comment -->, <!doctype>, <?xml ?> — and <![CDATA[ ]]>, a CDATA
+			// section (text through "]]>") in foreign content only; in HTML it is a
+			// bogus comment that ends at the first ">"
 			if (html.startsWith("<!--", lt)) {
 				pos = findCommentEnd(html, lt + 4);
+			} else if (html.startsWith("<![CDATA[", lt) && options.inForeign?.()) {
+				const end = html.indexOf("]]>", lt + 9);
+				const bodyEnd = end === -1 ? length : end;
+				if (bodyEnd > lt + 9 && onText(html.slice(lt + 9, bodyEnd)) === false) return;
+				pos = end === -1 ? length : end + 3;
 			} else {
 				const gt = gtAfter(lt);
 				pos = gt === -1 ? length : gt + 1;
@@ -460,7 +479,7 @@ function findTagEnd(html, from) {
 	let state = 0;
 	for (let i = from; i < length; i++) {
 		const code = html.charCodeAt(i);
-		const whitespace = code === 32 || (code >= 9 && code <= 13);
+		const whitespace = isTokenizerWhitespace(code);
 		if (code === 62 && state !== 4) return i; // ">" ends the tag in every state but an unquoted value
 		switch (state) {
 			case 0: // before attribute name
@@ -508,7 +527,8 @@ function attributeValue(attrs, name) {
 	// value is never mistaken for the next attribute (`title="a href=x" href=y`
 	// has href y). The first attribute of that name wins, as in the parser; one
 	// present without a value is the empty string; absent is null.
-	const attribute = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+	const attribute =
+		/([^\t\n\f\r =/>"']+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"([^"]*)"|'([^']*)'|([^\t\n\f\r "'>]+)))?/g;
 	for (const match of String(attrs || "").matchAll(attribute)) {
 		if (asciiLower(match[1]) === name) return match[2] ?? match[3] ?? match[4] ?? "";
 	}
@@ -644,7 +664,15 @@ function createTreeTracker() {
 	 */
 	const handle = (tag) => {
 		const { name, closing, selfClosing, attrs } = tag;
-		const current = mode();
+		let current = mode();
+		// In a MathML text integration point (mi, mo, mn, ms, mtext) the children
+		// are HTML — except <mglyph> and <malignmark>, which stay MathML
+		if (current === "html" && !closing && (name === "mglyph" || name === "malignmark")) {
+			const top = stack.length - 1;
+			if (top >= 0 && ns[top] === "math" && MATHML_TEXT_INTEGRATION.has(stack[top])) {
+				current = "math";
+			}
+		}
 		if (current !== "html") {
 			if (!closing) {
 				if (
@@ -698,7 +726,13 @@ function createTreeTracker() {
 					popTo(selectIndex); // a nested <select> acts as </select>
 					return !hostile;
 				}
-				if (name === "input" || name === "keygen" || name === "textarea" || name === "hr") {
+				if (name === "hr") {
+					// <hr> is inserted INSIDE the select, closing an open option/optgroup:
+					// void, so nothing is pushed and the select stays open
+					while (stack.length - 1 > selectIndex) popTo(stack.length - 1);
+					return !hostile;
+				}
+				if (name === "input" || name === "keygen" || name === "textarea") {
 					popTo(selectIndex); // acts as </select>, then the token is reprocessed
 				} else if (!SELECT_CONTENT.has(name)) {
 					tag.rawText = false; // an ignored <title> never switches the tokenizer
@@ -785,6 +819,8 @@ function createTreeTracker() {
 
 	return {
 		handle,
+		/** Options for tokenizeHtml(): CDATA sections are opaque in foreign content */
+		tokenizerOptions: { inForeign: () => mode() !== "html" },
 		/** Deepest nesting seen so far */
 		get depth() {
 			return depth;
@@ -845,7 +881,8 @@ function selectContentRegion(html) {
 				if (mark.start === -1) mark.start = tag.start;
 			}
 		},
-		() => undefined
+		() => undefined,
+		tree.tokenizerOptions
 	);
 	if (tree.hostile) return html;
 
@@ -895,7 +932,8 @@ export function estimateNesting(html) {
 	tokenizeHtml(
 		html,
 		(tag) => tree.handle(tag),
-		() => undefined
+		() => undefined,
+		tree.tokenizerOptions
 	);
 	return { depth: tree.depth, prefixDepth: tree.prefixDepth };
 }
@@ -1141,7 +1179,8 @@ const FONT_BREAKOUT_ATTRIBUTES = new Set(["color", "face", "size"]);
  */
 function hasAnyAttribute(attrs, names) {
 	if (!attrs) return false;
-	const attribute = /([^\s=/>"']+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+	const attribute =
+		/([^\t\n\f\r =/>"']+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"[^"]*"|'[^']*'|[^\t\n\f\r "'>]+))?/g;
 	for (const match of attrs.matchAll(attribute)) {
 		if (names.has(asciiLower(match[1]))) return true;
 	}
@@ -1267,11 +1306,43 @@ export function extractHtmlTitle(html) {
 		(text) => {
 			if (collecting) buffer.push(text);
 			return true;
-		}
+		},
+		tree.tokenizerOptions
 	);
 	return decodeHtmlEntities(title ?? heading ?? "")
 		.replace(/\s+/g, " ")
 		.trim();
+}
+
+/**
+ * Whether a text starts like an HTML document: an optional BOM and whitespace,
+ * any number of comments (ended by "-->", "--!>" or the abrupt "<!-->" and
+ * "<!--->", exactly as the tokenizer ends them), then "<!doctype html",
+ * "<html", "<head" or "<body". Only the leading structure counts: a text that
+ * merely contains "<html>" somewhere is the plain text it claims to be.
+ * Linear: each comment is skipped once.
+ *
+ * @param {string} text - Decoded body
+ * @returns {boolean}
+ */
+export function startsLikeHtmlDocument(text) {
+	const source = String(text ?? "");
+	let pos = 0;
+	for (;;) {
+		while (
+			pos < source.length &&
+			(isTokenizerWhitespace(source.charCodeAt(pos)) || source[pos] === "\uFEFF")
+		) {
+			pos++;
+		}
+		if (!source.startsWith("<!--", pos)) break;
+		const end = findCommentEnd(source, pos + 4);
+		if (end >= source.length) return false; // unterminated, or nothing after it
+		pos = end;
+	}
+	return /^<(?:!doctype[\t\n\f\r ]+html|html|head|body)(?:[\t\n\f\r />]|$)/i.test(
+		source.slice(pos, pos + 64)
+	);
 }
 
 /**
@@ -1352,7 +1423,8 @@ function documentBaseUrl(html, responseUrl) {
 			}
 			return false; // the first <base href> wins, as in browsers
 		},
-		() => undefined
+		() => undefined,
+		tree.tokenizerOptions
 	);
 	return base;
 }

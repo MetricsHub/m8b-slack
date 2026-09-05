@@ -1096,6 +1096,22 @@ describe("content negotiation", () => {
 		expect(result.title).toBe("T");
 		expect(result.content).not.toContain("var x");
 		expect(result.content).not.toContain("menu");
+		// Every comment terminator the tokenizer knows: "--!>" and the abrupt "<!-->"
+		for (const preamble of ["<!-- license --!>", "<!-->", "<!--->", "<!-- a --!><!-->"]) {
+			const alt = await run(
+				{ url: "https://example.com/alt.txt" },
+				{
+					routes: {
+						"https://example.com/alt.txt": response(
+							`${preamble}<html><head><title>Alt</title></head><body><p>${"Text. ".repeat(40)}</p></body></html>`,
+							{ contentType: "text/plain" }
+						),
+					},
+				}
+			);
+			expect(alt.result.source).toBe("html");
+			expect(alt.result.title).toBe("Alt");
+		}
 		// An unterminated leading comment is not a document
 		const broken = await run(
 			{ url: "https://example.com/broken.txt" },

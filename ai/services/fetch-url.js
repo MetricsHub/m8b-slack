@@ -26,7 +26,12 @@
 import dns from "node:dns";
 import net from "node:net";
 import { parseBooleanFlag } from "../config/providers.js";
-import { extractHtmlTitle, htmlToMarkdown, sniffMetaCharset } from "../utils/html-text.js";
+import {
+	extractHtmlTitle,
+	htmlToMarkdown,
+	sniffMetaCharset,
+	startsLikeHtmlDocument,
+} from "../utils/html-text.js";
 
 /** Default per-request timeout */
 const DEFAULT_TIMEOUT_MS = 20000;
@@ -483,27 +488,6 @@ function isTextualType(type) {
 	return /^application\/(?:json|xml|yaml|x-yaml|javascript|x-javascript|ecmascript|x-ndjson|x-sh|x-httpd-php|.*\+(?:json|xml))$/.test(
 		type
 	);
-}
-
-/**
- * Whether a text body starts like an HTML document: optional BOM/whitespace,
- * any number of comments, then "<!doctype html", "<html", "<head" or "<body".
- * Only the first 4 KB are examined, one comment at a time (linear).
- *
- * @param {string} body - Decoded body
- * @returns {boolean}
- */
-function startsLikeHtml(body) {
-	const head = body.slice(0, 4096);
-	let pos = 0;
-	for (;;) {
-		while (pos < head.length && /[\s\uFEFF]/.test(head[pos])) pos++;
-		if (!head.startsWith("<!--", pos)) break;
-		const end = head.indexOf("-->", pos + 4);
-		if (end === -1) return false; // an unterminated comment: nothing can follow
-		pos = end + 3;
-	}
-	return /^<(?:!doctype\s+html|html|head|body)\b/i.test(head.slice(pos));
 }
 
 function decodeBody(bytes, charset, type) {
@@ -1104,7 +1088,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	// the doctype or a document tag: a tutorial or source file that merely
 	// contains "<html>" somewhere is the plain text it claims to be
 	const looksHtml =
-		HTML_TYPES.has(type) || ((!type || type === "text/plain") && startsLikeHtml(body));
+		HTML_TYPES.has(type) || ((!type || type === "text/plain") && startsLikeHtmlDocument(body));
 
 	// 1. The server answered our Accept header with Markdown or plain text
 	if (MARKDOWN_TYPES.has(type) || (type === "text/plain" && !looksHtml)) {
