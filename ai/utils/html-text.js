@@ -628,10 +628,10 @@ function estimateNesting(html) {
 				if (index !== -1) {
 					if (FORMATTING_ELEMENTS.has(name) && index !== stack.length - 1) {
 						// Adoption agency: the end tag of a formatting element that is not
-						// the current node reconstructs the formatting element and leaves
-						// the block elements above it open. Only that element leaves the
-						// estimate; `<b><div></b>` repeated keeps nesting, as in the parser.
-						stack.splice(index, 1);
+						// the current node leaves the block elements above it open and
+						// RECONSTRUCTS the formatting element inside them, so the DOM only
+						// gets deeper. Nothing is popped here: the estimate stays an upper
+						// bound (`<b><i><div></i></b>` repeated keeps nesting, as in the parser).
 						return true;
 					}
 					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;

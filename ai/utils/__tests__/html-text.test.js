@@ -443,6 +443,16 @@ describe("htmlToMarkdown", () => {
 		);
 	});
 
+	it("keeps reconstructed formatting elements in the depth estimate", () => {
+		// The adoption agency reconstructs <b> and <i> inside each div: the DOM
+		// grows by three levels per repetition, never fewer than the estimate
+		const page = `<body>${"<b><i><div></i></b>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

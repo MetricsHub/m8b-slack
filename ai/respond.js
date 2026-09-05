@@ -24,7 +24,7 @@ import {
 	systemPromptVersion,
 	TOKEN_LIMITS,
 } from "./config/system-prompt.js";
-import { getMcpServerCount } from "./mcp_registry.js";
+import { getMcpServerCount, getOpenAiFunctionTools } from "./mcp_registry.js";
 import { describeProviderError, getProvider } from "./providers/index.js";
 import { processCitations } from "./services/citations.js";
 import { isConfigAdmin } from "./services/config-editor.js";
@@ -397,9 +397,14 @@ async function respondCore({
 		// the workspace this message comes from and the deployment notes (both modes)
 		const systemPrompt = buildSystemPrompt(provider.capabilities, {
 			contextWindow: stateless ? provider.contextWindow : undefined,
-			// Hosted web search reads pages itself; function-only providers get
-			// the app-side fetch_url tool (unless the operator disabled it)
-			fetchUrl: !provider.capabilities.hostedWebSearch && isFetchUrlEnabled(),
+			// The fetched-content safeguards apply whenever ANY fetch_url reader is
+			// exposed: the app-side one on function-only providers, or an MCP
+			// reader advertised alongside a hosted web search (its pages arrive as
+			// ordinary function output too)
+			fetchUrl:
+				isFetchUrlEnabled() &&
+				(!provider.capabilities.hostedWebSearch ||
+					getOpenAiFunctionTools().some((tool) => tool.name === "fetch_url")),
 			...(await getDeploymentContext({ client, teamId, logger })),
 		});
 		const promptVersion = systemPromptVersion(systemPrompt);

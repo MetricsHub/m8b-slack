@@ -372,6 +372,8 @@ describe("limits", () => {
 		expect(looksBinary(Buffer.from("%PDF-1.4 ..."))).toBe(true);
 		expect(looksBinary(Buffer.from([0x1f, 0x8b, 0x08, 0x00]))).toBe(true);
 		expect(looksBinary(Buffer.from("PK\x03\x04rest", "latin1"))).toBe(true);
+		// Two ASCII letters are not a signature: text may start with "MZ ..."
+		expect(looksBinary(Buffer.from("MZ tools and configuration notes"))).toBe(false);
 		expect(looksBinary(Buffer.from("abc\x00def", "latin1"))).toBe(true);
 		expect(looksBinary(Buffer.from("\x01\x02\x03\x04\x05\x06\x07\x08 text", "latin1"))).toBe(true);
 		expect(looksBinary(Buffer.from("﻿BOM then text"))).toBe(false);
@@ -858,6 +860,20 @@ describe("content negotiation", () => {
 		expect(result.content).toContain("Café");
 	});
 
+	it("leaves entity-looking text in a bare URL untouched", async () => {
+		// Only Slack's <url|label> form is escaped; a bare URL may name "/R&amp;D" for real
+		const seen = [];
+		const routes = {
+			"https://example.com/R&amp;D": (_init, url) => {
+				seen.push(url);
+				return response("dept", { contentType: "text/plain" });
+			},
+		};
+		const { result } = await run({ url: "https://example.com/R&amp;D" }, { routes });
+		expect(result.ok).toBe(true);
+		expect(seen).toEqual(["https://example.com/R&amp;D"]);
+	});
+
 	it("decodes Slack's escaped entities inside a wrapped URL", async () => {
 		const seen = [];
 		const routes = {
@@ -872,6 +888,34 @@ describe("content negotiation", () => {
 		);
 		expect(result.ok).toBe(true);
 		expect(seen).toEqual(["https://example.com/search?a=1&b=2"]);
+	});
+
+	it("never logs the query string of a Markdown candidate (signed URLs, tokens)", async () => {
+		const routes = {
+			"https://docs.example.com/guide?token=secret123": response(HTML_PAGE),
+			"https://docs.example.com/guide.md?token=secret123": response("# Guide", {
+				contentType: "text/markdown",
+			}),
+			"https://other.example.com/page?sig=secret456": response(HTML_PAGE),
+			// Unusable candidate (HTML on the .md path) → debug log path
+			"https://other.example.com/page.md?sig=secret456": response(HTML_PAGE),
+		};
+		const found = await run({ url: "https://docs.example.com/guide?token=secret123" }, { routes });
+		expect(found.result.source).toBe("markdown");
+		const unusable = await run({ url: "https://other.example.com/page?sig=secret456" }, { routes });
+		expect(unusable.result.source).toBe("html");
+		for (const { logger } of [found, unusable]) {
+			const logged = [
+				...logger.info.mock.calls,
+				...logger.debug.mock.calls,
+				...logger.warn.mock.calls,
+			]
+				.flat()
+				.map(String)
+				.join("\n");
+			expect(logged).not.toContain("secret123");
+			expect(logged).not.toContain("secret456");
+		}
 	});
 
 	it("keeps the query string on Markdown alternatives and skips llms.txt for queried pages", async () => {

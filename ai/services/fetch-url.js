@@ -38,11 +38,13 @@ const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 
 /**
- * Cap on the text handed to the model in one call (characters). Keeps a
- * 2 MB plain-text response under the middleware's hard output limit; the
- * provider inline cap applies on top of it.
+ * Cap on the text carried by one result (characters). High on purpose: the
+ * tool middleware stages the COMPLETE result for run_python and the provider
+ * inline cap trims what the model sees, so the staged copy must not be cut
+ * beforehand. The cap only keeps the serialized result under the middleware's
+ * 1 MB hard limit.
  */
-export const MAX_CONTENT_CHARS = 200000;
+export const MAX_CONTENT_CHARS = 900000;
 
 /** Cap on the title reported alongside the content (characters) */
 const MAX_TITLE_CHARS = 300;
@@ -505,7 +507,8 @@ const BINARY_SIGNATURES = [
 	[0x50, 0x4b, 0x03, 0x04], // ZIP / OOXML / JAR
 	[0x1f, 0x8b], // gzip
 	[0x7f, 0x45, 0x4c, 0x46], // ELF
-	[0x4d, 0x5a], // MZ (Windows executable)
+	// (No "MZ": two ASCII letters are too weak a signature — a text document may
+	// well start with "MZ tools..."; executables are caught by the control-byte share)
 	[0x52, 0x49, 0x46, 0x46], // RIFF (WebP, WAV, AVI)
 	[0x00, 0x00, 0x00, 0x1c, 0x66, 0x74, 0x79, 0x70], // MP4 ftyp
 	[0xd0, 0xcf, 0x11, 0xe0], // OLE (legacy Office)
@@ -868,6 +871,19 @@ export function llmsTxtLinks(text) {
 	return links;
 }
 
+/**
+ * URL for log lines: origin and path only. Query strings may carry signed
+ * tokens or credentials and never belong in the application logs.
+ */
+function redactUrl(rawUrl) {
+	try {
+		const url = new URL(String(rawUrl));
+		return `${url.origin}${url.pathname}${url.search ? "?…" : ""}`;
+	} catch {
+		return "<invalid url>";
+	}
+}
+
 function finalizeContent(text) {
 	const clean = String(text || "")
 		.replace(/\r\n?/g, "\n")
@@ -938,7 +954,7 @@ async function tryMarkdownResource(candidateUrl, runtime) {
 		return { text, url: url.toString(), contentType: type || "text/markdown" };
 	} catch (e) {
 		runtime.logger?.debug?.(
-			`[FETCH_URL] Markdown candidate ${candidateUrl} unusable: ${e?.message}`
+			`[FETCH_URL] Markdown candidate ${redactUrl(candidateUrl)} unusable: ${e?.message}`
 		);
 		return null;
 	}
@@ -1019,7 +1035,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	if (sibling) {
 		const markdown = await tryMarkdownResource(sibling, runtime);
 		if (markdown) {
-			runtime.logger?.info?.(`[FETCH_URL] Using sibling Markdown ${markdown.url}`);
+			runtime.logger?.info?.(`[FETCH_URL] Using sibling Markdown ${redactUrl(markdown.url)}`);
 			return buildResult({
 				requestedUrl,
 				finalUrl: markdown.url,
@@ -1040,7 +1056,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 		if (entry && entry !== llmsUrl) {
 			const markdown = await tryMarkdownResource(entry, runtime);
 			if (markdown) {
-				runtime.logger?.info?.(`[FETCH_URL] Using llms.txt entry ${markdown.url}`);
+				runtime.logger?.info?.(`[FETCH_URL] Using llms.txt entry ${redactUrl(markdown.url)}`);
 				return buildResult({
 					requestedUrl,
 					finalUrl: markdown.url,
@@ -1561,12 +1577,13 @@ export async function executeFetchUrl(args, logger, options = {}) {
 
 	try {
 		// Slack wraps pasted links in <...|label>; models sometimes forward that form
-		// Slack escapes &, < and > in message text: "?a=1&amp;b=2" is "?a=1&b=2"
-		const cleaned = rawUrl
-			.replace(/^<([^|>]+)(?:\|[^>]*)?>$/, "$1")
-			.replace(/&amp;/g, "&")
-			.replace(/&lt;/g, "<")
-			.replace(/&gt;/g, ">");
+		// Slack wraps links as <url|label> and escapes &, < and > inside them:
+		// "?a=1&amp;b=2" is "?a=1&b=2". A bare URL is taken verbatim (a path may
+		// legitimately contain "&amp;")
+		const wrapped = rawUrl.match(/^<([^|>]+)(?:\|[^>]*)?>$/);
+		const cleaned = wrapped
+			? wrapped[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+			: rawUrl;
 		const url = validateUrlPolicy(cleaned, config);
 
 		const github = parseGitHubUrl(url);
