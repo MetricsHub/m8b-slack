@@ -380,6 +380,24 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("honours a <base href> once a breakout has left the svg it follows", () => {
+		// <div> breaks out of the svg and is reprocessed as HTML: the <base> after
+		// it is an HTML base (an svg:base right inside the svg would not be)
+		const page = `<html><body><svg><div><base href="/docs/"><p><a href="guide">Guide</a></p></div></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		const foreign = `<html><body><svg><base href="/docs/"></svg><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(foreign, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/guide)"
+		);
+		// ...and one inside a foreignObject is HTML again
+		const island = `<html><body><svg><foreignObject><base href="/docs/"></foreignObject></svg><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(island, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
 	it("honours a <base href> placed after </head> or inside <body>", () => {
 		// Browsers process a base start tag with the in-head rules wherever it is
 		const page = `<html><head><title>T</title></head><body><base href="/docs/v2/"><p><a href="guide">Guide</a></p></body></html>`;
@@ -665,6 +683,48 @@ describe("htmlToMarkdown", () => {
 		}
 	});
 
+	it("counts HTML void names opened in foreign content as elements with children", () => {
+		// <input> is not a breakout: inside svg it is an ordinary foreign element
+		// that nests (hundreds of unclosed ones build a deep subtree)
+		expect(estimateNesting(`<svg>${"<input>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg>${"<link>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Self-closed, they are empty; and in HTML they never open anything
+		expect(estimateNesting(`<svg>${"<input/>".repeat(600)}`).depth).toBe(1);
+		expect(estimateNesting(`<div>${"<input>".repeat(600)}`).depth).toBe(1);
+		// Void breakouts (<br>, <img>, <embed>) leave the svg and open nothing
+		expect(estimateNesting(`<svg>${"<img>".repeat(600)}`).depth).toBe(1);
+	});
+
+	it("binds integration points to their namespace", () => {
+		const deep = "<mi>".repeat(600);
+		// <desc>, <title> and <foreignObject> are integration points in svg only:
+		// a MathML <desc> is an ordinary element and its <textarea> stays foreign
+		expect(estimateNesting(`<math><desc><textarea>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<math><foreignObject><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<svg><desc><textarea>${deep}</textarea>`).depth).toBe(3);
+		// <mi>... are MathML text integration points, not svg ones
+		expect(estimateNesting(`<svg><mi><textarea>${"<g>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<math><mi><textarea>${deep}</textarea>`).depth).toBe(3);
+	});
+
+	it("breaks out of foreign content on </p> and </br> end tags too", () => {
+		// The parser leaves svg on </p> or </br> and reprocesses them as HTML; the
+		// following "<x/>" are HTML tokens whose slash means nothing: they nest
+		expect(estimateNesting(`<svg></p>${"<x/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg></br>${"<x/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Other end tags do not: "</g>" closes a g, "</x>" with none open is ignored
+		expect(estimateNesting(`<svg></x>${"<x/>".repeat(600)}`).depth).toBe(1);
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg></p>${"<x/>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
 	it("reprocesses a self-closing breakout tag as HTML: <div/> in svg opens a div", () => {
 		// The parser leaves foreign content on <div/>, then handles the token as
 		// HTML, where the slash means nothing on a non-void element
@@ -777,6 +837,23 @@ describe("extractHtmlTitle", () => {
 
 	it("prefers <title>, decoded and whitespace-normalized", () => {
 		expect(extractHtmlTitle(PAGE)).toBe("Install & Configure — Docs");
+	});
+
+	it("judges <title> by its namespace: svg titles are labels, a broken-out one is the page's", () => {
+		// The div breaks out of the svg, so the <title> after it is an HTML title
+		expect(
+			extractHtmlTitle("<body><svg><div><title>Page title</title></div><h1>H</h1></body>")
+		).toBe("Page title");
+		// A <title> under an svg foreignObject is HTML as well
+		expect(
+			extractHtmlTitle(
+				"<body><svg><foreignObject><title>Island</title></foreignObject></svg></body>"
+			)
+		).toBe("Island");
+		// An unclosed <head> ends at the first body start tag: the <h1> is live
+		expect(extractHtmlTitle("<html><head><meta charset=utf-8><h1>Heading</h1></html>")).toBe(
+			"Heading"
+		);
 	});
 
 	it("skips headings inside dropped page furniture for the fallback", () => {

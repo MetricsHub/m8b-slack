@@ -1520,10 +1520,60 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 }
 
 /**
- * Read a repository file (blob URL). Public files come from
- * raw.githubusercontent.com; when the bot's token is scoped to the repository
- * the file is read through the API's raw media type instead, so the token
- * stays confined to api.github.com and private files are readable.
+ * Read a repository file from raw.githubusercontent.com VERBATIM: no content
+ * negotiation, no HTML sniffing or conversion — a repository file is source,
+ * whatever its extension, and the token-scoped path (the API) returns the
+ * same bytes, so a public and a private read of the same blob give the same
+ * text. The raw host is derived from an already policy-checked github.com
+ * URL: exempt from the allow list, still subject to the block list.
+ *
+ * @param {string} rawUrl - raw.githubusercontent.com URL
+ * @param {string} requestedUrl - The blob URL the user gave
+ * @param {string} path - Repository path (the title)
+ * @param {Object} runtime
+ * @returns {Promise<Object>}
+ */
+async function readRawGitHubFile(rawUrl, requestedUrl, path, runtime) {
+	const { response, url: finalUrl } = await guardedGet(
+		rawUrl,
+		{ Accept: "text/plain, */*;q=0.5" },
+		runtime,
+		{ derivedHost: true }
+	);
+	if (!response.ok) {
+		await response.body?.cancel?.().catch(() => {});
+		throw new FetchUrlError(
+			`HTTP ${response.status} from ${finalUrl.hostname}`,
+			response.status === 404
+				? "The file does not exist at that path, or the repository is private (set GITHUB_TOKEN on the bot to read private repositories)."
+				: undefined,
+			response.status
+		);
+	}
+	const { charset } = parseContentType(response.headers?.get?.("content-type"));
+	const bytes = await readBodyCapped(response, runtime.config.maxBytes);
+	if (looksBinary(bytes, charset)) {
+		throw new FetchUrlError(`Refused: ${path} is a binary file (only text files can be read)`);
+	}
+	return buildResult({
+		requestedUrl,
+		finalUrl: finalUrl.toString(),
+		source: "text",
+		title: path,
+		contentType: "text/plain",
+		text: decodeBody(bytes, charset, "text/plain"),
+	});
+}
+
+/**
+ * Read a GitHub blob URL as the repository file it names: from the raw host
+ * for public repositories (or a token scoped elsewhere), through the API
+ * with the token for repositories in its scope.
+ *
+ * @param {Object} target - Parsed blob URL (owner, repo, ref, path, segments, rawUrl)
+ * @param {string} requestedUrl - The blob URL the user gave
+ * @param {Object} runtime
+ * @returns {Promise<Object>}
  */
 async function readGitHubBlob(target, requestedUrl, runtime) {
 	// A blob URL does not say where the ref ends and the path starts
@@ -1534,15 +1584,8 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 	const base = `/repos/${target.owner}/${target.repo}`;
 
 	if (!githubTokenInScope(runtime, target.owner, target.repo)) {
-		// The raw host is derived from an already policy-checked github.com URL:
-		// exempt from the allow list, still subject to the block list
-		const readRaw = async (url) => {
-			const result = await readWebPage(new URL(url), runtime, { derivedHost: true });
-			result.url = requestedUrl;
-			return result;
-		};
 		try {
-			return await readRaw(target.rawUrl);
+			return await readRawGitHubFile(target.rawUrl, requestedUrl, target.path, runtime);
 		} catch (e) {
 			// The single-segment split (the common case) does not exist: the branch
 			// or tag may contain a slash. The refs API is asked anonymously — only
@@ -1560,8 +1603,11 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 			const ref = segments.slice(0, resolved.refSegments).join("/");
 			const path = segments.slice(resolved.refSegments).join("/");
 			runtime.logger?.info?.(`[FETCH_URL] GitHub blob ref resolved to ${resolved.kind} ${ref}`);
-			return await readRaw(
-				`https://raw.githubusercontent.com/${target.owner}/${target.repo}/refs/${resolved.kind}/${ref}/${path}`
+			return await readRawGitHubFile(
+				`https://raw.githubusercontent.com/${target.owner}/${target.repo}/refs/${resolved.kind}/${ref}/${path}`,
+				requestedUrl,
+				path,
+				runtime
 			);
 		}
 	}

@@ -5,6 +5,8 @@ import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { Ajv } from "ajv";
+import { Ajv2019 } from "ajv/dist/2019.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
 
 // In-memory registry state
 const state = {
@@ -477,30 +479,62 @@ function routedCalls(def, args, hosts) {
 }
 
 /**
- * JSON Schema validator for a tool definition's input schema, compiled once
- * per definition (strict mode off: server schemas may carry keywords or
- * formats Ajv does not know; a "$schema" pointer is dropped so any draft
- * compiles against the default meta-schema). Null when the schema cannot be
- * compiled at all — the call is then sent as-is, as before this check existed.
+ * Validator for a tool definition's input schema, compiled once per
+ * definition with the Ajv instance of the dialect its "$schema" declares
+ * (draft-07 when absent, what the MCP SDKs emit; strict mode off, so
+ * server-specific keywords or formats compile). A dialect Ajv cannot
+ * validate faithfully (draft-04 and older, unknown URIs) is reported as a
+ * reason to refuse; a schema that fails to compile in its own dialect is
+ * reported as no validator, and the call is sent as-is, as before this check
+ * existed.
  *
  * @param {{inputSchema?: object}} def - Tool definition
- * @returns {import("ajv").ValidateFunction|null}
+ * @returns {{validate: import("ajv").ValidateFunction|null, reason: string|null}}
  */
 function schemaValidator(def) {
-	if (VALIDATORS.has(def)) return VALIDATORS.get(def) ?? null;
-	let validate = null;
-	try {
-		const { $schema: _draft, ...schema } = def?.inputSchema || {};
-		validate = ajv.compile(schema);
-	} catch (e) {
-		console.warn(`[MCP] Tool schema could not be compiled for validation: ${e?.message || e}`);
+	const cached = VALIDATORS.get(def);
+	if (cached) return cached;
+	const { $schema, ...schema } = def?.inputSchema || {};
+	const dialect = schemaDialect($schema);
+	/** @type {{validate: import("ajv").ValidateFunction|null, reason: string|null}} */
+	const entry = { validate: null, reason: null };
+	if (!dialect) {
+		entry.reason = `declares the JSON Schema dialect ${$schema}, which cannot be validated`;
+	} else {
+		try {
+			entry.validate = AJV_BY_DIALECT[dialect].compile(schema);
+		} catch (e) {
+			console.warn(`[MCP] Tool schema could not be compiled for validation: ${e?.message || e}`);
+		}
 	}
-	VALIDATORS.set(def, validate);
-	return validate;
+	VALIDATORS.set(def, entry);
+	return entry;
 }
 
-const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
-/** @type {WeakMap<object, import("ajv").ValidateFunction|null>} */
+/**
+ * Dialect key of a schema's "$schema" URI: absent means draft-07; draft-06/07,
+ * 2019-09 and 2020-12 are supported; anything else is null.
+ *
+ * @param {unknown} $schema
+ * @returns {"draft-07"|"2019-09"|"2020-12"|null}
+ */
+function schemaDialect($schema) {
+	if ($schema === undefined || $schema === null || $schema === "") return "draft-07";
+	const uri = String($schema);
+	if (/\/draft\/2020-12\//.test(uri)) return "2020-12";
+	if (/\/draft\/2019-09\//.test(uri)) return "2019-09";
+	if (/\/draft-0[67]\//.test(uri)) return "draft-07";
+	return null;
+}
+
+const AJV_OPTIONS = { strict: false, allErrors: true, validateFormats: false };
+/** One Ajv instance per JSON Schema dialect a tool schema may declare */
+const AJV_BY_DIALECT = {
+	"draft-07": new Ajv(AJV_OPTIONS),
+	"2019-09": new Ajv2019(AJV_OPTIONS),
+	"2020-12": new Ajv2020(AJV_OPTIONS),
+};
+/** @type {WeakMap<object, {validate: import("ajv").ValidateFunction|null, reason: string|null}>} */
 const VALIDATORS = new WeakMap();
 
 /**
@@ -552,7 +586,8 @@ function toolIncompatibility(server, name, callArgs) {
 	if (!hasHostRoutingParam(def)) {
 		return `Agent ${server.server_label} exports a version of ${name} without a host argument, which cannot be routed by host`;
 	}
-	const validate = schemaValidator(def);
+	const { validate, reason } = schemaValidator(def);
+	if (reason) return `Agent ${server.server_label}'s version of ${name} ${reason}`;
 	if (validate && !validate(callArgs)) {
 		return `Agent ${server.server_label}'s version of ${name} rejects the call: ${describeViolations(validate.errors)}`;
 	}

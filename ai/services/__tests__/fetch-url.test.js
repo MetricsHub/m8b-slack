@@ -1481,6 +1481,25 @@ describe("GitHub", () => {
 		}
 	});
 
+	it("reads public blobs verbatim, whatever the file looks like", async () => {
+		// An HTML source file is source: no HTML sniffing, negotiation or conversion
+		// (the token-scoped path returns the same bytes through the API)
+		const source =
+			"<!DOCTYPE html><html><head><script>var x = 1;</script></head><body><nav>menu</nav><p>Hi</p></body></html>";
+		const routes = {
+			"https://raw.githubusercontent.com/acme/tool/main/index.html": (init) => {
+				expect(init.headers.Accept).not.toContain("text/markdown");
+				return response(source, { contentType: "text/plain; charset=utf-8" });
+			},
+		};
+		const { result } = await run(
+			{ url: "https://github.com/acme/tool/blob/main/index.html" },
+			{ routes, config: { allowedHosts: ["github.com"] } }
+		);
+		expect(result).toMatchObject({ ok: true, source: "text", title: "index.html" });
+		expect(result.content).toBe(source);
+	});
+
 	it("resolves slash-containing refs for public blobs once the raw URL 404s", async () => {
 		const requested = [];
 		const json = (value) => response(JSON.stringify(value), { contentType: "application/json" });

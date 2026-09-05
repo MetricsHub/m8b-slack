@@ -155,6 +155,83 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		).toEqual(["h-01", "h-02"]);
 	});
 
+	it("validates with the JSON Schema dialect the destination declares", async () => {
+		const modern = fakeServer(
+			"modern",
+			{ "m-01": host("m-01") },
+			{
+				fetch_url: {
+					description: "2020-12 with unevaluatedProperties.",
+					inputSchema: {
+						$schema: "https://json-schema.org/draft/2020-12/schema",
+						type: "object",
+						properties: { url: { type: "string" }, hosts: { type: "array" } },
+						required: ["url", "hosts"],
+						unevaluatedProperties: false,
+					},
+				},
+			}
+		);
+		const dependent = fakeServer(
+			"dependent",
+			{ "d-01": host("d-01") },
+			{
+				fetch_url: {
+					description: "2019-09 with dependentRequired.",
+					inputSchema: {
+						$schema: "https://json-schema.org/draft/2019-09/schema",
+						type: "object",
+						properties: { url: { type: "string" }, mode: {}, depth: {}, hosts: {} },
+						dependentRequired: { mode: ["depth"] },
+					},
+				},
+			}
+		);
+		const ancient = fakeServer(
+			"ancient",
+			{ "a-01": host("a-01") },
+			{
+				fetch_url: {
+					description: "draft-04.",
+					inputSchema: {
+						$schema: "http://json-schema.org/draft-04/schema#",
+						type: "object",
+						properties: { url: {}, hosts: {} },
+					},
+				},
+			}
+		);
+		_setServersForTests([modern, dependent, ancient]);
+		for (const label of ["modern", "dependent", "ancient"]) await refreshHostsForServer(label);
+
+		const out = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			mode: "text",
+			hosts: ["m-01", "d-01", "a-01"],
+		});
+		const byServer = Object.fromEntries(out.results.map((r) => [r.server_label, r]));
+		// unevaluatedProperties (2020-12) is enforced, not silently ignored
+		expect(byServer.modern.ok).toBe(false);
+		expect(byServer.modern.error).toContain("mode");
+		// dependentRequired (2019-09) too
+		expect(byServer.dependent.ok).toBe(false);
+		expect(byServer.dependent.error).toContain("depth");
+		// A dialect Ajv cannot validate faithfully is refused rather than guessed
+		expect(byServer.ancient.ok).toBe(false);
+		expect(byServer.ancient.error).toContain("draft-04");
+		expect(byServer.ancient.error).toContain("cannot be validated");
+		for (const server of [modern, dependent, ancient]) {
+			expect(server.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
+		}
+
+		// Fitting calls go through on the supported dialects
+		const fits = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			hosts: ["m-01", "d-01"],
+		});
+		expect(fits.results.every((r) => r.ok)).toBe(true);
+	});
+
 	it("validates every constraint of the destination schema (enum, items, nested)", async () => {
 		const constrained = fakeServer(
 			"constrained",

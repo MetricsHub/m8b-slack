@@ -521,108 +521,244 @@ function hasTextOfAtLeast(html, minimum) {
 	return count >= minimum;
 }
 
-/** Elements whose content is not part of the page: a fragment, or a graphic */
-const INERT_ELEMENTS = new Set(["template", "svg", "math"]);
+/** Elements allowed inside <head>: any other start tag ends an unclosed <head> */
+const HEAD_ELEMENTS = new Set([
+	"head",
+	"html",
+	"title",
+	"meta",
+	"link",
+	"style",
+	"script",
+	"base",
+	"noscript",
+	"template",
+]);
 
 /**
- * Tracks the open inert containers (<template>, inline <svg>/<math>) on a
- * stack, as the parser does: an end tag only closes a matching open element
- * (`<template></svg>` keeps the template open), and an empty "<svg/>" opens
- * nothing (while "<template/>" opens a template: the slash means nothing on
- * HTML elements). Per-name counters keep unmatched closers O(1), so a flood
- * of them stays linear.
+ * Simulation of the parser's stack of open elements — the one model behind
+ * every pre-parser pass (depth estimate, region selection, title, base URL),
+ * so they all agree on what the DOM will contain. It applies the tree
+ * builder's rules that decide nesting and namespaces:
+ *
+ * - end tags pop to their element only when it is in scope (a closer below a
+ *   scope boundary is ignored); the generic algorithm stops at special
+ *   elements; formatting end tags obey the adoption agency (nothing popped);
+ *   </form> removes only the form; </body> and </html> pop nothing;
+ * - everyday unclosed <li>/<p>/<td>... are closed by their siblings, an
+ *   unclosed <head> by the first non-head start tag;
+ * - svg/math open foreign content, in which every start tag (HTML void names
+ *   and <textarea>/<style>/<script> included) is a foreign element with
+ *   children; "/>" closes it at once; a breakout start tag (div, p, font
+ *   color=..., ...) and the </p> and </br> end tags pop the foreign elements
+ *   and are reprocessed as HTML, where "/>" means nothing; end tags pop to
+ *   the matching foreign element; integration points (svg foreignObject/desc/
+ *   title, MathML mi/mo/mn/ms/mtext and annotation-xml with an HTML encoding)
+ *   make their children HTML again; namespaces are bound per element.
+ *
+ * Also counts what the callers need: the depth, the list/blockquote nesting
+ * (Turndown multiplies the output by it), whether the current position is
+ * inside an element the converter drops, inside a <template>, or in foreign
+ * content. `handle` returns false once a cap is exceeded: the page is
+ * hostile, the caller stops scanning and the DOM route is refused.
  */
-function createInertTracker() {
-	const stack = [];
-	const open = new Map();
-	return {
-		/**
-		 * Feed a tag; true when it was an inert container tag (consumed).
-		 * @param {{name: string, closing: boolean, selfClosing: boolean}} tag
-		 */
-		handle({ name, closing, selfClosing }) {
-			if (!INERT_ELEMENTS.has(name)) return false;
-			if (closing) {
-				if ((open.get(name) || 0) > 0) {
-					let popped;
-					do {
-						popped = stack.pop();
-						open.set(popped, open.get(popped) - 1);
-					} while (popped !== name);
-				}
-			} else if (!selfClosing || name === "template") {
-				stack.push(name);
-				open.set(name, (open.get(name) || 0) + 1);
-			}
-			return true;
-		},
-		/** Inside an inert container right now */
-		get inert() {
-			return stack.length > 0;
-		},
-	};
-}
-
-/**
- * Tracks whether the current position is inside an element the converter
- * drops (nav, footer, form, ...): a <main> or <h1> found there is not the
- * page's content, and slicing it out would detach it from the ancestor
- * Turndown removes. Dropped elements and scope boundaries sit on a small
- * stack with the parser's end-tag rule (a closer below a scope boundary is
- * ignored, so `<nav><object></nav>` keeps the nav open; `</form>` removes
- * only the form). The stack is bounded: past the bound the page is hostile
- * anyway (the depth guard refuses it) and the caller stops scanning.
- */
-function createDroppedTracker() {
-	const tracked = [];
-	let droppedDepth = 0;
+function createTreeTracker() {
+	const stack = []; // element names (lowercase)
+	const ns = []; // "svg" | "math" for foreign elements, null for HTML ones
+	const integration = []; // the element is an integration point: its children are HTML
+	let depth = 0;
+	let prefixDepth = 0;
+	let prefixes = 0; // list/blockquote ancestors currently open
+	let dropped = 0; // ancestors the converter drops
+	let templates = 0;
 	let hostile = false;
-	return {
-		/**
-		 * Feed a tag; true when it was a dropped element or scope boundary
-		 * (consumed by the tracker), false when the caller should look at it.
-		 * @param {{name: string, closing: boolean, selfClosing: boolean}} tag
-		 */
-		handle({ name, closing, selfClosing }) {
-			if (!(DROP_ELEMENT_SET.has(name) || SCOPE_BOUNDARY.has(name))) return false;
-			// A void dropped element (<embed>) has no content and never closes
-			if (VOID_ELEMENTS.has(name)) return true;
-			if (closing) {
-				let index = -1;
-				for (let i = tracked.length - 1; i >= 0; i--) {
-					if (tracked[i] === name) {
-						index = i;
-						break;
+
+	const isForeign = (i) => ns[i] !== null && !integration[i];
+	/** Namespace the next token is processed in: that of the current node */
+	const mode = () => {
+		const top = stack.length - 1;
+		return top >= 0 && isForeign(top) ? ns[top] : "html";
+	};
+	const forget = (i) => {
+		if (ns[i] === null && PREFIXING.has(stack[i])) prefixes--;
+		if (DROP_ELEMENT_SET.has(stack[i])) dropped--;
+		if (stack[i] === "template") templates--;
+	};
+	const popTo = (index) => {
+		for (let i = index; i < stack.length; i++) forget(i);
+		stack.length = index;
+		ns.length = index;
+		integration.length = index;
+	};
+	const removeAt = (index) => {
+		forget(index);
+		stack.splice(index, 1);
+		ns.splice(index, 1);
+		integration.splice(index, 1);
+	};
+	const push = (name, namespace, isIntegration) => {
+		stack.push(name);
+		ns.push(namespace);
+		integration.push(isIntegration);
+		if (namespace === null && PREFIXING.has(name)) prefixes++;
+		if (DROP_ELEMENT_SET.has(name)) dropped++;
+		if (name === "template") templates++;
+		if (stack.length > depth) depth = stack.length;
+		if (prefixes > prefixDepth) prefixDepth = prefixes;
+		if (depth > MAX_DOM_DEPTH || prefixDepth > MAX_PREFIX_DEPTH) hostile = true;
+	};
+	/** Leave foreign content: pop until the current node is HTML or an integration point */
+	const popForeign = () => {
+		while (stack.length > 0 && isForeign(stack.length - 1)) popTo(stack.length - 1);
+	};
+
+	/**
+	 * Feed a tag. Returns false once the page exceeded a cap (stop scanning).
+	 * @param {{name: string, closing: boolean, selfClosing: boolean, attrs: string, rawText: boolean}} tag
+	 * @returns {boolean}
+	 */
+	const handle = (tag) => {
+		const { name, closing, selfClosing, attrs } = tag;
+		const current = mode();
+		if (current !== "html") {
+			if (!closing) {
+				if (
+					FOREIGN_BREAKOUT.has(name) &&
+					(name !== "font" || hasAnyAttribute(attrs, FONT_BREAKOUT_ATTRIBUTES))
+				) {
+					// The breakout pops the foreign elements; the token is then
+					// REPROCESSED under the HTML rules below ("<div/>" opens a div)
+					popForeign();
+				} else {
+					// Any other start tag is a foreign element — an HTML void name
+					// (<input>) or a raw-text name (<textarea>, <style>) included: it has
+					// children, and the tokenizer stays in the data state
+					tag.rawText = false;
+					if (selfClosing) return !hostile; // "<path/>" is empty
+					const top = stack.length - 1;
+					// <svg> below a MathML <annotation-xml> is SVG; anything else keeps
+					// the namespace it is inserted in
+					const namespace =
+						name === "svg" && stack[top] === "annotation-xml" && ns[top] === "math"
+							? "svg"
+							: current;
+					push(name, namespace, isIntegrationPoint(name, attrs, namespace));
+					return !hostile;
+				}
+			} else if (name === "p" || name === "br") {
+				// </p> and </br> break out too, then follow the HTML end-tag rules
+				popForeign();
+			} else {
+				// A foreign end tag pops to its element when one is open above the
+				// nearest HTML element; otherwise the HTML rules decide
+				for (let i = stack.length - 1; i >= 0; i--) {
+					if (ns[i] === null) break;
+					if (stack[i] === name) {
+						popTo(i);
+						return !hostile;
 					}
-					if (SCOPE_BOUNDARY.has(tracked[i])) break;
 				}
-				if (index === -1) return true;
-				if (name === "form") {
-					// </form> removes only the form element from the parser's stack: a
-					// <nav> opened inside it stays open, so a <main> that follows is
-					// still inside the nav (`<form><nav></form><main>` is no way out)
-					tracked.splice(index, 1);
-					droppedDepth--;
-					return true;
-				}
-				for (let i = index; i < tracked.length; i++) {
-					if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
-				}
-				tracked.length = index;
-			} else if (!(selfClosing && (name === "svg" || name === "math"))) {
-				tracked.push(name);
-				if (DROP_ELEMENT_SET.has(name)) droppedDepth++;
-				if (tracked.length > MAX_DOM_DEPTH * 2) hostile = true;
 			}
-			return true;
+		}
+
+		// HTML rules
+		if (
+			!closing &&
+			stack.length > 0 &&
+			stack[stack.length - 1] === "head" &&
+			!HEAD_ELEMENTS.has(name)
+		) {
+			popTo(stack.length - 1); // an unclosed <head> ends at the first body start tag
+		}
+		// </body> and </html> only change the parser's insertion mode: nothing is
+		// popped, the open elements stay nested. Extra <body>/<html> start tags
+		// are ignored by the parser as well.
+		if (name === "body" || name === "html") {
+			if (!closing && !stack.includes(name)) push(name, null, false);
+			return !hostile;
+		}
+		if (closing) {
+			// Pop to the matching open element, unless a scope boundary (object,
+			// table, td, template, ...) sits above it: the parser then ignores the
+			// end tag and everything stays open. Special elements have their own
+			// end-tag rules ("in scope": stop at the scope boundaries; </li> adds
+			// ul/ol, </p> adds button). Any other end tag uses the generic algorithm,
+			// which gives up at the first SPECIAL element it meets
+			// (`<span><div></span>` leaves the div open). The stack is capped, so
+			// this walk is bounded.
+			const special = SPECIAL_ELEMENTS.has(name);
+			const extraBoundary = name === "li" ? LIST_SCOPE : name === "p" ? BUTTON_SCOPE : null;
+			let index = -1;
+			for (let i = stack.length - 1; i >= 0; i--) {
+				if (stack[i] === name) {
+					index = i;
+					break;
+				}
+				if (special) {
+					if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
+				} else if (SPECIAL_ELEMENTS.has(stack[i])) {
+					break;
+				}
+			}
+			if (index !== -1) {
+				if (FORMATTING_ELEMENTS.has(name) && index !== stack.length - 1) {
+					// Adoption agency: the end tag of a formatting element that is not
+					// the current node leaves the block elements above it open and
+					// RECONSTRUCTS the formatting element inside them, so the DOM only
+					// gets deeper. Nothing is popped: the estimate stays an upper bound
+					return !hostile;
+				}
+				if (name === "form" && index !== stack.length - 1) {
+					// </form> removes only the form element; the descendants above it
+					// stay open (`<form><nav></form>` keeps the nav open)
+					removeAt(index);
+					return !hostile;
+				}
+				popTo(index);
+			}
+			return !hostile;
+		}
+		if (name === "svg" || name === "math") {
+			if (!selfClosing) push(name, name, false); // an empty <svg/> opens nothing
+			return !hostile;
+		}
+		// "<div/>" opens a div: the slash is only meaningful on void elements
+		if (VOID_ELEMENTS.has(name)) return !hostile;
+		const closes = IMPLICIT_CLOSERS[name];
+		if (closes) {
+			while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
+				popTo(stack.length - 1);
+			}
+		}
+		push(name, null, false);
+		return !hostile;
+	};
+
+	return {
+		handle,
+		/** Deepest nesting seen so far */
+		get depth() {
+			return depth;
 		},
-		/** Inside a dropped element right now */
-		get dropped() {
-			return droppedDepth > 0;
+		/** Deepest list/blockquote nesting seen so far */
+		get prefixDepth() {
+			return prefixDepth;
 		},
-		/** The stack bound was exceeded: the page is hostile, stop scanning */
+		/** A cap was exceeded: the page is hostile */
 		get hostile() {
 			return hostile;
+		},
+		/** The next token is processed in foreign content (svg/math) */
+		get inForeign() {
+			return mode() !== "html";
+		},
+		/** Inside a <template> (an inert fragment) */
+		get inTemplate() {
+			return templates > 0;
+		},
+		/** Inside an element the converter drops (nav, footer, form, svg, ...) */
+		get dropped() {
+			return dropped > 0;
 		},
 	};
 }
@@ -640,14 +776,15 @@ function selectContentRegion(html) {
 		body: { opens: 0, start: -1, end: -1 },
 	};
 	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
-	// slicing it out would also detach it from the ancestor Turndown removes
-	const dropped = createDroppedTracker();
+	// slicing it out would also detach it from the ancestor Turndown removes.
+	// The tree simulation says whether the element sits under a dropped one
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
 		(tag) => {
-			if (dropped.handle(tag)) return !dropped.hostile;
+			if (!tree.handle(tag)) return false;
 			const mark = marks[tag.name];
-			if (!mark || dropped.dropped) return;
+			if (!mark || tree.dropped) return;
 			if (tag.closing) {
 				mark.end = tag.start; // the last closer wins
 			} else {
@@ -657,7 +794,7 @@ function selectContentRegion(html) {
 		},
 		() => undefined
 	);
-	if (dropped.hostile) return html;
+	if (tree.hostile) return html;
 
 	for (const tag of ["main", "article"]) {
 		const { opens, start, end } = marks[tag];
@@ -688,14 +825,11 @@ const MAX_URL_CHARS = 2048;
 const MAX_URL_CHARS_PER_DOCUMENT = 300000;
 
 /**
- * Estimate the maximum element nesting depth the parser would build, with the
- * parser's rules that matter for depth: a closer only pops elements when its
- * element is actually open (an unmatched </span> is ignored, so <div></span>
- * repeated nests), and everyday unclosed <li>/<p>/<td>... are implicitly
- * closed by their siblings. Also tracks how deep lists and blockquotes nest
- * (Turndown prefixes every line per ancestor, so that depth multiplies the
- * output). Stops as soon as either cap is exceeded, so the stack — and each
- * closer's search through it — stays bounded.
+ * Estimate the maximum element nesting depth the parser would build, and how
+ * deep lists and blockquotes nest (Turndown prefixes every line per ancestor,
+ * so that depth multiplies the output), with the tree simulation of
+ * createTreeTracker(). Stops as soon as either cap is exceeded, so the stack —
+ * and each end tag's search through it — stays bounded.
  *
  * Exported for tests only: the estimate is the guard, so tests pin its value
  * on parser corner cases rather than infer it from timing.
@@ -704,130 +838,13 @@ const MAX_URL_CHARS_PER_DOCUMENT = 300000;
  * @returns {{depth: number, prefixDepth: number}}
  */
 export function estimateNesting(html) {
-	const stack = [];
-	let depth = 0;
-	let prefixDepth = 0;
-	let prefixes = 0; // list/blockquote ancestors currently open
-	// Foreign content (svg, math) is COUNTED like everything else: the parser
-	// builds it and Turndown recurses into it before dropping the svg node, so
-	// thousands of nested <g> cost as much as nested <div>. Two foreign rules
-	// matter: "/>" really closes an element there (inline icons stay shallow),
-	// and an HTML "breakout" start tag pops the foreign subtree in the parser.
-	let foreignOpen = 0; // svg/math elements currently on the stack
-	// Parallel to the stack: whether each element is an integration point (an
-	// island of HTML inside svg/math). Decided at push time from the tag's
-	// attributes: <annotation-xml> only counts with an HTML encoding
-	const integration = [];
-	const popTo = (index) => {
-		for (let i = index; i < stack.length; i++) {
-			if (PREFIXING.has(stack[i])) prefixes--;
-			if (stack[i] === "svg" || stack[i] === "math") foreignOpen--;
-		}
-		stack.length = index;
-		integration.length = index;
-	};
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
-		(tag) => {
-			const { name, closing, selfClosing, attrs } = tag;
-			if (foreignOpen > 0 && !closing && inForeignMode(stack, integration)) {
-				if (
-					FOREIGN_BREAKOUT.has(name) &&
-					(name !== "font" || hasAnyAttribute(attrs, FONT_BREAKOUT_ATTRIBUTES))
-				) {
-					// The breakout closes the foreign subtree (pop to below the innermost
-					// svg/math), then the token is REPROCESSED under the HTML rules below,
-					// where "/>" means nothing on a non-void element: "<div/>" opens a div
-					for (let i = stack.length - 1; i >= 0; i--) {
-						if (stack[i] === "svg" || stack[i] === "math") {
-							popTo(i);
-							break;
-						}
-					}
-				} else {
-					if (selfClosing) return true; // "<path/>" is an empty element in foreign content
-					// Any other start tag opens a foreign element, <textarea>, <title>,
-					// <script> and <style> included: the tokenizer stays in the data
-					// state and their content is markup that nests (and counts) as usual
-					tag.rawText = false;
-				}
-			}
-			// </body> and </html> only change the parser's insertion mode: nothing is
-			// popped, the open elements stay nested. Extra <body>/<html> start tags
-			// are ignored by the parser as well.
-			if (name === "body" || name === "html") {
-				if (!closing && !stack.includes(name)) {
-					stack.push(name);
-					integration.push(false);
-					if (stack.length > depth) depth = stack.length;
-				}
-				return true;
-			}
-			if (closing) {
-				// Pop to the matching open element, unless a scope boundary (object,
-				// table, td, template, ...) sits above it: the parser then ignores
-				// the end tag and everything stays open. The stack is capped, so this
-				// walk is bounded.
-				// Special elements have their own end-tag rules ("in scope": stop at the
-				// scope boundaries; </li> adds ul/ol, </p> adds button). Any other end
-				// tag uses the generic algorithm, which gives up at the first SPECIAL
-				// element it meets (`<span><div></span>` leaves the div open)
-				const special = SPECIAL_ELEMENTS.has(name);
-				const extraBoundary = name === "li" ? LIST_SCOPE : name === "p" ? BUTTON_SCOPE : null;
-				let index = -1;
-				for (let i = stack.length - 1; i >= 0; i--) {
-					if (stack[i] === name) {
-						index = i;
-						break;
-					}
-					if (special) {
-						if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
-					} else if (SPECIAL_ELEMENTS.has(stack[i])) {
-						break;
-					}
-				}
-				if (index !== -1) {
-					if (FORMATTING_ELEMENTS.has(name) && index !== stack.length - 1) {
-						// Adoption agency: the end tag of a formatting element that is not
-						// the current node leaves the block elements above it open and
-						// RECONSTRUCTS the formatting element inside them, so the DOM only
-						// gets deeper. Nothing is popped here: the estimate stays an upper
-						// bound (`<b><i><div></i></b>` repeated keeps nesting, as in the parser).
-						return true;
-					}
-					if (name === "form" && index !== stack.length - 1) {
-						// </form> removes only the form element from the stack; the
-						// descendants above it stay open (`<form><div></form>` keeps nesting)
-						stack.splice(index, 1);
-						integration.splice(index, 1);
-						return true;
-					}
-					popTo(index);
-				}
-				return true;
-			}
-			if (name === "svg" || name === "math") {
-				if (selfClosing) return true; // an empty <svg/> opens nothing
-				foreignOpen++; // counted like any element below
-			}
-			// "<div/>" opens a div: the slash is only meaningful on void elements
-			if (VOID_ELEMENTS.has(name)) return true;
-			const closes = IMPLICIT_CLOSERS[name];
-			if (closes) {
-				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
-					popTo(stack.length - 1);
-				}
-			}
-			stack.push(name);
-			integration.push(isIntegrationPoint(name, attrs));
-			if (PREFIXING.has(name)) prefixes++;
-			if (stack.length > depth) depth = stack.length;
-			if (prefixes > prefixDepth) prefixDepth = prefixes;
-			return depth <= MAX_DOM_DEPTH && prefixDepth <= MAX_PREFIX_DEPTH;
-		},
+		(tag) => tree.handle(tag),
 		() => undefined
 	);
-	return { depth, prefixDepth };
+	return { depth: tree.depth, prefixDepth: tree.prefixDepth };
 }
 
 /**
@@ -973,57 +990,34 @@ const FORMATTING_ELEMENTS = new Set([
 const MAX_PREFIX_DEPTH = 16;
 
 /**
- * Elements inside svg/math whose children the HTML parser builds as HTML again
- * (integration points): svg foreignObject/desc/title, MathML annotation-xml
- * and the text elements. Below one of them, "<x/>" opens an element as in HTML.
+ * Integration points: foreign elements whose children are parsed as HTML.
+ * Bound to their namespace — an svg <desc> is one, a MathML <desc> is not.
  */
-const FOREIGN_INTEGRATION = new Set([
-	"foreignobject",
-	"desc",
-	"title",
-	"annotation-xml",
-	"mi",
-	"mo",
-	"mn",
-	"ms",
-	"mtext",
-]);
+const SVG_INTEGRATION = new Set(["foreignobject", "desc", "title"]);
+const MATHML_TEXT_INTEGRATION = new Set(["mi", "mo", "mn", "ms", "mtext"]);
 
 /** Encodings that make a MathML <annotation-xml> an HTML integration point */
 const INTEGRATION_ENCODINGS = new Set(["text/html", "application/xhtml+xml"]);
 
 /**
- * Whether a start tag opens an integration point: an svg foreignObject, desc
- * or title, a MathML text element (mi, mo, mn, ms, mtext), or an
- * <annotation-xml> whose encoding attribute is text/html or
- * application/xhtml+xml (ASCII case-insensitive) — without that encoding it
- * is an ordinary MathML element and its children stay foreign.
+ * Whether a start tag opens an integration point in its namespace: an svg
+ * foreignObject, desc or title; a MathML text element (mi, mo, mn, ms,
+ * mtext); or a MathML <annotation-xml> whose encoding attribute is text/html
+ * or application/xhtml+xml (ASCII case-insensitive) — without that encoding
+ * it is an ordinary MathML element and its children stay foreign.
  *
  * @param {string} name - Tag name
  * @param {string} attrs - Raw attribute text of the tag
+ * @param {"svg"|"math"|null} namespace - Namespace the element is inserted in
  * @returns {boolean}
  */
-function isIntegrationPoint(name, attrs) {
-	if (!FOREIGN_INTEGRATION.has(name)) return false;
-	if (name !== "annotation-xml") return true;
+function isIntegrationPoint(name, attrs, namespace) {
+	if (namespace === "svg") return SVG_INTEGRATION.has(name);
+	if (namespace !== "math") return false;
+	if (MATHML_TEXT_INTEGRATION.has(name)) return true;
+	if (name !== "annotation-xml") return false;
 	const encoding = attributeValue(attrs, "encoding");
 	return encoding !== null && INTEGRATION_ENCODINGS.has(asciiLower(encoding.trim()));
-}
-
-/**
- * Whether the innermost namespace context on the stack is foreign: the
- * nearest svg/math or integration point decides (the stack is capped, so this
- * walk is bounded).
- *
- * @param {string[]} stack - Open element names
- * @param {boolean[]} integration - Parallel flags: element is an integration point
- */
-function inForeignMode(stack, integration) {
-	for (let i = stack.length - 1; i >= 0; i--) {
-		if (stack[i] === "svg" || stack[i] === "math") return true;
-		if (integration[i]) return false;
-	}
-	return false;
 }
 
 /**
@@ -1174,8 +1168,8 @@ function stripTagsFallback(html) {
 /**
  * Extract the document title (<title>, else the first <h1>).
  *
- * @param {string} html - Raw HTML document
- * @returns {string} Title text, or "" when none is found
+ * @param {string} html - Full document
+ * @returns {string} Title text, or "" when the document has none
  */
 export function extractHtmlTitle(html) {
 	// One tokenizer pass: the first <title> wins; the first <h1> is the fallback
@@ -1184,24 +1178,20 @@ export function extractHtmlTitle(html) {
 	let heading = null;
 	let collecting = null; // "title" | "h1" while inside the element being captured
 	let buffer = [];
-	// <title> inside inline <svg>/<math> is an accessibility label, and anything
-	// inside <template> is an inert fragment: neither is a page-title candidate.
-	// The heading fallback also skips the elements the converter drops (nav,
-	// footer, aside, ...): a menu's <h1> is not the title of the page
-	const inert = createInertTracker();
-	const dropped = createDroppedTracker();
+	// The tree simulation tells what each element is: a <title> in svg/math is a
+	// graphic's label and anything in a <template> is inert (neither is a
+	// page-title candidate — but <svg><foreignObject><title> is HTML again, and
+	// <svg><div><title> too, the div having broken out); the heading fallback
+	// skips the elements the converter drops (a menu's <h1> is not the title)
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		source,
 		(tag) => {
 			const { name, closing } = tag;
-			if (!collecting) {
-				const boundary = inert.handle(tag);
-				// <title> is itself on the converter's drop list (and lives in <head>,
-				// another dropped element): it is not judged by the dropped tracker
-				if (name !== "title") dropped.handle(tag);
-				if (dropped.hostile) return false;
-				if (boundary || inert.inert) return true;
-			}
+			// What the element IS depends on where it is inserted: judge <title>
+			// by the state before the tag (its parent's namespace)
+			const inert = tree.inTemplate || tree.inForeign;
+			if (!tree.handle(tag)) return false;
 			if (collecting) {
 				if (name === collecting && closing) {
 					const text = buffer.join(" ");
@@ -1213,8 +1203,9 @@ export function extractHtmlTitle(html) {
 				}
 				return true;
 			}
-			if (!closing && name === "title" && title === null) collecting = "title";
-			else if (!closing && name === "h1" && heading === null && !dropped.dropped) {
+			if (closing) return true;
+			if (name === "title" && title === null && !inert) collecting = "title";
+			else if (name === "h1" && heading === null && !tree.inForeign && !tree.dropped) {
 				collecting = "h1";
 			}
 			return true;
@@ -1277,38 +1268,34 @@ export function sniffMetaCharset(head) {
  */
 function documentBaseUrl(html, responseUrl) {
 	let base = responseUrl;
-	// A <base> inside <template> (a separate document fragment) or inside inline
-	// svg/math does not establish the document base. Stack-based: a stray
-	// "</svg>" inside a template does not end the template
-	const inert = createInertTracker();
+	// A <base> inside <template> (a separate document fragment) or in foreign
+	// content (an svg:base is not an HTML base) does not establish the document
+	// base. The tree simulation knows breakouts and integration points:
+	// <svg><div><base> is live, the div having left the svg
+	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
 		(tag) => {
-			if (inert.handle(tag) || inert.inert) return true;
-			const { name, closing, attrs } = tag;
-			if (name === "base" && !closing) {
-				// A <base> without href (target only) does not count: keep looking.
-				// Attribute values are raw source: character references are decoded
-				// ("&amp;" in the source is "&" in the URL), as the parser does
-				const rawHref = attributeValue(attrs, "href");
-				if (rawHref === null) return true;
-				const href = decodeHtmlEntities(rawHref).trim();
-				try {
-					// Judged on the parsed URL (tabs/newlines stripped by the parser):
-					// only an http(s) base can be a base for links
-					const parsed = responseUrl ? new URL(href, responseUrl) : new URL(href);
-					if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-						base = parsed.toString();
-					}
-				} catch {
-					// Malformed base: keep the response URL
+			const inert = tree.inTemplate || tree.inForeign;
+			if (!tree.handle(tag)) return false;
+			if (inert || tag.closing || tag.name !== "base") return true;
+			// A <base> without href (target only) does not count: keep looking.
+			// Attribute values are raw source: character references are decoded
+			// ("&amp;" in the source is "&" in the URL), as the parser does
+			const rawHref = attributeValue(tag.attrs, "href");
+			if (rawHref === null) return true;
+			const href = decodeHtmlEntities(rawHref).trim();
+			try {
+				// Judged on the parsed URL (tabs/newlines stripped by the parser):
+				// only an http(s) base can be a base for links
+				const parsed = responseUrl ? new URL(href, responseUrl) : new URL(href);
+				if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+					base = parsed.toString();
 				}
-				return false; // the first <base href> wins, as in browsers
+			} catch {
+				// Malformed base: keep the response URL
 			}
-			// A <base> in the body still counts: the tree builder handles the start
-			// tag with the in-head rules wherever it appears, and the first <base
-			// href> in tree order sets the document base — so the scan goes on
-			return true;
+			return false; // the first <base href> wins, as in browsers
 		},
 		() => undefined
 	);
