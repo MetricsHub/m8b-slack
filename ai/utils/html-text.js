@@ -270,6 +270,9 @@ function tokenizeHtml(html, onTag, onText, options = {}) {
 			// bogus comment that ends at the first ">"
 			if (html.startsWith("<!--", lt)) {
 				pos = findCommentEnd(html, lt + 4);
+			} else if (next === 33 && startsWithAsciiCI(html, lt + 2, "doctype")) {
+				// A DOCTYPE's quoted identifiers may contain ">" (`SYSTEM "x><textarea>"`)
+				pos = findDoctypeEnd(html, lt + 9);
 			} else if (html.startsWith("<![CDATA[", lt) && options.inForeign?.()) {
 				const end = html.indexOf("]]>", lt + 9);
 				const bodyEnd = end === -1 ? length : end;
@@ -301,7 +304,7 @@ function tokenizeHtml(html, onTag, onText, options = {}) {
 		// inside title="...>..." does not end the tag, as in the HTML tokenizer).
 		// End tags get the same treatment: the tokenizer parses (and discards)
 		// attributes on malformed closers, so `</span title=">">` is one closer
-		const gt = findTagEnd(html, nameEnd);
+		const { gt, selfClosing: slashBeforeGt } = findTagEnd(html, nameEnd);
 		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
 		// ASCII case folding only, as the tokenizer does: "<xİ>" and "</xi̇>" are
 		// different elements to the parser and must stay different here
@@ -309,7 +312,7 @@ function tokenizeHtml(html, onTag, onText, options = {}) {
 		// The "/>" slash only means something on void elements (and in foreign
 		// content); the HTML parser opens <div/> like <div>. Reported as a fact,
 		// consumers decide.
-		const selfClosing = !closing && gt > nameEnd && html.charCodeAt(gt - 1) === 47;
+		const selfClosing = !closing && slashBeforeGt;
 		const tag = { name, closing, selfClosing, start: lt, end: gt + 1, attrs: "", rawText: false };
 		if (!closing && gt > nameEnd) tag.attrs = html.slice(nameEnd, selfClosing ? gt - 1 : gt);
 		// The switch to raw text / RCDATA is the tree builder's, and only for HTML
@@ -333,7 +336,7 @@ function tokenizeHtml(html, onTag, onText, options = {}) {
 				if (onText(html.slice(pos, bodyEnd)) === false) return;
 			}
 			if (close === -1) return;
-			const closeGt = findTagEnd(html, close + 2 + name.length);
+			const closeGt = findTagEnd(html, close + 2 + name.length).gt;
 			const closeEnd = closeGt === -1 ? length : closeGt + 1;
 			const closer = {
 				name,
@@ -476,34 +479,53 @@ function findCommentEnd(html, from) {
 }
 
 /**
- * Index of the ">" that ends a start tag whose attributes begin at `from`, or
- * -1 when the tag never ends. Follows the HTML tokenizer's attribute states:
- * a quote opens a quoted value only right after "=", where it hides any ">"
- * until the matching quote; a quote in attribute-name position is just a
- * character. Every character is visited once, so the scan is linear and
- * cannot be made to rescan.
+ * End of a tag whose attributes begin at `from`: the index of the ">" that
+ * ends it (-1 when the tag never ends) and whether it ended in the tokenizer's
+ * self-closing-start-tag state — a "/" right before the ">" met where an
+ * attribute name could start or end, NOT one inside an unquoted value
+ * (`<svg a=x/>` has the value "x/" and opens an svg). Follows the attribute
+ * states: a quote opens a quoted value only right after "=", where it hides
+ * any ">" until the matching quote; a quote in attribute-name position is
+ * just a character. Every character is visited once, so the scan is linear.
+ *
+ * @param {string} html - Markup
+ * @param {number} from - Index right after the tag name
+ * @returns {{gt: number, selfClosing: boolean}}
  */
 function findTagEnd(html, from) {
 	const length = html.length;
 	// HTML tokenizer states (simplified): 0 before attribute name, 1 attribute
 	// name, 2 after attribute name, 3 before attribute value, 4 unquoted value
 	let state = 0;
+	let slash = false; // the previous character was a "/" in self-closing position
 	for (let i = from; i < length; i++) {
 		const code = html.charCodeAt(i);
 		const whitespace = isTokenizerWhitespace(code);
-		if (code === 62 && state !== 4) return i; // ">" ends the tag in every state but an unquoted value
+		if (code === 62 && state !== 4) return { gt: i, selfClosing: slash }; // ">" ends the tag
+		slash = false;
 		switch (state) {
 			case 0: // before attribute name
-				if (whitespace || code === 47) break;
+				if (whitespace) break;
+				if (code === 47) {
+					slash = true; // "/" here: self-closing start tag state
+					break;
+				}
 				// "=" here STARTS a name (parse error in the spec), it is not an assignment
 				state = 1;
 				break;
 			case 1: // attribute name
-				if (whitespace || code === 47) state = 2;
-				else if (code === 61) state = 3;
+				if (whitespace) state = 2;
+				else if (code === 47) {
+					slash = true;
+					state = 2;
+				} else if (code === 61) state = 3;
 				break;
 			case 2: // after attribute name
-				if (whitespace || code === 47) break;
+				if (whitespace) break;
+				if (code === 47) {
+					slash = true;
+					break;
+				}
 				if (code === 61) state = 3;
 				else state = 1; // a new attribute starts
 				break;
@@ -512,20 +534,74 @@ function findTagEnd(html, from) {
 				if (code === 34 || code === 39) {
 					// Quoted value: skip to the matching quote (none → unterminated tag)
 					const close = html.indexOf(code === 34 ? '"' : "'", i + 1);
-					if (close === -1) return -1;
+					if (close === -1) return { gt: -1, selfClosing: false };
 					i = close;
 					state = 0;
 				} else {
-					state = 4; // unquoted value starts
+					state = 4; // unquoted value starts ("/" included)
 				}
 				break;
-			default: // 4: unquoted value
-				if (code === 62) return i;
+			default: // 4: unquoted value — a "/" is part of the value
+				if (code === 62) return { gt: i, selfClosing: false };
 				if (whitespace) state = 0;
 				break;
 		}
 	}
-	return -1;
+	return { gt: -1, selfClosing: false };
+}
+
+/**
+ * Whether `html` at `index` spells `needle` (ASCII lowercase) with ASCII
+ * case-insensitive comparison, whatever follows.
+ */
+function startsWithAsciiCI(html, index, needle) {
+	for (let i = 0; i < needle.length; i++) {
+		let code = html.charCodeAt(index + i);
+		if (code >= 65 && code <= 90) code += 32;
+		if (code !== needle.charCodeAt(i)) return false;
+	}
+	return true;
+}
+
+/**
+ * Index just past the ">" that ends a DOCTYPE whose text starts at `from`
+ * (right after "<!doctype"), with the tokenizer's DOCTYPE states: the name
+ * runs to whitespace or ">"; a PUBLIC or SYSTEM keyword then introduces
+ * quoted identifiers (two at most for PUBLIC, one for SYSTEM) in which a ">"
+ * is an ordinary character; anything else is a bogus DOCTYPE that ends at the
+ * next ">". An unterminated DOCTYPE swallows the rest of the input.
+ *
+ * @param {string} html - Markup
+ * @param {number} from - Index right after "<!doctype"
+ * @returns {number}
+ */
+function findDoctypeEnd(html, from) {
+	const length = html.length;
+	let i = from;
+	const skipWhitespace = () => {
+		while (i < length && isTokenizerWhitespace(html.charCodeAt(i))) i++;
+	};
+	const toNextGt = () => {
+		const gt = html.indexOf(">", i);
+		return gt === -1 ? length : gt + 1;
+	};
+	skipWhitespace();
+	while (i < length && !isTokenizerWhitespace(html.charCodeAt(i)) && html.charCodeAt(i) !== 62) i++;
+	skipWhitespace();
+	let identifiers = 0;
+	if (startsWithAsciiCI(html, i, "public")) identifiers = 2;
+	else if (startsWithAsciiCI(html, i, "system")) identifiers = 1;
+	else return toNextGt(); // no keyword (or ">" right here): the DOCTYPE ends at the next ">"
+	i += 6;
+	for (let n = 0; n < identifiers; n++) {
+		skipWhitespace();
+		const quote = html.charCodeAt(i);
+		if (quote !== 34 && quote !== 39) return toNextGt(); // no (further) identifier
+		const close = html.indexOf(quote === 34 ? '"' : "'", i + 1);
+		if (close === -1) return length; // unterminated identifier
+		i = close + 1;
+	}
+	return toNextGt();
 }
 
 /**
@@ -906,6 +982,10 @@ function selectContentRegion(html) {
 	// region, while a </div> that pops an open <main> with it does
 	const tree = createTreeTracker();
 	const names = Object.keys(marks);
+	// Open instances per name, each flagged accepted (opened outside a dropped
+	// element) or not: only an accepted instance's pop ends the region, so a
+	// <main> inside a <nav> after the real one neither counts nor extends it
+	const instances = Object.fromEntries(names.map((name) => [name, []]));
 	tokenizeHtml(
 		html,
 		(tag) => {
@@ -913,13 +993,18 @@ function selectContentRegion(html) {
 			if (!tree.handle(tag)) return false;
 			names.forEach((name, index) => {
 				const mark = marks[name];
+				const open = instances[name];
 				const after = tree.openCount(name);
-				if (after > before[index]) {
-					if (tree.dropped) return; // opened inside a dropped element: not a region
-					mark.opens++;
-					if (mark.start === -1) mark.start = tag.start;
-				} else if (after < before[index]) {
-					mark.end = tag.start; // the element was popped here
+				for (let k = before[index]; k < after; k++) {
+					const accepted = !tree.dropped;
+					open.push(accepted);
+					if (accepted) {
+						mark.opens++;
+						if (mark.start === -1) mark.start = tag.start;
+					}
+				}
+				for (let k = after; k < before[index]; k++) {
+					if (open.pop()) mark.end = tag.start; // an accepted instance was popped here
 				}
 			});
 		},

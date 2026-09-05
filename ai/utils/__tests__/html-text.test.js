@@ -380,6 +380,43 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("reads self-closing from the attribute state: a slash inside an unquoted value is value", () => {
+		// "<svg a=x/>" has the attribute a="x/" and OPENS an svg (not self-closing):
+		// hundreds of them nest
+		expect(estimateNesting("<svg a=x/>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<div a=x/>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// With a space before the slash, or no attribute value, the tag is self-closing
+		expect(estimateNesting("<svg a=x />".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<svg a/>".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<svg a='x'/>".repeat(600)).depth).toBe(0);
+		// The slash stays in the attribute value: <base href=/docs/> is "/docs/"
+		const page = `<html><head><base href=/docs/></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("skips a DOCTYPE with quoted identifiers containing '>'", () => {
+		const deep = "<div>".repeat(600);
+		// The system identifier holds ">" and a fake <textarea>: the tokenizer stays in
+		// the DOCTYPE until its closing quote and final ">", so the divs are live
+		expect(estimateNesting(`<!doctype html SYSTEM "x><textarea>">${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(
+			estimateNesting(`<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0//EN" "http://x/>y.dtd">${deep}`)
+				.depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Without a PUBLIC/SYSTEM keyword the quotes mean nothing: a bogus DOCTYPE
+		// ends at the first ">" and the <textarea> that follows is real RCDATA
+		expect(estimateNesting(`<!doctype html "x><textarea>">${deep}`).depth).toBe(1);
+		// Everyday doctypes still work, and the title after one is found
+		expect(estimateNesting(`<!DOCTYPE html>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(extractHtmlTitle('<!doctype html SYSTEM "about:legacy-compat"><title>T</title>')).toBe(
+			"T"
+		);
+	});
+
 	it("ends a content region only where the parser really closes the element", () => {
 		// The first </main> is ignored by the parser (the open <table> is a scope
 		// boundary), so the cell is still inside main and must survive selection
@@ -396,6 +433,11 @@ describe("htmlToMarkdown", () => {
 		// A <main> the parser discards (inside an open <select>) opens nothing
 		const ignored = `<html><body><select><main></select><main><p>${intro}</p></main><p>Outside</p></body></html>`;
 		expect(htmlToMarkdown(ignored)).not.toContain("Outside");
+		// A later <main> inside a dropped <nav> neither counts nor extends the region
+		const decoyLater = `<html><body><main><p>${intro}</p></main><p>Outside</p><nav><main>menu</main></nav></body></html>`;
+		const narrowed = htmlToMarkdown(decoyLater);
+		expect(narrowed).toContain("Intro text.");
+		expect(narrowed).not.toContain("Outside");
 	});
 
 	it("leaves inline code spans alone when tidying punctuation and spacing", () => {
