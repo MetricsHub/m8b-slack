@@ -109,21 +109,191 @@ function safeFromCodePoint(code) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Linear HTML scanning
+//
+// Everything below runs on attacker-controlled input BEFORE (or instead of)
+// the real parser, so it must be linear whatever the markup: no regex that can
+// rescan from every "<" of a malformed page. One hand-written tokenizer feeds
+// the region selection, the depth estimate, the fallback converter and the
+// title extraction.
+// ---------------------------------------------------------------------------
+
+/** Elements whose content is raw text (no tags inside) until their closer */
+const RAW_TEXT_ELEMENTS = new Set(["script", "style", "textarea", "title", "xmp"]);
+
+/** Elements that never have a closing tag */
+const VOID_ELEMENTS = new Set([
+	"area",
+	"base",
+	"br",
+	"col",
+	"embed",
+	"hr",
+	"img",
+	"input",
+	"link",
+	"meta",
+	"param",
+	"source",
+	"track",
+	"wbr",
+]);
+
+/**
+ * Openers that implicitly close a same-family element still open on top of
+ * the stack (unclosed <li>, <p>, <td>, <tr>, <option>... are everyday HTML):
+ * opener → names it closes when found on top.
+ */
+const IMPLICIT_CLOSERS = {
+	li: ["li"],
+	p: ["p"],
+	dt: ["dt", "dd"],
+	dd: ["dt", "dd"],
+	option: ["option"],
+	td: ["td", "th"],
+	th: ["td", "th"],
+	tr: ["td", "th", "tr"],
+	tbody: ["td", "th", "tr", "tbody", "thead", "tfoot"],
+	thead: ["td", "th", "tr", "tbody", "thead", "tfoot"],
+	tfoot: ["td", "th", "tr", "tbody", "thead", "tfoot"],
+};
+
+function isTagNameChar(code) {
+	return (
+		(code >= 97 && code <= 122) || // a-z
+		(code >= 65 && code <= 90) || // A-Z
+		(code >= 48 && code <= 57) || // 0-9
+		code === 45 || // -
+		code === 58 // :
+	);
+}
+
+/**
+ * Single-pass HTML tokenizer. Comments, doctype/processing instructions and
+ * raw-text element bodies are skipped; text runs go to onText, tags to onTag
+ * (name lowercased). Either callback may return false to stop the scan.
+ *
+ * Linear by construction: the next ">" is looked up once and cached, so a "<"
+ * with no later ">" costs nothing extra; an unterminated tag or raw-text
+ * element swallows the rest of the input, as the HTML tokenizer does.
+ *
+ * @param {string} html - Markup
+ * @param {(tag: {name: string, closing: boolean, selfClosing: boolean}) => (boolean|void)} onTag
+ * @param {(text: string) => (boolean|void)} onText
+ */
+function tokenizeHtml(html, onTag, onText) {
+	const length = html.length;
+	let lower = null; // lowercased copy, built once, only when a raw-text element shows up
+	let pos = 0;
+	// Cache: no ">" exists in [nextGtFrom, nextGt); nextGt === -1 means none at all
+	// after nextGtFrom. A query inside that span is answered without scanning, and
+	// each rescan starts past the previous answer, so the scans never overlap.
+	let nextGt = -1;
+	let nextGtFrom = Number.POSITIVE_INFINITY;
+	const gtAfter = (index) => {
+		if (index >= nextGtFrom && (nextGt === -1 || index <= nextGt)) return nextGt;
+		nextGt = html.indexOf(">", index);
+		nextGtFrom = index;
+		return nextGt;
+	};
+
+	while (pos < length) {
+		const lt = html.indexOf("<", pos);
+		if (lt === -1) {
+			if (onText(html.slice(pos)) === false) return;
+			break;
+		}
+		if (lt > pos && onText(html.slice(pos, lt)) === false) return;
+
+		const next = html.charCodeAt(lt + 1);
+		if (next === 33 || next === 63) {
+			// <!-- comment -->, <!doctype>, <![CDATA[ ]]>, <?xml ?>
+			if (html.startsWith("<!--", lt)) {
+				const end = html.indexOf("-->", lt + 4);
+				pos = end === -1 ? length : end + 3;
+			} else {
+				const gt = gtAfter(lt);
+				pos = gt === -1 ? length : gt + 1;
+			}
+			continue;
+		}
+
+		const closing = next === 47; // "/"
+		const nameStart = lt + (closing ? 2 : 1);
+		const first = html.charCodeAt(nameStart);
+		const startsWithLetter = (first >= 97 && first <= 122) || (first >= 65 && first <= 90);
+		if (!startsWithLetter) {
+			// A stray "<": text
+			if (onText("<") === false) return;
+			pos = lt + 1;
+			continue;
+		}
+		let nameEnd = nameStart + 1;
+		while (nameEnd < length && isTagNameChar(html.charCodeAt(nameEnd))) nameEnd++;
+
+		const gt = gtAfter(nameEnd);
+		if (gt === -1) return; // unterminated tag: the rest of the input is lost, as in browsers
+		const name = html.slice(nameStart, nameEnd).toLowerCase();
+		const selfClosing = !closing && gt > nameEnd && html.charCodeAt(gt - 1) === 47;
+		if (onTag({ name, closing, selfClosing }) === false) return;
+		pos = gt + 1;
+
+		if (!closing && RAW_TEXT_ELEMENTS.has(name)) {
+			// Raw text until the matching closer (or the end of input)
+			if (lower === null) lower = html.toLowerCase();
+			const close = lower.indexOf(`</${name}`, pos);
+			if (close === -1) return;
+			const closeGt = gtAfter(close);
+			if (onTag({ name, closing: true, selfClosing: false }) === false) return;
+			pos = closeGt === -1 ? length : closeGt + 1;
+		}
+	}
+}
+
+/**
+ * Whether the text outside tags reaches a minimum length (stops early).
+ */
+function hasTextOfAtLeast(html, minimum) {
+	let count = 0;
+	tokenizeHtml(
+		html,
+		() => undefined,
+		(text) => {
+			count += text.trim().length;
+			return count < minimum;
+		}
+	);
+	return count >= minimum;
+}
+
+/**
+ * Text content of a fragment (tags dropped, raw-text bodies skipped), linear.
+ */
+function textOfHtml(html) {
+	const parts = [];
+	tokenizeHtml(
+		html,
+		() => undefined,
+		(text) => {
+			parts.push(text);
+		}
+	);
+	return decodeHtmlEntities(parts.join(" ")).replace(/\s+/g, " ").trim();
+}
+
 /**
  * Narrow the document to the region worth reading: a single <main>, else a
- * single <article>, else the <body>, else everything. Plain index scans only:
- * linear in the page size whatever the nesting depth (the page is
- * attacker-controlled; noise elements are removed later, in the DOM).
+ * single <article>, else the <body>, else everything. Index scans only.
  */
 function selectContentRegion(html) {
 	const lower = html.toLowerCase();
 	for (const tag of ["main", "article"]) {
-		const opens = html.match(new RegExp(`<${tag}\\b`, "gi"));
-		if (!opens || opens.length !== 1) continue;
 		const start = lower.indexOf(`<${tag}`);
+		if (start === -1 || lower.indexOf(`<${tag}`, start + 1) !== -1) continue;
 		const end = lower.lastIndexOf(`</${tag}`);
 		const region = end > start ? html.slice(start, end) : html.slice(start);
-		if (region.replace(/<[^>]+>/g, "").trim().length > 200) return region;
+		if (hasTextOfAtLeast(region, 200)) return region;
 	}
 	const bodyStart = lower.indexOf("<body");
 	if (bodyStart === -1) return html;
@@ -148,59 +318,100 @@ const MAX_URL_CHARS = 2048;
  */
 const MAX_URL_CHARS_PER_DOCUMENT = 300000;
 
-/** Elements that never have a closing tag */
-const VOID_ELEMENTS = new Set([
-	"area",
-	"base",
-	"br",
-	"col",
-	"embed",
-	"hr",
-	"img",
-	"input",
-	"link",
-	"meta",
-	"param",
-	"source",
-	"track",
-	"wbr",
-]);
-
 /**
- * Estimate the maximum element nesting depth with a single linear tag scan
- * (no parsing: an upper bound is all that is needed to refuse hostile input).
+ * Estimate the maximum element nesting depth the parser would build, with the
+ * parser's rules that matter for depth: a closer only pops elements when its
+ * element is actually open (an unmatched </span> is ignored, so <div></span>
+ * repeated nests), and everyday unclosed <li>/<p>/<td>... are implicitly
+ * closed by their siblings. Stops as soon as the cap is exceeded, so the
+ * stack — and each closer's search through it — stays bounded.
  */
 function estimateMaxNestingDepth(html) {
-	let depth = 0;
+	const stack = [];
 	let max = 0;
-	const tags = /<(\/?)([a-z][a-z0-9-]*)[^>]*?(\/?)>/gi;
-	for (const match of html.matchAll(tags)) {
-		const [, closing, name, selfClosing] = match;
-		if (closing) {
-			depth = Math.max(0, depth - 1);
-		} else if (!selfClosing && !VOID_ELEMENTS.has(name.toLowerCase())) {
-			depth++;
-			if (depth > max) {
-				max = depth;
-				if (max > MAX_DOM_DEPTH) return max;
+	tokenizeHtml(
+		html,
+		({ name, closing, selfClosing }) => {
+			if (closing) {
+				const index = stack.lastIndexOf(name);
+				if (index !== -1) stack.length = index;
+				return true;
 			}
-		}
-	}
+			if (selfClosing || VOID_ELEMENTS.has(name)) return true;
+			const closes = IMPLICIT_CLOSERS[name];
+			if (closes) {
+				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) stack.pop();
+			}
+			stack.push(name);
+			if (stack.length > max) max = stack.length;
+			return max <= MAX_DOM_DEPTH;
+		},
+		() => undefined
+	);
 	return max;
 }
 
+/** Elements whose content is dropped by the fallback converter */
+const FALLBACK_DROP = new Set([...DROP_ELEMENTS, "title"]);
+
+/** Elements that start or end a line in the fallback converter */
+const FALLBACK_BLOCKS = new Set([
+	"p",
+	"div",
+	"li",
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"tr",
+	"br",
+	"section",
+	"article",
+	"blockquote",
+	"pre",
+	"ul",
+	"ol",
+	"table",
+	"dt",
+	"dd",
+	"hr",
+]);
+
 /**
  * Last-resort conversion when the DOM route is refused (hostile nesting
- * depth) or fails (parser error, stack exhaustion): strip tags, keep the
- * text. Linear; navigation/footer content is not removed in this mode.
+ * depth) or fails (parser error, stack exhaustion): drop noise elements,
+ * strip the other tags, keep the text. Single pass, linear.
  */
 function stripTagsFallback(html) {
-	return decodeHtmlEntities(
-		html
-			.replace(/<(script|style|noscript|template|svg)\b[\s\S]*?<\/\1\s*>/gi, " ")
-			.replace(/<\/(?:p|div|li|h[1-6]|tr|br|section|article)\b[^>]*>|<br\b[^>]*>/gi, "\n")
-			.replace(/<[^>]+>/g, " ")
-	)
+	const parts = [];
+	let skipping = null; // name of the noise element being skipped
+	let skipDepth = 0;
+	tokenizeHtml(
+		html,
+		({ name, closing, selfClosing }) => {
+			if (skipping) {
+				if (name === skipping && !selfClosing) {
+					skipDepth += closing ? -1 : 1;
+					if (skipDepth === 0) skipping = null;
+				}
+				return true;
+			}
+			if (!closing && !selfClosing && FALLBACK_DROP.has(name)) {
+				skipping = name;
+				skipDepth = 1;
+				return true;
+			}
+			if (FALLBACK_BLOCKS.has(name)) parts.push("\n");
+			else parts.push(" ");
+			return true;
+		},
+		(text) => {
+			if (!skipping) parts.push(text);
+		}
+	);
+	return decodeHtmlEntities(parts.join(""))
 		.replace(/[ \t\r\f\v]+/g, " ")
 		.replace(/ *\n */g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
@@ -217,9 +428,7 @@ export function extractHtmlTitle(html) {
 	const source = String(html ?? "");
 	const title = source.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
 	const raw = title?.[1] || source.match(/<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i)?.[1] || "";
-	return decodeHtmlEntities(raw.replace(/<[^>]+>/g, " "))
-		.replace(/\s+/g, " ")
-		.trim();
+	return textOfHtml(raw);
 }
 
 function resolveUrl(href, baseUrl) {

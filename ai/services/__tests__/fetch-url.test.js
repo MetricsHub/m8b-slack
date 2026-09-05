@@ -397,6 +397,26 @@ describe("limits", () => {
 });
 
 describe("transport hardening", () => {
+	it("hides unexpected internal errors from the model, keeping them in the logs", async () => {
+		const routes = {
+			"https://example.com/odd": () => ({
+				...response("x", { contentType: "text/plain" }),
+				arrayBuffer: async () => {
+					throw new TypeError("ENOENT: /srv/m8b/internal/secret-path.js exploded");
+				},
+			}),
+		};
+		const { result, logger } = await run({ url: "https://example.com/odd" }, { routes });
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("unexpectedly");
+		expect(result.error).not.toContain("secret-path");
+		expect(result.error).not.toContain("ENOENT");
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("Unexpected failure"),
+			expect.objectContaining({ error: expect.stringContaining("secret-path") })
+		);
+	});
+
 	it("cancels the body of a response rejected on its declared size", async () => {
 		const cancel = jest.fn(async () => {});
 		const routes = {
@@ -709,8 +729,16 @@ describe("GitHub", () => {
 		});
 		expect(parseGitHubUrl(new URL("https://github.com/acme/tool/blob/main/src/a.js"))).toEqual({
 			kind: "blob",
+			owner: "acme",
+			repo: "tool",
+			ref: "main",
+			path: "src/a.js",
 			rawUrl: "https://raw.githubusercontent.com/acme/tool/main/src/a.js",
 		});
+		// Percent-encoded path segments are decoded once
+		expect(
+			parseGitHubUrl(new URL("https://github.com/acme/tool/blob/v1.0/docs/guide v2.md"))
+		).toMatchObject({ ref: "v1.0", path: "docs/guide v2.md" });
 		expect(parseGitHubUrl(new URL("https://github.com/acme/tool"))).toBeNull();
 		expect(parseGitHubUrl(new URL("https://github.com/acme/tool/issues"))).toBeNull();
 		expect(parseGitHubUrl(new URL("https://gitlab.com/acme/tool/issues/12"))).toBeNull();
@@ -831,24 +859,66 @@ describe("GitHub", () => {
 		expect(result.hint).toContain("GITHUB_TOKEN");
 	});
 
-	it("maps blob URLs to their raw file without sending the token", async () => {
+	it("maps public blob URLs to their raw file, anonymously", async () => {
 		const routes = {
 			"https://raw.githubusercontent.com/acme/tool/main/README.md": (init) => {
 				expect(init.headers.Authorization).toBeUndefined();
 				return response("# Tool\n\nReadme.", { contentType: "text/plain; charset=utf-8" });
 			},
 		};
-		const { result } = await run(
-			{ url: "https://github.com/acme/tool/blob/main/README.md" },
-			{ routes, config: { githubToken: "ghp_test", allowedHosts: ["github.com"] } }
+		// No token at all, and a token scoped to another repository: both anonymous
+		for (const config of [
+			{ allowedHosts: ["github.com"] },
+			{ githubToken: "ghp_test", githubTokenRepos: ["other/*"], allowedHosts: ["github.com"] },
+		]) {
+			const { result } = await run(
+				{ url: "https://github.com/acme/tool/blob/main/README.md" },
+				{ routes, config }
+			);
+			expect(result).toMatchObject({
+				ok: true,
+				source: "text",
+				url: "https://github.com/acme/tool/blob/main/README.md",
+				finalUrl: "https://raw.githubusercontent.com/acme/tool/main/README.md",
+				content: "# Tool\n\nReadme.",
+			});
+		}
+	});
+
+	it("reads blobs of token-scoped repositories through the API raw media type", async () => {
+		const routes = {
+			"https://api.github.com/repos/acme/tool/contents/docs/guide%20v2.md?ref=main": (init) => {
+				expect(init.headers.Authorization).toBe("Bearer ghp_test");
+				expect(init.headers.Accept).toBe("application/vnd.github.raw+json");
+				return response("# Private guide", { contentType: "text/plain; charset=utf-8" });
+			},
+			"https://api.github.com/repos/acme/tool/contents/bin/app.png?ref=main": response(
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]),
+				{ contentType: "application/octet-stream" }
+			),
+		};
+		const config = { githubToken: "ghp_test", githubTokenRepos: ["acme/tool"] };
+		const { result, fetchImpl } = await run(
+			{ url: "https://github.com/acme/tool/blob/main/docs/guide v2.md" },
+			{ routes, config }
 		);
 		expect(result).toMatchObject({
 			ok: true,
-			source: "text",
-			url: "https://github.com/acme/tool/blob/main/README.md",
-			finalUrl: "https://raw.githubusercontent.com/acme/tool/main/README.md",
-			content: "# Tool\n\nReadme.",
+			source: "github",
+			title: "docs/guide v2.md",
+			content: "# Private guide",
 		});
+		// The token never went anywhere but api.github.com
+		expect(
+			fetchImpl.mock.calls.every((call) => String(call[0]).startsWith("https://api.github.com/"))
+		).toBe(true);
+
+		const binary = await run(
+			{ url: "https://github.com/acme/tool/blob/main/bin/app.png" },
+			{ routes, config }
+		);
+		expect(binary.result.ok).toBe(false);
+		expect(binary.result.error).toContain("binary file");
 	});
 
 	it("still honours the host policy on github.com itself", async () => {
@@ -920,5 +990,72 @@ describe("GitHub", () => {
 		expect(outOfScope.result.ok).toBe(false);
 		expect(seen.outOfScope).toBeUndefined();
 		expect(outOfScope.result.hint).toContain("GITHUB_TOKEN_REPOS");
+	});
+
+	it("follows Link pagination on comment and review lists and reports truncation", async () => {
+		const json = (value, headers = {}) =>
+			response(JSON.stringify(value), { contentType: "application/json", headers });
+		const pull = { ...issue, number: 9, html_url: "https://github.com/acme/tool/pull/9" };
+		const review = (i) => ({
+			user: { login: `r${i}` },
+			state: "APPROVED",
+			submitted_at: "2026-09-01T08:00:00Z",
+			body: "",
+		});
+		const base = "https://api.github.com/repos/acme/tool";
+		const routes = {
+			[`${base}/pulls/9`]: json(pull),
+			// Comments: two pages
+			[`${base}/issues/9/comments?per_page=100`]: json(
+				[{ user: { login: "c1" }, created_at: "2026-09-01T00:00:00Z", body: "first page" }],
+				{ link: `<${base}/issues/9/comments?per_page=100&page=2>; rel="next"` }
+			),
+			[`${base}/issues/9/comments?per_page=100&page=2`]: json([
+				{ user: { login: "c2" }, created_at: "2026-09-02T00:00:00Z", body: "second page" },
+			]),
+			// Reviews: more pages than the cap
+			[`${base}/pulls/9/reviews?per_page=100`]: json([review(1)], {
+				link: `<${base}/pulls/9/reviews?per_page=100&page=2>; rel="next"`,
+			}),
+			[`${base}/pulls/9/comments?per_page=100`]: json([]),
+		};
+		for (let page = 2; page <= 7; page++) {
+			routes[`${base}/pulls/9/reviews?per_page=100&page=${page}`] = json([review(page)], {
+				link: `<${base}/pulls/9/reviews?per_page=100&page=${page + 1}>; rel="next"`,
+			});
+		}
+		const { result, fetchImpl } = await run(
+			{ url: "https://github.com/acme/tool/pull/9" },
+			{ routes }
+		);
+		expect(result.ok).toBe(true);
+		expect(result.content).toContain("## Comments (2)");
+		expect(result.content).toContain("second page");
+		expect(result.content).toContain("## Reviews (5)");
+		expect(result.content).toContain("@r5:");
+		expect(result.content).not.toContain("@r6:");
+		expect(result.note).toContain("Only the first 500 reviews are included.");
+		expect(result.note).not.toContain("comments are included");
+		// 1 item + 2 comment pages + 5 review pages + 1 review-comments page
+		expect(fetchImpl).toHaveBeenCalledTimes(9);
+	});
+
+	it("refuses pagination links that leave api.github.com", async () => {
+		const routes = {
+			"https://api.github.com/repos/acme/tool/issues/3": response(JSON.stringify(issue), {
+				contentType: "application/json",
+			}),
+			"https://api.github.com/repos/acme/tool/issues/3/comments?per_page=100": response("[]", {
+				contentType: "application/json",
+				headers: { link: '<https://evil.example.net/steal>; rel="next"' },
+			}),
+		};
+		const { result, fetchImpl } = await run(
+			{ url: "https://github.com/acme/tool/issues/3" },
+			{ routes }
+		);
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("outside https://api.github.com");
+		expect(fetchImpl.mock.calls.some((call) => String(call[0]).includes("evil"))).toBe(false);
 	});
 });

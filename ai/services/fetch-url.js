@@ -948,7 +948,8 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
  *
  * @param {URL} url - Parsed URL
  * @returns {{kind: "issue"|"pull", owner: string, repo: string, number: number}
- *   | {kind: "blob", rawUrl: string} | null}
+ *   | {kind: "blob", owner: string, repo: string, ref: string, path: string, rawUrl: string}
+ *   | null}
  */
 export function parseGitHubUrl(url) {
 	const host = url.hostname.toLowerCase();
@@ -967,31 +968,73 @@ export function parseGitHubUrl(url) {
 		};
 	}
 	if ((kind === "blob" || kind === "raw") && rest.length >= 2) {
+		// The first segment after blob/ is taken as the ref (branch names with
+		// slashes are ambiguous in GitHub URLs too). URL.pathname is already
+		// percent-encoded: decode so the API path is encoded exactly once
+		const decode = (segment) => {
+			try {
+				return decodeURIComponent(segment);
+			} catch {
+				return segment;
+			}
+		};
+		const [ref, ...pathSegments] = rest;
 		return {
 			kind: "blob",
+			owner,
+			repo: repo.replace(/\.git$/, ""),
+			ref: decode(ref),
+			path: pathSegments.map(decode).join("/"),
 			rawUrl: `https://raw.githubusercontent.com/${owner}/${repo}/${rest.join("/")}`,
 		};
 	}
 	return null;
 }
 
-async function githubApi(path, runtime) {
+/** Pages followed per GitHub list (comments, reviews); 100 items each */
+const GITHUB_MAX_PAGES = 5;
+
+const GITHUB_API_ORIGIN = "https://api.github.com";
+
+/**
+ * Whether the bot's token applies to a repository (see githubTokenAllowedFor).
+ */
+function githubTokenInScope(runtime, owner, repo) {
+	return (
+		Boolean(runtime.config.githubToken) &&
+		githubTokenAllowedFor(runtime.config.githubTokenRepos, owner, repo)
+	);
+}
+
+/**
+ * One GitHub API request. Returns the body bytes and the response headers;
+ * HTTP errors become model-facing FetchUrlErrors with actionable hints.
+ *
+ * @param {string} pathOrUrl - API path (/repos/...) or absolute api.github.com URL
+ * @param {Object} runtime - Fetch runtime
+ * @param {Object} [options]
+ * @param {string} [options.accept] - Media type (default: JSON)
+ * @param {string} [options.what] - Noun for the 404 message (default: "the issue")
+ * @returns {Promise<{bytes: Uint8Array, headers: Headers}>}
+ */
+async function githubRequest(pathOrUrl, runtime, { accept, what = "the issue" } = {}) {
+	const url = pathOrUrl.startsWith("/") ? `${GITHUB_API_ORIGIN}${pathOrUrl}` : pathOrUrl;
+	if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
+		throw new FetchUrlError(`Refused: GitHub pagination pointed outside ${GITHUB_API_ORIGIN}`);
+	}
+	const path = url.slice(GITHUB_API_ORIGIN.length);
 	const headers = {
-		Accept: "application/vnd.github+json",
+		Accept: accept || "application/vnd.github+json",
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
 	// The token is the bot's, shared by every Slack user who can talk to it:
 	// only spend it on repositories the operator scoped it to
 	const [, owner = "", repo = ""] = path.match(/^\/repos\/([^/]+)\/([^/]+)/) || [];
-	const tokenInScope =
-		Boolean(runtime.config.githubToken) &&
-		githubTokenAllowedFor(runtime.config.githubTokenRepos, owner, repo);
+	const tokenInScope = githubTokenInScope(runtime, owner, repo);
 	if (tokenInScope) {
 		headers.Authorization = `Bearer ${runtime.config.githubToken}`;
 	}
-	const { response } = await guardedGet(`https://api.github.com${path}`, headers, runtime, {
-		derivedHost: true,
-	});
+	const { response } = await guardedGet(url, headers, runtime, { derivedHost: true });
 	if (!response.ok) {
 		await response.body?.cancel?.().catch(() => {});
 		const remaining = response.headers?.get?.("x-ratelimit-remaining");
@@ -1001,7 +1044,7 @@ async function githubApi(path, runtime) {
 			else if (runtime.config.githubToken)
 				hint = `The bot's GITHUB_TOKEN is not scoped to ${owner}/${repo} (GITHUB_TOKEN_REPOS), so the request was anonymous.`;
 			throw new FetchUrlError(
-				`GitHub returned 404 for ${path}: the issue does not exist, or the repository is private`,
+				`GitHub returned 404 for ${path}: ${what} does not exist, or the repository is private`,
 				hint
 			);
 		}
@@ -1014,11 +1057,55 @@ async function githubApi(path, runtime) {
 		throw new FetchUrlError(`GitHub API returned HTTP ${response.status} for ${path}`);
 	}
 	const bytes = await readBodyCapped(response, runtime.config.maxBytes);
+	return { bytes, headers: response.headers };
+}
+
+/**
+ * GET a JSON document from the GitHub API.
+ */
+async function githubApi(path, runtime, options = {}) {
+	const { bytes } = await githubRequest(path, runtime, options);
 	try {
 		return JSON.parse(new TextDecoder("utf-8").decode(bytes));
 	} catch {
 		throw new FetchUrlError("GitHub API returned malformed JSON");
 	}
+}
+
+/**
+ * Next page URL from a GitHub `Link` header, or null.
+ */
+function nextPageLink(headers) {
+	const link = headers?.get?.("link") || "";
+	const match = link.match(/<([^>]+)>\s*;\s*rel="next"/);
+	return match ? match[1] : null;
+}
+
+/**
+ * GET a paginated GitHub list, following `Link: rel="next"` up to
+ * GITHUB_MAX_PAGES pages (all on api.github.com). Reports truncation so the
+ * model is never told a list is complete when it is not.
+ *
+ * @returns {Promise<{items: Array, truncated: boolean}>}
+ */
+async function githubList(path, runtime) {
+	const items = [];
+	let next = path;
+	let pages = 0;
+	while (next) {
+		const { bytes, headers } = await githubRequest(next, runtime);
+		let page;
+		try {
+			page = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+		} catch {
+			throw new FetchUrlError("GitHub API returned malformed JSON");
+		}
+		if (Array.isArray(page)) items.push(...page);
+		pages++;
+		next = nextPageLink(headers);
+		if (next && pages >= GITHUB_MAX_PAGES) return { items, truncated: true };
+	}
+	return { items, truncated: false };
 }
 
 function formatDate(value) {
@@ -1118,25 +1205,27 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 		target.kind === "pull" ? `${base}/pulls/${number}` : `${base}/issues/${number}`,
 		runtime
 	);
-	const comments = await githubApi(
+	const isPull = target.kind === "pull" || Boolean(item.pull_request);
+	const none = { items: [], truncated: false };
+	// Every list is paginated (Link: rel="next") up to GITHUB_MAX_PAGES pages
+	const comments = await githubList(
 		`${base}/issues/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`,
 		runtime
 	);
-	const isPull = target.kind === "pull" || Boolean(item.pull_request);
 	const reviews = isPull
-		? await githubApi(`${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`, runtime)
-		: [];
+		? await githubList(`${base}/pulls/${number}/reviews?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		: none;
 	// Line-level review comments live on their own endpoint
 	const reviewComments = isPull
-		? await githubApi(`${base}/pulls/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`, runtime)
-		: [];
+		? await githubList(`${base}/pulls/${number}/comments?per_page=${GITHUB_PAGE_SIZE}`, runtime)
+		: none;
 
+	const limit = GITHUB_PAGE_SIZE * GITHUB_MAX_PAGES;
 	const notes = [];
-	if (Array.isArray(comments) && comments.length >= GITHUB_PAGE_SIZE) {
-		notes.push(`Only the first ${GITHUB_PAGE_SIZE} comments are included.`);
-	}
-	if (Array.isArray(reviewComments) && reviewComments.length >= GITHUB_PAGE_SIZE) {
-		notes.push(`Only the first ${GITHUB_PAGE_SIZE} review comments are included.`);
+	if (comments.truncated) notes.push(`Only the first ${limit} comments are included.`);
+	if (reviews.truncated) notes.push(`Only the first ${limit} reviews are included.`);
+	if (reviewComments.truncated) {
+		notes.push(`Only the first ${limit} review comments are included.`);
 	}
 	return buildResult({
 		requestedUrl,
@@ -1144,8 +1233,47 @@ async function readGitHubItem(target, requestedUrl, runtime) {
 		source: "github",
 		title: item.title,
 		contentType: "text/markdown",
-		text: renderGitHubItem(target, item, comments, reviews, reviewComments),
+		text: renderGitHubItem(target, item, comments.items, reviews.items, reviewComments.items),
 		note: notes.length > 0 ? notes.join(" ") : undefined,
+	});
+}
+
+/**
+ * Read a repository file (blob URL). Public files come from
+ * raw.githubusercontent.com; when the bot's token is scoped to the repository
+ * the file is read through the API's raw media type instead, so the token
+ * stays confined to api.github.com and private files are readable.
+ */
+async function readGitHubBlob(target, requestedUrl, runtime) {
+	if (!githubTokenInScope(runtime, target.owner, target.repo)) {
+		// The raw host is derived from an already policy-checked github.com URL:
+		// exempt from the allow list, still subject to the block list
+		const result = await readWebPage(new URL(target.rawUrl), runtime, { derivedHost: true });
+		result.url = requestedUrl;
+		return result;
+	}
+
+	const encodedPath = target.path
+		.split("/")
+		.map((segment) => encodeURIComponent(segment))
+		.join("/");
+	const { bytes } = await githubRequest(
+		`/repos/${target.owner}/${target.repo}/contents/${encodedPath}?ref=${encodeURIComponent(target.ref)}`,
+		runtime,
+		{ accept: "application/vnd.github.raw+json", what: "the file" }
+	);
+	if (looksBinary(bytes)) {
+		throw new FetchUrlError(
+			`Refused: ${target.path} is a binary file (only text files can be read)`
+		);
+	}
+	return buildResult({
+		requestedUrl,
+		finalUrl: requestedUrl,
+		source: "github",
+		title: target.path,
+		contentType: "text/plain",
+		text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
 	});
 }
 
@@ -1216,14 +1344,8 @@ export async function executeFetchUrl(args, logger, options = {}) {
 			return await readGitHubItem(github, url.toString(), runtime);
 		}
 		if (github?.kind === "blob") {
-			logger?.info?.(`[FETCH_URL] GitHub blob → ${github.rawUrl}`);
-			// The raw host is derived from an already policy-checked github.com URL:
-			// exempt from the allow list, still subject to the block list
-			const result = await readWebPage(new URL(github.rawUrl), runtime, {
-				derivedHost: true,
-			});
-			result.url = url.toString();
-			return result;
+			logger?.info?.(`[FETCH_URL] GitHub blob ${github.owner}/${github.repo} ${github.path}`);
+			return await readGitHubBlob(github, url.toString(), runtime);
 		}
 
 		const result = await readWebPage(url, runtime);
@@ -1234,7 +1356,13 @@ export async function executeFetchUrl(args, logger, options = {}) {
 			logger?.warn?.(`[FETCH_URL] ${e.message}`);
 			return { ok: false, error: e.message, ...(e.hint ? { hint: e.hint } : {}) };
 		}
-		logger?.error?.("[FETCH_URL] Unexpected failure", { error: String(e) });
-		return { ok: false, error: `fetch_url failed: ${e?.message || e}` };
+		// Anything else is a bug or an environment problem: details go to the
+		// logs, never to the model (paths, module internals, network details)
+		logger?.error?.("[FETCH_URL] Unexpected failure", { error: String(e), stack: e?.stack });
+		return {
+			ok: false,
+			error:
+				"fetch_url failed unexpectedly while reading the page; the bot's logs have the details.",
+		};
 	}
 }

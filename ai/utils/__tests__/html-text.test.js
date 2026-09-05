@@ -113,6 +113,44 @@ describe("htmlToMarkdown", () => {
 		expect(out).toBe("Long");
 	});
 
+	it("stays linear on malformed markup designed to make scanners rescan", () => {
+		const cases = [
+			// One unterminated <main> followed by many "<" without any ">"
+			`<body><main>${"<".repeat(120000)}</body>`,
+			// Mismatched closers: the parser ignores </span>, so the DOM nests
+			`<body>${"<div></span>".repeat(150000)}Deep</body>`,
+			// Fallback route (600 nested divs) then a flood of unterminated <script>
+			`<body>${"<div>".repeat(600)}Text ${"<script>".repeat(100000)}</body>`,
+			// Many unterminated tags inside the region check
+			`<body><main>${"<a href=x".repeat(50000)}</main></body>`,
+		];
+		for (const page of cases) {
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(typeof out).toBe("string");
+		}
+	});
+
+	it("does not mistake everyday unclosed list items and cells for hostile nesting", () => {
+		const items = Array.from({ length: 1500 }, (_, i) => `<li>Item ${i}`).join("");
+		const rows = Array.from({ length: 800 }, (_, i) => `<tr><td>${i}<td>x`).join("");
+		const page = `<body><ul>${items}</ul><table>${rows}</table></body>`;
+		const out = htmlToMarkdown(page);
+		// DOM route taken: Markdown list markers and a table came out of Turndown
+		expect(out).toContain("- Item 0");
+		expect(out).toContain("- Item 1499");
+		expect(out).toMatch(/\| 799 +\| x +\|/);
+	});
+
+	it("keeps dropping noise elements in the fallback route", () => {
+		const page = `<body>${"<div>".repeat(600)}<nav>menu</nav><script>evil()</script><p>Kept</p></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Kept");
+		expect(out).not.toContain("menu");
+		expect(out).not.toContain("evil()");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
@@ -139,7 +177,6 @@ describe("htmlToMarkdown", () => {
 		// and the converter recurses per level, so depth is bounded before parsing
 		for (const page of [
 			`<body><p>Before</p>${"<nav>".repeat(20000)}menu${"</nav>".repeat(20000)}<p>After</p></body>`,
-			`<body><p>Before</p>${"<nav>".repeat(20000)}menu <p>After</p>`, // unterminated
 			`<body><p>Before</p>${"<div>".repeat(200000)}After${"</div>".repeat(200000)}</body>`,
 		]) {
 			const started = Date.now();
@@ -147,7 +184,13 @@ describe("htmlToMarkdown", () => {
 			expect(Date.now() - started).toBeLessThan(2000);
 			expect(out).toContain("Before");
 			expect(out).toContain("After");
+			expect(out).not.toContain("menu");
 		}
+		// Unterminated navs swallow the rest of the page, as a browser would nest it
+		const open = `<body><p>Before</p>${"<nav>".repeat(20000)}menu <p>After</p>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(open)).toBe("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
 	});
 
 	it("handles null and empty input", () => {

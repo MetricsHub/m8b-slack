@@ -535,7 +535,9 @@ Markdown with [Turndown](https://github.com/mixmark-io/turndown) (GFM tables inc
 dropping scripts, styles, navigation, footers and asides and narrowing to the main content
 region. GitHub issue and pull request
 URLs are read through the REST API (body, comments, reviews; optional `GITHUB_TOKEN` for
-private repositories and a higher rate limit), `blob` URLs through their raw counterpart. The
+private repositories and a higher rate limit), `blob` URLs through their raw counterpart (or through the API when the token is scoped to that
+repository, so private files stay readable and the token stays on `api.github.com`). Comment
+and review lists follow the API's pagination up to 500 entries and say when they were cut. The
 tool output names the variant used (`source: markdown | llms.txt | html | text | github`).
 Only `http`/`https` URLs to public hosts are read: private, loopback, link-local and cloud
 metadata addresses are refused at resolution time and again when the socket is opened, redirects
