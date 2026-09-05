@@ -502,10 +502,13 @@ function decodeBody(bytes, charset, type) {
 	// embedded XHTML fragment is content, not a declaration
 	// (application/xhtml+xml is an XML media type: its <meta charset> has no
 	// authority, only the XML declaration does)
-	const isHtml = !type || HTML_TYPES.has(type);
+	// An untyped body is HTML here only when it STARTS like an HTML document
+	// (checked on the latin1 prefix): a tutorial or source file that merely
+	// quotes a <meta charset> is text, whatever the tag says
+	const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
+	const isHtml = HTML_TYPES.has(type) || (!type && startsLikeHtmlDocument(head));
 	const isXml = type === "text/xml" || /xml$/.test(type);
 	if (!label && (isHtml || isXml)) {
-		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
 			(isHtml ? sniffMetaCharset(head) : null) ||
 			// An XML declaration is only valid at the very start of the document (a

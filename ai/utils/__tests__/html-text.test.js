@@ -380,6 +380,39 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("ends a content region only where the parser really closes the element", () => {
+		// The first </main> is ignored by the parser (the open <table> is a scope
+		// boundary), so the cell is still inside main and must survive selection
+		const intro = "Intro text. ".repeat(20);
+		const page = `<html><body><main><p>${intro}</p><table></main><tr><td>Actual content</td></tr></table></main><footer>f</footer></body></html>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Actual content");
+		expect(out).toContain("Intro text.");
+		// A </div> that pops the main with it ends the region there
+		const popped = `<html><body><div><main><p>${intro}</p></div><nav>menu</nav><p>Outside</p></body></html>`;
+		const region = htmlToMarkdown(popped);
+		expect(region).toContain("Intro text.");
+		expect(region).not.toContain("Outside");
+		// A <main> the parser discards (inside an open <select>) opens nothing
+		const ignored = `<html><body><select><main></select><main><p>${intro}</p></main><p>Outside</p></body></html>`;
+		expect(htmlToMarkdown(ignored)).not.toContain("Outside");
+	});
+
+	it("leaves inline code spans alone when tidying punctuation and spacing", () => {
+		const page =
+			"<html><body><p>Use <code>div :hover</code> and <code>a ; b</code> here , now .</p>" +
+			"<p>Nested ticks: <code>x ` y ;</code> then text , more</p></body></html>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("`div :hover`");
+		expect(out).toContain("`a ; b`");
+		expect(out).toContain("here, now.");
+		// A span whose content holds a backtick is fenced with two: still untouched
+		expect(out).toContain("x ` y ;");
+		expect(out).toContain("then text, more");
+		// A literal (escaped) backtick in prose does not open a span
+		expect(htmlToMarkdown("<body><p>a ` b , c</p></body>")).toBe("a \\` b, c");
+	});
+
 	it("keeps <mglyph> and <malignmark> in MathML inside text integration points", () => {
 		const deep = "<x>".repeat(600);
 		// Children of <mtext> are HTML, except these two: a <textarea> below them

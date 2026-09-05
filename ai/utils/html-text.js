@@ -612,10 +612,12 @@ function createTreeTracker() {
 		const top = stack.length - 1;
 		return top >= 0 && isForeign(top) ? ns[top] : "html";
 	};
+	const openCounts = new Map(); // element name → how many are open
 	const forget = (i) => {
 		if (ns[i] === null && PREFIXING.has(stack[i])) prefixes--;
 		if (DROP_ELEMENT_SET.has(stack[i])) dropped--;
 		if (stack[i] === "template") templates--;
+		openCounts.set(stack[i], openCounts.get(stack[i]) - 1);
 	};
 	const popTo = (index) => {
 		for (let i = index; i < stack.length; i++) forget(i);
@@ -636,6 +638,7 @@ function createTreeTracker() {
 		if (namespace === null && PREFIXING.has(name)) prefixes++;
 		if (DROP_ELEMENT_SET.has(name)) dropped++;
 		if (name === "template") templates++;
+		openCounts.set(name, (openCounts.get(name) || 0) + 1);
 		if (stack.length > depth) depth = stack.length;
 		if (prefixes > prefixDepth) prefixDepth = prefixes;
 		if (depth > MAX_DOM_DEPTH || prefixDepth > MAX_PREFIX_DEPTH) hostile = true;
@@ -849,6 +852,15 @@ function createTreeTracker() {
 		get dropped() {
 			return dropped > 0;
 		},
+		/**
+		 * How many elements of that name are open. Comparing before and after a
+		 * tag tells whether the tag REALLY opened or closed one (an end tag the
+		 * parser ignores, or a start tag it discards, changes nothing).
+		 * @param {string} name
+		 */
+		openCount(name) {
+			return openCounts.get(name) || 0;
+		},
 	};
 }
 
@@ -866,20 +878,28 @@ function selectContentRegion(html) {
 	};
 	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
 	// slicing it out would also detach it from the ancestor Turndown removes.
-	// The tree simulation says whether the element sits under a dropped one
+	// The tree simulation says whether the element sits under a dropped one, and
+	// whether a tag REALLY opened or closed it: an end tag the parser ignores
+	// (`<main><table></main>` — the table is a scope boundary) does not end the
+	// region, while a </div> that pops an open <main> with it does
 	const tree = createTreeTracker();
+	const names = Object.keys(marks);
 	tokenizeHtml(
 		html,
 		(tag) => {
+			const before = names.map((name) => tree.openCount(name));
 			if (!tree.handle(tag)) return false;
-			const mark = marks[tag.name];
-			if (!mark || tree.dropped) return;
-			if (tag.closing) {
-				mark.end = tag.start; // the last closer wins
-			} else {
-				mark.opens++;
-				if (mark.start === -1) mark.start = tag.start;
-			}
+			names.forEach((name, index) => {
+				const mark = marks[name];
+				const after = tree.openCount(name);
+				if (after > before[index]) {
+					if (tree.dropped) return; // opened inside a dropped element: not a region
+					mark.opens++;
+					if (mark.start === -1) mark.start = tag.start;
+				} else if (after < before[index]) {
+					mark.end = tag.start; // the element was popped here
+				}
+			});
 		},
 		() => undefined,
 		tree.tokenizerOptions
@@ -1558,19 +1578,74 @@ export function htmlToMarkdown(html, { baseUrl } = {}) {
  * only the prose segments are rewritten. No placeholder that page text could
  * collide with, and the output can never grow.
  */
+/**
+ * Split Markdown text into alternating [text, code, text, code, ..., text]
+ * segments on inline code spans, with CommonMark's rule: a backtick run opens
+ * a span that the next run of exactly the same length closes (a longer or
+ * shorter run inside is content); an unmatched run is text, and so is a
+ * backslash-escaped backtick (how Turndown writes a literal one). Linear: the
+ * runs are collected in one pass and matched with one cursor per run length.
+ *
+ * @param {string} text
+ * @returns {string[]} Even indexes are text, odd indexes are code spans
+ */
+function splitInlineCode(text) {
+	const runs = [];
+	for (let i = text.indexOf("`"); i !== -1; ) {
+		let length = 0;
+		while (text.charCodeAt(i + length) === 96) length++;
+		if (i === 0 || text.charCodeAt(i - 1) !== 92) runs.push({ start: i, length });
+		i = text.indexOf("`", i + length);
+	}
+	const byLength = new Map(); // run length → indexes of the runs with it
+	runs.forEach((run, index) => {
+		if (!byLength.has(run.length)) byLength.set(run.length, []);
+		byLength.get(run.length).push(index);
+	});
+	const cursors = new Map();
+	const parts = [];
+	let plain = 0;
+	let r = 0;
+	while (r < runs.length) {
+		const { start, length } = runs[r];
+		const list = byLength.get(length);
+		let c = cursors.get(length) || 0;
+		while (c < list.length && list[c] <= r) c++;
+		cursors.set(length, c);
+		if (c >= list.length) {
+			r++; // no closing run of that length: literal backticks
+			continue;
+		}
+		const close = runs[list[c]];
+		parts.push(text.slice(plain, start), text.slice(start, close.start + length));
+		plain = close.start + length;
+		r = list[c] + 1;
+	}
+	parts.push(text.slice(plain));
+	return parts;
+}
+
+/** Whitespace and punctuation cleanup of a prose segment (never applied to code) */
+function tidyProse(text) {
+	return text
+		.replace(/^(\s*)-\s{2,}(?=\S)/gm, "$1- ")
+		.replace(/^(\s*\d+\.)\s{2,}(?=\S)/gm, "$1 ")
+		.replace(/ +([,.;:!?)\]])/g, "$1")
+		.replace(/\n{3,}/g, "\n\n");
+}
+
 function tidyMarkdown(markdown) {
 	const out = [];
 	let prose = [];
 	let inFence = false;
 	const flush = () => {
 		if (prose.length === 0) return;
+		// Inline code spans are content: "div :hover" or "a ; b" must not lose
+		// their spaces, so only the text between spans is tidied
 		out.push(
-			prose
-				.join("\n")
-				.replace(/^(\s*)-\s{2,}(?=\S)/gm, "$1- ")
-				.replace(/^(\s*\d+\.)\s{2,}(?=\S)/gm, "$1 ")
-				.replace(/ +([,.;:!?)\]])/g, "$1")
-				.replace(/\n{3,}/g, "\n\n")
+			splitInlineCode(prose.join("\n"))
+				.map((segment, index) => (index % 2 === 0 ? tidyProse(segment) : segment))
+				.join("")
 		);
 		prose = [];
 	};

@@ -947,6 +947,30 @@ describe("content negotiation", () => {
 		}
 	});
 
+	it("sniffs a meta charset in untyped bodies only when they start like HTML", async () => {
+		// An untyped UTF-8 tutorial that QUOTES a meta tag is text: the tag has no
+		// authority, the body stays UTF-8
+		const tutorial = Buffer.from(
+			'Step 1: add <meta charset="windows-1252"> to the head.\nStep 2: write Café du marché.',
+			"utf8"
+		);
+		// An untyped body that starts like an HTML document is HTML: its meta counts
+		const page = Buffer.from(
+			'<!DOCTYPE html><html><head><meta charset="windows-1252"></head><body><p>Caf\xe9 du march\xe9</p></body></html>',
+			"latin1"
+		);
+		const routes = {
+			"https://example.com/notes": response(tutorial, { contentType: null }),
+			"https://example.com/page": response(page, { contentType: null }),
+		};
+		const notes = await run({ url: "https://example.com/notes" }, { routes });
+		expect(notes.result.source).toBe("text");
+		expect(notes.result.content).toContain("Café du marché");
+		const html = await run({ url: "https://example.com/page" }, { routes });
+		expect(html.result.source).toBe("html");
+		expect(html.result.content).toContain("Café du marché");
+	});
+
 	it("falls back to windows-1252 for HTML without any encoding declaration", async () => {
 		// The HTML fallback encoding: a lone 0xE9 is "é"...
 		const latin = Buffer.from("<html><body><p>Caf\xe9 du march\xe9</p></body></html>", "latin1");
