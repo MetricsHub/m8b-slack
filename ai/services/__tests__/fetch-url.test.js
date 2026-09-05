@@ -682,6 +682,23 @@ describe("content negotiation", () => {
 		expect(result.content).toContain("Café");
 	});
 
+	it("honours the XML encoding declaration when the HTTP charset is missing", async () => {
+		const latinXml = Buffer.from(
+			'<?xml version="1.0" encoding="iso-8859-1"?><rss><channel><title>Caf\xe9 du march\xe9</title></channel></rss>',
+			"latin1"
+		);
+		const routes = {
+			"https://example.com/feed.xml": response(latinXml, { contentType: "application/rss+xml" }),
+			"https://example.com/data.xml": response(latinXml, { contentType: "text/xml" }),
+		};
+		for (const url of ["https://example.com/feed.xml", "https://example.com/data.xml"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.ok).toBe(true);
+			expect(result.source).toBe("text");
+			expect(result.content).toContain("Café du marché");
+		}
+	});
+
 	it("unwraps Slack link syntax", async () => {
 		const routes = {
 			"https://example.com/page": response("plain", { contentType: "text/plain" }),

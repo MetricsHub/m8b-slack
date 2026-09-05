@@ -36,6 +36,7 @@ const DROP_ELEMENTS = [
 	"select",
 	"dialog",
 ];
+const DROP_ELEMENT_SET = new Set(DROP_ELEMENTS);
 
 const NAMED_ENTITIES = {
 	amp: "&",
@@ -250,9 +251,24 @@ function tokenizeHtml(html, onTag, onText) {
 		pos = gt + 1;
 
 		if (!closing && (RAW_TEXT_ELEMENTS.has(name) || RCDATA_ELEMENTS.has(name))) {
-			// Not markup until the matching closer (or the end of input)
+			// Not markup until the matching closer (or the end of input). The closer
+			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
+			// a script is script text, as in the HTML tokenizer. Each miss resumes
+			// past the previous candidate, so the search stays linear.
 			if (lower === null) lower = html.toLowerCase();
-			const close = lower.indexOf(`</${name}`, pos);
+			let close = lower.indexOf(`</${name}`, pos);
+			while (close !== -1) {
+				const after = lower.charCodeAt(close + 2 + name.length);
+				if (
+					Number.isNaN(after) ||
+					after === 62 ||
+					after === 47 ||
+					after === 32 ||
+					(after >= 9 && after <= 13)
+				)
+					break;
+				close = lower.indexOf(`</${name}`, close + 1);
+			}
 			const bodyEnd = close === -1 ? length : close;
 			if (RCDATA_ELEMENTS.has(name) && bodyEnd > pos) {
 				if (onText(html.slice(pos, bodyEnd)) === false) return;
@@ -316,11 +332,23 @@ function selectContentRegion(html) {
 		article: { opens: 0, start: -1, end: -1 },
 		body: { opens: 0, start: -1, end: -1 },
 	};
+	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
+	// slicing it out would also detach it from the ancestor Turndown removes
+	const droppedAncestors = [];
 	tokenizeHtml(
 		html,
-		({ name, closing, start }) => {
+		({ name, closing, selfClosing, start }) => {
+			if (DROP_ELEMENT_SET.has(name)) {
+				if (closing) {
+					const index = droppedAncestors.lastIndexOf(name);
+					if (index !== -1) droppedAncestors.length = index;
+				} else if (!(selfClosing && (name === "svg" || name === "math"))) {
+					droppedAncestors.push(name);
+				}
+				return;
+			}
 			const mark = marks[name];
-			if (!mark) return;
+			if (!mark || droppedAncestors.length > 0) return;
 			if (closing) {
 				mark.end = start; // the last closer wins
 			} else {
@@ -364,14 +392,23 @@ const MAX_URL_CHARS_PER_DOCUMENT = 300000;
  * parser's rules that matter for depth: a closer only pops elements when its
  * element is actually open (an unmatched </span> is ignored, so <div></span>
  * repeated nests), and everyday unclosed <li>/<p>/<td>... are implicitly
- * closed by their siblings. Stops as soon as the cap is exceeded, so the
- * stack — and each closer's search through it — stays bounded.
+ * closed by their siblings. Also tracks how deep lists and blockquotes nest
+ * (Turndown prefixes every line per ancestor, so that depth multiplies the
+ * output). Stops as soon as either cap is exceeded, so the stack — and each
+ * closer's search through it — stays bounded.
+ *
+ * @param {string} html - Markup
+ * @returns {{depth: number, prefixDepth: number}}
  */
-function estimateMaxNestingDepth(html) {
+function estimateNesting(html) {
 	const stack = [];
-	let max = 0;
+	let depth = 0;
+	let prefixDepth = 0;
+	let prefixes = 0; // list/blockquote ancestors currently open
 	// Foreign content (svg, math) honours "/>" and is dropped by the converter
-	// anyway: skipped as a whole so inline icons and charts never count
+	// anyway: skipped as a whole so inline icons and charts never count. HTML
+	// "breakout" tags inside it pop the foreign content in the parser and are
+	// processed as ordinary HTML, so they are counted.
 	let foreign = null;
 	let foreignDepth = 0;
 	tokenizeHtml(
@@ -381,12 +418,17 @@ function estimateMaxNestingDepth(html) {
 				if (name === foreign && !(selfClosing && !closing)) {
 					foreignDepth += closing ? -1 : 1;
 					if (foreignDepth === 0) foreign = null;
+					return true;
 				}
-				return true;
+				if (closing || !FOREIGN_BREAKOUT.has(name)) return true;
+				foreign = null; // the breakout closed the foreign subtree: fall through
 			}
 			if (closing) {
 				const index = stack.lastIndexOf(name);
-				if (index !== -1) stack.length = index;
+				if (index !== -1) {
+					for (let i = index; i < stack.length; i++) if (PREFIXING.has(stack[i])) prefixes--;
+					stack.length = index;
+				}
 				return true;
 			}
 			if (name === "svg" || name === "math") {
@@ -400,16 +442,83 @@ function estimateMaxNestingDepth(html) {
 			if (VOID_ELEMENTS.has(name)) return true;
 			const closes = IMPLICIT_CLOSERS[name];
 			if (closes) {
-				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) stack.pop();
+				while (stack.length > 0 && closes.includes(stack[stack.length - 1])) {
+					if (PREFIXING.has(stack[stack.length - 1])) prefixes--;
+					stack.pop();
+				}
 			}
 			stack.push(name);
-			if (stack.length > max) max = stack.length;
-			return max <= MAX_DOM_DEPTH;
+			if (PREFIXING.has(name)) prefixes++;
+			if (stack.length > depth) depth = stack.length;
+			if (prefixes > prefixDepth) prefixDepth = prefixes;
+			return depth <= MAX_DOM_DEPTH && prefixDepth <= MAX_PREFIX_DEPTH;
 		},
 		() => undefined
 	);
-	return max;
+	return { depth, prefixDepth };
 }
+
+/**
+ * Elements Turndown renders with a per-line prefix (list indentation, "> ").
+ * Nesting them multiplies the output: every line of a deep list repeats the
+ * indentation of all its ancestors, so a small page could expand a lot.
+ */
+const PREFIXING = new Set(["ul", "ol", "blockquote"]);
+
+/** Deepest list/blockquote nesting the DOM route accepts (real pages stay far below) */
+const MAX_PREFIX_DEPTH = 16;
+
+/**
+ * HTML start tags that end foreign content (svg, math) in the HTML parser:
+ * everything after them is ordinary HTML again and counts towards depth.
+ */
+const FOREIGN_BREAKOUT = new Set([
+	"b",
+	"big",
+	"blockquote",
+	"body",
+	"br",
+	"center",
+	"code",
+	"dd",
+	"div",
+	"dl",
+	"dt",
+	"em",
+	"embed",
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"head",
+	"hr",
+	"i",
+	"img",
+	"li",
+	"listing",
+	"menu",
+	"meta",
+	"nobr",
+	"ol",
+	"p",
+	"pre",
+	"ruby",
+	"s",
+	"small",
+	"span",
+	"strong",
+	"strike",
+	"sub",
+	"sup",
+	"table",
+	"tt",
+	"u",
+	"ul",
+	"var",
+	"font",
+]);
 
 /** Elements whose content is dropped by the fallback converter */
 const FALLBACK_DROP = new Set([...DROP_ELEMENTS, "title"]);
@@ -648,9 +757,11 @@ export function htmlToMarkdown(html, { baseUrl } = {}) {
 	// removed as nodes, whatever their nesting
 	source = selectContentRegion(source);
 
-	// Hostile nesting depth: the parser's cost grows quadratically with it and
-	// the converter recurses per level. Refuse the DOM route up front.
-	if (estimateMaxNestingDepth(source) > MAX_DOM_DEPTH) {
+	// Hostile nesting: the parser's cost grows quadratically with element depth
+	// and the converter recurses per level; nested lists and quotes multiply
+	// the output by their depth. Refuse the DOM route up front in both cases.
+	const nesting = estimateNesting(source);
+	if (nesting.depth > MAX_DOM_DEPTH || nesting.prefixDepth > MAX_PREFIX_DEPTH) {
 		return stripTagsFallback(source);
 	}
 

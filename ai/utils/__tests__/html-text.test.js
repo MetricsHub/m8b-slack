@@ -209,6 +209,54 @@ describe("htmlToMarkdown", () => {
 		expect(out).toContain("- a");
 	});
 
+	it("refuses list/blockquote nesting that would multiply the output", () => {
+		// ~255 nested lists then thousands of siblings: each line would carry ~1 KB of indentation
+		const depth = 255;
+		const page = `<body>${"<ul><li>".repeat(depth)}${"<li>x</li>".repeat(20000)}${"</li></ul>".repeat(depth)}</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out.length).toBeLessThan(page.length + 1000);
+		expect(out).toContain("x");
+
+		const quotes = `<body>${"<blockquote>".repeat(200)}${"<p>q</p>".repeat(5000)}${"</blockquote>".repeat(200)}</body>`;
+		expect(htmlToMarkdown(quotes).length).toBeLessThan(quotes.length + 1000);
+
+		// Ordinary nesting keeps the DOM route
+		const normal = htmlToMarkdown(
+			"<body><ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li></ul></body>"
+		);
+		expect(normal).toContain("- a");
+		expect(normal).toMatch(/\n\s+- b/);
+	});
+
+	it("counts HTML breakout tags inside SVG towards nesting depth", () => {
+		const page = `<body><svg>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("ignores a <main> nested inside a dropped element", () => {
+		const long = "Article text. ".repeat(40);
+		const decoy = `<template><main>${"Template text. ".repeat(40)}</main></template>`;
+		const page = `<body>${decoy}<nav><main>${"Menu text. ".repeat(40)}</main></nav><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Article text.");
+		expect(out).not.toContain("Template text.");
+		expect(out).not.toContain("Menu text.");
+	});
+
+	it("only accepts a complete closing tag name for raw-text elements", () => {
+		const long = "Real article. ".repeat(40);
+		const page = `<body><script>var s = "</scripture>"; var m = "<main>${"Injected. ".repeat(40)}</main>";</script><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real article.");
+		expect(out).not.toContain("Injected.");
+		expect(extractHtmlTitle("<head><title>Ti</titles>tle</title></head>")).toBe("Ti</titles>tle");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

@@ -455,7 +455,11 @@ function isTextualType(type) {
 function decodeBody(bytes, charset, type) {
 	// A UTF-16 byte-order mark (or declared charset) wins over any sniffing
 	let label = utf16Label(bytes, charset) || charset;
-	if (!label && type && HTML_TYPES.has(type)) {
+	// No HTTP charset: HTML <meta charset> and XML encoding declarations decide
+	// (for HTML and XML media types alike — RSS/Atom feeds, sitemaps, ...)
+	const declaresEncoding =
+		!type || HTML_TYPES.has(type) || type === "text/xml" || /xml$/.test(type);
+	if (!label && declaresEncoding) {
 		// Sniff <meta charset> in the first bytes of the document
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
