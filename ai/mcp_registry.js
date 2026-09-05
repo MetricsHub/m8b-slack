@@ -405,10 +405,21 @@ export function isHostRoutedMcpTool(name) {
 	// Every server is inspected: with mixed agent versions, a later server may
 	// export the host-routed definition the first one lacks
 	for (const server of state.servers) {
-		const props = server.tools?.get?.(name)?.inputSchema?.properties;
-		if (props && ("hosts" in props || "hostname" in props || "host" in props)) return true;
+		if (hasHostRoutingParam(server.tools?.get?.(name))) return true;
 	}
 	return false;
+}
+
+/**
+ * Whether an MCP tool definition declares a host-routing argument of its own
+ * (hosts / hostname / host).
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Tool definition
+ * @returns {boolean}
+ */
+function hasHostRoutingParam(def) {
+	const props = def?.inputSchema?.properties;
+	return Boolean(props && ("hosts" in props || "hostname" in props || "host" in props));
 }
 
 /**
@@ -501,14 +512,23 @@ export function getOpenAiFunctionTools() {
 		},
 	});
 
-	// Other tools discovered per server (excluding ListHosts)
-	const seen = new Set();
+	// Other tools discovered per server (excluding ListHosts): one definition per
+	// name. With mixed agent versions the same tool may come with different
+	// schemas; the definition that declares its own host-routing argument is the
+	// one that can be driven through the router, so it wins over one without
+	// (otherwise the first seen wins, and the tool keeps its first position)
+	const definitions = new Map();
 	for (const server of state.servers) {
 		for (const [name, def] of server.tools.entries()) {
 			if (name === "ListHosts") continue;
-			if (seen.has(name)) continue;
-			seen.add(name);
-
+			const current = definitions.get(name);
+			if (!current || (!hasHostRoutingParam(current) && hasHostRoutingParam(def))) {
+				definitions.set(name, def);
+			}
+		}
+	}
+	for (const [name, def] of definitions) {
+		{
 			const schema = def?.inputSchema || { type: "object", properties: {} };
 			const params = { type: "object", properties: {}, additionalProperties: false };
 

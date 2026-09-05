@@ -4,7 +4,12 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
 import { _setServersForTests, isHostRoutedMcpTool } from "../../mcp_registry.js";
-import { buildFunctionNamespaces, buildToolsArray, KNOWLEDGE_TOOL } from "../index.js";
+import {
+	buildFunctionNamespaces,
+	buildToolsArray,
+	isFetchUrlAdvertised,
+	KNOWLEDGE_TOOL,
+} from "../index.js";
 
 function makeTool(name) {
 	return {
@@ -378,6 +383,57 @@ describe("buildToolsArray", () => {
 			// The MCP reader wins (one definition), the built-in is not added alongside
 			expect(readers).toHaveLength(1);
 			expect(readers[0].parameters.properties).toHaveProperty("hosts");
+			// ...and it is the host-routed DEFINITION that is advertised, not the first
+			// server's URL-only schema with a hosts field bolted on
+			expect(readers[0].description).toBe("Host-routed reader.");
+			expect(readers[0].parameters.required).toEqual(expect.arrayContaining(["hosts"]));
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("advertises page-reading guidance only when a fetch_url reader is exposed", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		const server = (props) => ({
+			server_label: "a1",
+			server_url: "https://a1.example",
+			token: "",
+			tools: new Map([
+				[
+					"fetch_url",
+					{ description: "Reader.", inputSchema: { type: "object", properties: props } },
+				],
+			]),
+		});
+		const namespaced = (tools) =>
+			tools
+				.filter((tool) => tool.type === "namespace")
+				.flatMap((namespace) => namespace.tools.map((tool) => tool.name));
+		try {
+			// Only a URL-only MCP reader: the hosted path filters it out, so the prompt
+			// must not tell the model to read links with a tool it does not have
+			_setServersForTests([server({ url: {} })]);
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(false);
+			expect(
+				namespaced(buildToolsArray({ vectorStoreIds: [], provider: openAiProvider }))
+			).not.toContain("fetch_url");
+			// Function-only providers get the built-in reader regardless
+			expect(isFetchUrlAdvertised(ollamaProvider.capabilities)).toBe(true);
+
+			// A host-routed MCP reader is advertised on the hosted path
+			_setServersForTests([server({ url: {}, hosts: { type: "array" } })]);
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(true);
+			expect(
+				namespaced(buildToolsArray({ vectorStoreIds: [], provider: openAiProvider }))
+			).toContain("fetch_url");
+
+			// The switch turns everything off
+			process.env.FETCH_URL_ENABLED = "false";
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(false);
+			expect(isFetchUrlAdvertised(ollamaProvider.capabilities)).toBe(false);
 		} finally {
 			_setServersForTests([]);
 			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;

@@ -250,6 +250,23 @@ export function buildFunctionToolsArray({
  * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of tool definitions
  */
+/**
+ * Whether a fetch_url reader is advertised to the model for a provider with
+ * these capabilities: the built-in reader on function-only providers (unless
+ * FETCH_URL_ENABLED=false), or a host-routed MCP reader on providers with tool
+ * namespaces. buildToolsArray() and the system prompt's page-reading guidance
+ * share this predicate, so the prompt never names a reader that was filtered
+ * out of the tool set.
+ *
+ * @param {{toolNamespaces?: boolean}|undefined} capabilities - Provider capability flags
+ * @returns {boolean}
+ */
+export function isFetchUrlAdvertised(capabilities) {
+	if (!isFetchUrlEnabled()) return false;
+	if (capabilities && !capabilities.toolNamespaces) return true;
+	return isHostRoutedMcpTool("fetch_url");
+}
+
 export function buildToolsArray({
 	vectorStoreIds = [],
 	codeFileIds = new Set(),
@@ -285,7 +302,7 @@ export function buildToolsArray({
 	// fetch_url is not advertised here either (its calls are refused anyway)
 	// ...and a URL-only MCP fetch_url is not advertised either: it cannot be
 	// driven through the host router, so a call would silently go elsewhere
-	const advertiseMcpFetchUrl = isFetchUrlEnabled() && isHostRoutedMcpTool("fetch_url");
+	const advertiseMcpFetchUrl = isFetchUrlAdvertised({ toolNamespaces: true });
 	const mcpFunctionTools = advertiseMcpFetchUrl
 		? getOpenAiFunctionTools()
 		: getOpenAiFunctionTools().filter((tool) => tool.name !== "fetch_url");

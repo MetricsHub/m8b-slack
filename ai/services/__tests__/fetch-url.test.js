@@ -935,6 +935,36 @@ describe("content negotiation", () => {
 		}
 	});
 
+	it("lets a UTF-8 byte-order mark override a wrong declared charset", async () => {
+		// WHATWG decode: the BOM is sniffed before any label, so a UTF-8 document
+		// served as windows-1252 (or declaring it in a meta tag) is still UTF-8
+		const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+		const html = Buffer.concat([
+			bom,
+			Buffer.from(
+				'<html><head><meta charset="windows-1252"></head><body><p>Café du marché</p></body></html>',
+				"utf8"
+			),
+		]);
+		const text = Buffer.concat([bom, Buffer.from("Café du marché", "utf8")]);
+		const routes = {
+			"https://example.com/page": response(html, {
+				contentType: "text/html; charset=windows-1252",
+			}),
+			"https://example.com/note.txt": response(text, {
+				contentType: "text/plain; charset=iso-8859-1",
+			}),
+		};
+		for (const url of ["https://example.com/page", "https://example.com/note.txt"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.ok).toBe(true);
+			expect(result.content).toContain("Café du marché");
+			expect(result.content).not.toContain("Ã");
+			expect(result.content).not.toContain("\uFEFF");
+			expect(result.content).not.toContain("ï»¿");
+		}
+	});
+
 	it("accepts whitespace in the HTTP charset parameter", async () => {
 		const latin = Buffer.from("<html><body><p>Caf\xe9 du march\xe9</p></body></html>", "latin1");
 		const routes = {
@@ -976,12 +1006,13 @@ describe("content negotiation", () => {
 		};
 		const { result } = await run({ url: "https://example.com/feed.xml" }, { routes });
 		expect(result.content).toContain("Café");
-		// A leading declaration behind a UTF-8 BOM still counts
+		// A UTF-8 BOM ahead of the declaration wins over it: the document IS UTF-8,
+		// whatever the (contradicting) declaration says
 		const bom = Buffer.concat([
 			Buffer.from([0xef, 0xbb, 0xbf]),
 			Buffer.from(
-				'<?xml version="1.0" encoding="windows-1252"?><rss><title>Caf\xe9</title></rss>',
-				"latin1"
+				'<?xml version="1.0" encoding="windows-1252"?><rss><title>Café</title></rss>',
+				"utf8"
 			),
 		]);
 		const withBom = await run(

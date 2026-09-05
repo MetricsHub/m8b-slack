@@ -516,8 +516,10 @@ function metaCharset(head) {
 }
 
 function decodeBody(bytes, charset, type) {
-	// A UTF-16 byte-order mark (or declared charset) wins over any sniffing
-	let label = utf16Label(bytes, charset) || charset;
+	// A byte-order mark wins over everything, the HTTP charset included (WHATWG
+	// Encoding "decode": BOM sniffing comes first) — a UTF-8 document served as
+	// windows-1252 is still UTF-8. Then the declared charset (UTF-16 by name too)
+	let label = bomLabel(bytes) || utf16Label(bytes, charset) || charset;
 	// No HTTP charset: the document's own declaration decides. For HTML that is
 	// <meta charset> (then an XML declaration, as browsers accept on XHTML served
 	// as text/html); for XML media types (RSS/Atom feeds, sitemaps, ...) only the
@@ -606,6 +608,20 @@ export function looksBinary(bytes, charset = null) {
 /**
  * "utf-16le" / "utf-16be" when the body is UTF-16 (declared charset or BOM), else null.
  */
+/**
+ * Encoding named by a leading byte-order mark: "utf-8", "utf-16le", "utf-16be",
+ * or null when there is none.
+ *
+ * @param {Uint8Array} bytes - Response body
+ * @returns {string|null}
+ */
+function bomLabel(bytes) {
+	if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return "utf-8";
+	if (bytes[0] === 0xff && bytes[1] === 0xfe) return "utf-16le";
+	if (bytes[0] === 0xfe && bytes[1] === 0xff) return "utf-16be";
+	return null;
+}
+
 function utf16Label(bytes, charset) {
 	const declared = String(charset || "")
 		.toLowerCase()

@@ -688,6 +688,21 @@ describe("htmlToMarkdown", () => {
 });
 
 describe("extractHtmlTitle", () => {
+	it("closes a script at the first </script> after a double-escaped -->", () => {
+		// Tokenizer: "-->" in the script data double escaped (dash dash) state switches
+		// to the script data state, so the next </script> ends the element and the
+		// markup after it is live again (browsers and domino agree)
+		const page =
+			"<html><head><script><!--<script>--></script><title>Real title</title></head>" +
+			"<body><h1>Heading</h1></body></html>";
+		expect(extractHtmlTitle(page)).toBe("Real title");
+		// Whereas before "-->" the </script> only leaves the double-escaped state
+		const stillOpen =
+			"<html><head><script><!--<script></script><title>Not a title</title>--></script>" +
+			"<title>Real title</title></head></html>";
+		expect(extractHtmlTitle(stillOpen)).toBe("Real title");
+	});
+
 	it("prefers <title>, decoded and whitespace-normalized", () => {
 		expect(extractHtmlTitle(PAGE)).toBe("Install & Configure — Docs");
 	});
