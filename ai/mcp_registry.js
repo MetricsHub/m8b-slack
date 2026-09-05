@@ -589,9 +589,9 @@ function describeViolations(errors) {
 function toolIncompatibility(server, name, callArgs) {
 	const def = server.tools?.get?.(name);
 	if (!def) return `Agent ${server.server_label} does not provide the tool ${name}`;
-	if (!hasHostRoutingParam(def)) {
-		return `Agent ${server.server_label} exports a version of ${name} without a host argument, which cannot be routed by host`;
-	}
+	// A tool without a host argument of its own is still callable: the hosts
+	// the model chose select the servers, routedCalls() drops the routing
+	// fields the destination does not declare, and the call goes out as-is
 	const { validate, reason } = schemaValidator(def);
 	if (reason) return `Agent ${server.server_label}'s version of ${name} ${reason}`;
 	if (validate && !validate(callArgs)) {
@@ -713,6 +713,9 @@ export function getOpenAiFunctionTools() {
 			if (schema && typeof schema === "object" && schema.type === "object" && schema.properties) {
 				params.properties = { ...schema.properties };
 				if (Array.isArray(schema.required)) params.required = [...schema.required];
+				// Local references ($ref: "#/$defs/...") need the definitions they point to
+				if (schema.$defs) params.$defs = schema.$defs;
+				if (schema.definitions) params.definitions = schema.definitions;
 				params.additionalProperties = false;
 			}
 

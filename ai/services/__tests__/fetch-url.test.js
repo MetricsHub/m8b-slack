@@ -851,6 +851,38 @@ describe("content negotiation", () => {
 		expect(result.content).toBe("User-agent: *\nDisallow:");
 	});
 
+	it("resolves relative llms.txt links against the index document", () => {
+		// The index lives at /llms.txt: "docs/install.md" is /docs/install.md, not
+		// /docs/docs/install.md relative to the page being read
+		expect(
+			findLlmsTxtEntry(
+				"# Site\n\n- [Install](docs/install.md)",
+				new URL("https://d.example/docs/install"),
+				new URL("https://d.example/llms.txt")
+			)
+		).toBe("https://d.example/docs/install.md");
+		// Without an explicit index URL, the site root's /llms.txt is assumed
+		expect(
+			findLlmsTxtEntry("[Install](docs/install.md)", new URL("https://d.example/docs/install"))
+		).toBe("https://d.example/docs/install.md");
+	});
+
+	it("rejects a Markdown candidate that is an HTML shell behind leading comments", async () => {
+		const routes = {
+			"https://docs.example.com/guide/install.html": response(HTML_PAGE),
+			"https://docs.example.com/guide/install.md": response(
+				"<!-- generated --><!DOCTYPE html><html><body><div id=app>shell</div></body></html>",
+				{ contentType: "text/markdown" }
+			),
+		};
+		const { result } = await run(
+			{ url: "https://docs.example.com/guide/install.html" },
+			{ routes }
+		);
+		expect(result.source).toBe("html");
+		expect(result.content).not.toContain("shell");
+	});
+
 	it("prefers the sibling .md rendition of an HTML page", async () => {
 		const routes = {
 			"https://docs.example.com/guide/install.html": response(HTML_PAGE),
@@ -990,6 +1022,18 @@ describe("content negotiation", () => {
 		const html = await run({ url: "https://example.com/page" }, { routes });
 		expect(html.result.source).toBe("html");
 		expect(html.result.content).toContain("Café du marché");
+	});
+
+	it("ignores a meta charset beyond the first 1024 bytes", async () => {
+		// A stale declaration past the prescan window has no authority: the page is
+		// well-formed UTF-8 and stays UTF-8
+		const page = Buffer.from(
+			`<html><head>${" ".repeat(1100)}<meta charset="windows-1252"></head><body><p>Café du marché</p></body></html>`,
+			"utf8"
+		);
+		const routes = { "https://example.com/late": response(page, { contentType: "text/html" }) };
+		const { result } = await run({ url: "https://example.com/late" }, { routes });
+		expect(result.content).toContain("Café du marché");
 	});
 
 	it("falls back to windows-1252 for HTML without any encoding declaration", async () => {

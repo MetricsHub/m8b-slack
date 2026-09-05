@@ -7,6 +7,7 @@ import {
 	decodeHtmlEntities,
 	estimateNesting,
 	extractHtmlTitle,
+	hasTextOfAtLeast,
 	htmlToMarkdown,
 	MAX_DOM_DEPTH,
 } from "../html-text.js";
@@ -481,6 +482,38 @@ describe("htmlToMarkdown", () => {
 			"[Guide](https://d.example/docs/guide)"
 		);
 		expect(estimateNesting("<select><optgroup><option><hr><option>x").depth).toBe(3);
+	});
+
+	it("treats foreign integration points as special elements for end tags", () => {
+		// </span> below an svg <foreignObject> (or a MathML <mi>) is rejected by the
+		// generic end-tag algorithm, which stops at that special element: every
+		// repetition nests four more levels
+		expect(
+			estimateNesting("<span><svg><foreignObject><x></span>".repeat(200)).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<span><math><mi><x></span>".repeat(200)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// An ordinary foreign element (<g>) is not special: the span still closes
+		expect(estimateNesting("<span><svg><g></span>".repeat(200)).depth).toBe(3);
+	});
+
+	it("measures region text without one DOM parse per fragment", () => {
+		// 100,000 entity-only fragments never reach the threshold: the text is decoded
+		// in batches (a few hundred decodes, not one per fragment), so the check is cheap
+		const fragments = "<i>&nbsp;</i>".repeat(100000);
+		let started = Date.now();
+		expect(hasTextOfAtLeast(fragments, 200)).toBe(false);
+		expect(Date.now() - started).toBeLessThan(1000);
+		// Visible text still counts once decoded, whatever the batching
+		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(200)}`, 200)).toBe(true);
+		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(199)}`, 200)).toBe(false);
+		// End to end, the empty-looking main is skipped and the real text kept
+		const real = "Real content. ".repeat(20);
+		const page = `<html><body><main>${"<i>&nbsp;</i>".repeat(20000)}</main><p>${real}</p></body></html>`;
+		started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Real content.");
+		expect(Date.now() - started).toBeLessThan(3000);
 	});
 
 	it("reads attribute names as the tokenizer does: quotes are part of a name", () => {

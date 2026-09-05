@@ -672,23 +672,39 @@ function attributeValue(attrs, name) {
  * Whether the text the converter will expose reaches a minimum length (stops
  * early): character references decoded, whitespace (non-breaking spaces
  * included) not counted, and nothing counted inside the elements the
- * converter drops or the parser keeps as raw text.
+ * converter drops or the parser keeps as raw text. Text is decoded in
+ * batches: the raw length bounds the visible length (a reference is never
+ * shorter than what it decodes to), so pending text is only decoded once it
+ * could reach the threshold — each character is decoded at most once, and a
+ * region made of 100,000 "&nbsp;" fragments costs a few hundred decodes, not
+ * one per fragment. Exported for tests only.
  */
-function hasTextOfAtLeast(html, minimum) {
-	let count = 0;
+export function hasTextOfAtLeast(html, minimum) {
+	let visible = 0;
+	let pending = [];
+	let pendingLength = 0;
+	const decodePending = () => {
+		const text = pending.join("");
+		pending = [];
+		pendingLength = 0;
+		const decoded = text.includes("&") ? decodeHtmlEntities(text) : text;
+		visible += decoded.replace(/[\s\u00a0]+/g, "").length;
+	};
 	const tree = createTreeTracker();
 	tokenizeHtml(
 		html,
 		(tag) => tree.handle(tag),
 		(text) => {
 			if (tree.dropped || tree.inTemplate) return true;
-			const visible = text.includes("&") ? decodeHtmlEntities(text) : text;
-			count += visible.replace(/[\s\u00a0]+/g, "").length;
-			return count < minimum;
+			pending.push(text);
+			pendingLength += text.length;
+			if (visible + pendingLength < minimum) return true; // cannot reach it yet
+			decodePending();
+			return visible < minimum;
 		},
 		tree.tokenizerOptions
 	);
-	return count >= minimum;
+	return visible >= minimum;
 }
 
 /** Start/end tags that still mean something inside an open <select> */
@@ -829,8 +845,16 @@ function createTreeTracker() {
 		integration.push(isIntegration);
 		if (!positions.has(name)) positions.set(name, []);
 		positions.get(name).push(index);
-		if (SPECIAL_ELEMENTS.has(name)) specials.push(index);
-		if (SCOPE_BOUNDARY.has(name)) boundaries.push(index);
+		// The special and scope-boundary categories are per namespace: HTML's own
+		// lists for HTML elements; for foreign ones, the integration points (svg
+		// foreignObject/desc/title, MathML mi/mo/mn/ms/mtext/annotation-xml), which
+		// the generic end tag stops at and "in scope" does not cross
+		const foreignSpecial =
+			namespace === "svg"
+				? SVG_INTEGRATION.has(name)
+				: namespace === "math" && (MATHML_TEXT_INTEGRATION.has(name) || name === "annotation-xml");
+		if (namespace === null ? SPECIAL_ELEMENTS.has(name) : foreignSpecial) specials.push(index);
+		if (namespace === null ? SCOPE_BOUNDARY.has(name) : foreignSpecial) boundaries.push(index);
 		if (namespace === null) {
 			if (LIST_SCOPE.has(name)) listScopes.push(index);
 			if (BUTTON_SCOPE.has(name)) buttons.push(index);

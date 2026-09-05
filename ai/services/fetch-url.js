@@ -505,7 +505,9 @@ function decodeBody(bytes, charset, type) {
 	// An untyped body is HTML here only when it STARTS like an HTML document
 	// (checked on the latin1 prefix): a tutorial or source file that merely
 	// quotes a <meta charset> is text, whatever the tag says
-	const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
+	// The encoding prescan covers the first 1024 bytes, as browsers do: a stale
+	// <meta charset> further down has no authority
+	const head = new TextDecoder("latin1").decode(bytes.subarray(0, 1024));
 	const isHtml = HTML_TYPES.has(type) || (!type && startsLikeHtmlDocument(head));
 	const isXml = type === "text/xml" || /xml$/.test(type);
 	if (!label && (isHtml || isXml)) {
@@ -868,15 +870,18 @@ function pagePathKey(rawUrl) {
  *
  * @param {string} llmsText - Content of /llms.txt
  * @param {URL} pageUrl - Page being read
+ * @param {URL} [indexUrl] - URL the index was fetched from: relative links in it
+ *   resolve against the index document, not the page (default: the site root's
+ *   /llms.txt for that page)
  * @returns {string|null} Absolute URL of the matching Markdown file
  */
-export function findLlmsTxtEntry(llmsText, pageUrl) {
+export function findLlmsTxtEntry(llmsText, pageUrl, indexUrl = new URL("/llms.txt", pageUrl)) {
 	const target = pagePathKey(pageUrl.toString());
 	if (target === null) return null;
 	for (const href of llmsTxtLinks(String(llmsText || ""))) {
 		let absolute;
 		try {
-			absolute = new URL(href, pageUrl).toString();
+			absolute = new URL(href, indexUrl).toString();
 		} catch {
 			continue;
 		}
@@ -1036,8 +1041,9 @@ async function tryMarkdownResource(candidateUrl, runtime) {
 		const bytes = await readBodyCapped(response, runtime.config.maxBytes);
 		if (looksBinary(bytes, charset)) return null;
 		const text = decodeBody(bytes, charset, type);
-		// A "Markdown" file that is really an HTML error/SPA shell is useless
-		if (/^\s*<(?:!doctype|html|head|body)\b/i.test(text) || !text.trim()) return null;
+		// A "Markdown" file that is really an HTML error/SPA shell is useless —
+		// judged like every other body, leading comments included
+		if (startsLikeHtmlDocument(text) || !text.trim()) return null;
 		return { text, url: url.toString(), contentType: type || "text/markdown" };
 	} catch (e) {
 		runtime.logger?.debug?.(
@@ -1137,7 +1143,7 @@ async function readWebPage(pageUrl, runtime, { derivedHost = false } = {}) {
 	// A listed rendition cannot carry the page's query string: skip the index then
 	const llms = finalUrl.search ? null : await tryMarkdownResource(llmsUrl, runtime);
 	if (llms) {
-		const entry = findLlmsTxtEntry(llms.text, finalUrl);
+		const entry = findLlmsTxtEntry(llms.text, finalUrl, new URL(llmsUrl));
 		if (entry && entry !== llmsUrl) {
 			const markdown = await tryMarkdownResource(entry, runtime);
 			if (markdown) {

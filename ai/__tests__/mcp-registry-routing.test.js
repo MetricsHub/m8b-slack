@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "@jest/globals";
 import {
 	_setServersForTests,
 	executeMcpFunctionCall,
+	getOpenAiFunctionTools,
 	refreshHostsForServer,
 } from "../mcp_registry.js";
 
@@ -67,10 +68,12 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		});
 		expect(out.ok).toBe(true);
 		const byServer = Object.fromEntries(out.results.map((r) => [r.server_label, r]));
-		// The old agent's URL-only version cannot take the routed call: refused with a reason
-		expect(byServer.old.ok).toBe(false);
-		expect(byServer.old.error).toContain("cannot be routed by host");
-		expect(old.calls.filter((c) => c.name === "fetch_url")).toHaveLength(0);
+		// The old agent's URL-only version is still called: the hosts the model chose
+		// selected the server, and the routing field it does not declare is dropped
+		expect(byServer.old.ok).toBe(true);
+		const oldCalls = old.calls.filter((c) => c.name === "fetch_url");
+		expect(oldCalls).toHaveLength(1);
+		expect(oldCalls[0].args).toEqual({ url: "https://example.com/" });
 		// The host-routed agent gets the call, with its own hosts only
 		expect(byServer.new).toMatchObject({ ok: true, result: { ok: true, agent: "new" } });
 		const sent = recent.calls.filter((c) => c.name === "fetch_url");
@@ -153,6 +156,30 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 				.slice(before)
 				.map((c) => c.args.hostname)
 		).toEqual(["h-01", "h-02"]);
+	});
+
+	it("advertises the definitions local references point to", () => {
+		const server = fakeServer(
+			"defs",
+			{ "d-01": host("d-01") },
+			{
+				fetch_url: {
+					description: "Uses $defs.",
+					inputSchema: {
+						type: "object",
+						$defs: { hostList: { type: "array", items: { type: "string" } } },
+						properties: { url: { type: "string" }, hostname: { $ref: "#/$defs/hostList" } },
+						required: ["url"],
+					},
+				},
+			}
+		);
+		_setServersForTests([server]);
+		const advertised = getOpenAiFunctionTools().find((t) => t.name === "fetch_url");
+		expect(advertised.parameters.$defs).toEqual({
+			hostList: { type: "array", items: { type: "string" } },
+		});
+		expect(advertised.parameters.properties.hostname).toEqual({ $ref: "#/$defs/hostList" });
 	});
 
 	it("lets the destination schema decide whether the routing field takes the whole bucket", async () => {
