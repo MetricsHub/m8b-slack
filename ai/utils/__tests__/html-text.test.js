@@ -380,6 +380,52 @@ describe("htmlToMarkdown", () => {
 		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
 	});
 
+	it("treats iframe, noembed and noframes fallback content as raw text", () => {
+		// The DOM parser never sees markup inside them: a decoy <base> or <title>
+		// there is text, and nothing nests
+		const page = `<html><body><iframe><base href="https://decoy.example/"></iframe><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/guide)"
+		);
+		expect(
+			extractHtmlTitle("<body><noembed><title>Decoy</title></noembed><h1>Real</h1></body>")
+		).toBe("Real");
+		expect(extractHtmlTitle("<body><noframes><h1>Decoy</h1></noframes><h1>Real</h1></body>")).toBe(
+			"Real"
+		);
+		expect(estimateNesting(`<iframe>${"<div>".repeat(600)}</iframe>`).depth).toBe(1);
+		// <plaintext> swallows the rest of the document, closer or not
+		expect(estimateNesting(`<plaintext>${"<div>".repeat(600)}</plaintext><div>`).depth).toBe(1);
+		expect(extractHtmlTitle("<body><plaintext><title>Decoy</title></plaintext><h1>X</h1>")).toBe(
+			""
+		);
+		// noscript content IS markup to the parser (and dropped by the converter)
+		expect(estimateNesting(`<noscript>${"<div>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+	});
+
+	it("ignores <base> and <title> the parser discards inside an open <select>", () => {
+		// "In select": a stray <base> or <title> is dropped, no element is created;
+		// the select is closed by </select>, so the next <base> is the live one
+		const page = `<html><body><select><base href="/preview/"></select><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		// An ignored <title> does not switch the tokenizer either: the tags after it
+		// are live (</select> closes the select, the <base> counts)
+		const unswitched = `<html><body><select><title></select><base href="/docs/"></title><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(unswitched, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(
+			extractHtmlTitle("<body><select><title>Decoy</title></select><h1>Real</h1></body>")
+		).toBe("Real");
+		// <option>s still nest normally, and an <input> ends the select like </select>
+		expect(estimateNesting("<select><option>a<option>b<optgroup><option>c").depth).toBe(3);
+		expect(estimateNesting("<select><input><div><div>").depth).toBe(2);
+	});
+
 	it("honours a <base href> once a breakout has left the svg it follows", () => {
 		// <div> breaks out of the svg and is reprocessed as HTML: the <base> after
 		// it is an HTML base (an svg:base right inside the svg would not be)

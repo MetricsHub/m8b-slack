@@ -530,10 +530,26 @@ function decodeBody(bytes, charset, type) {
 			head.match(/^[\sï»¿]*<\?xml\b[^>]*?\sencoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] ||
 			null;
 	}
+	// HTML with no declaration at all: the HTML fallback encoding is
+	// windows-1252 — an old page's lone 0xE9 is "é", not a replacement
+	// character. But an undeclared UTF-8 page (misconfigured servers are common)
+	// must not turn into mojibake: UTF-8 is kept when the bytes are well-formed
+	// UTF-8, as browser encoding sniffers do. XML and other text keep UTF-8.
+	if (!label && isHtml && !isWellFormedUtf8(bytes)) label = "windows-1252";
 	try {
 		return new TextDecoder(label || "utf-8", { fatal: false }).decode(bytes);
 	} catch {
 		return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+	}
+}
+
+/** Whether the bytes decode as UTF-8 without a single malformed sequence */
+function isWellFormedUtf8(bytes) {
+	try {
+		new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -1533,6 +1549,11 @@ async function readGitHubItem(target, requestedUrl, runtime) {
  * @param {Object} runtime
  * @returns {Promise<Object>}
  */
+/** Percent-encode decoded URL segments, keeping the slashes between them */
+function encodeSegments(parts) {
+	return parts.map((segment) => encodeURIComponent(segment)).join("/");
+}
+
 async function readRawGitHubFile(rawUrl, requestedUrl, path, runtime) {
 	const { response, url: finalUrl } = await guardedGet(
 		rawUrl,
@@ -1604,7 +1625,7 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 			const path = segments.slice(resolved.refSegments).join("/");
 			runtime.logger?.info?.(`[FETCH_URL] GitHub blob ref resolved to ${resolved.kind} ${ref}`);
 			return await readRawGitHubFile(
-				`https://raw.githubusercontent.com/${target.owner}/${target.repo}/refs/${resolved.kind}/${ref}/${path}`,
+				`https://raw.githubusercontent.com/${target.owner}/${target.repo}/refs/${resolved.kind}/${encodeSegments(segments.slice(0, resolved.refSegments))}/${encodeSegments(segments.slice(resolved.refSegments))}`,
 				requestedUrl,
 				path,
 				runtime
@@ -1615,12 +1636,11 @@ async function readGitHubBlob(target, requestedUrl, runtime) {
 	// With the token: the single-segment split (branch, tag or SHA) is the
 	// fallback; the refs API is consulted first when the URL could name a
 	// multi-segment ref. At most four requests.
-	const encode = (parts) => parts.map((segment) => encodeURIComponent(segment)).join("/");
 	const readAt = async (refSegments) => {
 		const ref = segments.slice(0, refSegments).join("/");
 		const path = segments.slice(refSegments).join("/");
 		const { bytes } = await githubRequest(
-			`${base}/contents/${encode(segments.slice(refSegments))}?ref=${encodeURIComponent(ref)}`,
+			`${base}/contents/${encodeSegments(segments.slice(refSegments))}?ref=${encodeURIComponent(ref)}`,
 			runtime,
 			{ accept: "application/vnd.github.raw+json", what: "the file" }
 		);

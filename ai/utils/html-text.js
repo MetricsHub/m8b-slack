@@ -147,7 +147,15 @@ function safeFromCodePoint(code) {
  * never shown (script, style, xmp) and escapable raw text that is (title,
  * textarea) — the latter is reported through onText.
  */
-const RAW_TEXT_ELEMENTS = new Set(["script", "style", "xmp"]);
+const RAW_TEXT_ELEMENTS = new Set([
+	"script",
+	"style",
+	"xmp",
+	"iframe",
+	"noembed",
+	"noframes",
+	"plaintext", // to the end of input: there is no closer
+]);
 const RCDATA_ELEMENTS = new Set(["title", "textarea"]);
 
 /** Elements that never have a closing tag */
@@ -179,6 +187,7 @@ const IMPLICIT_CLOSERS = {
 	dt: ["dt", "dd"],
 	dd: ["dt", "dd"],
 	option: ["option"],
+	optgroup: ["option", "optgroup"],
 	td: ["td", "th"],
 	th: ["td", "th"],
 	tr: ["td", "th", "tr"],
@@ -282,6 +291,7 @@ function tokenizeHtml(html, onTag, onText) {
 		pos = gt + 1;
 
 		if (tag.rawText) {
+			if (name === "plaintext") return; // the rest of the document is text
 			// Not markup until the matching closer (or the end of input). The closer
 			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
 			// a script is script text, as in the HTML tokenizer. Each miss resumes
@@ -521,6 +531,9 @@ function hasTextOfAtLeast(html, minimum) {
 	return count >= minimum;
 }
 
+/** Start/end tags that still mean something inside an open <select> */
+const SELECT_CONTENT = new Set(["option", "optgroup", "script", "template"]);
+
 /** Elements allowed inside <head>: any other start tag ends an unclosed <head> */
 const HEAD_ELEMENTS = new Set([
 	"head",
@@ -611,6 +624,18 @@ function createTreeTracker() {
 	const popForeign = () => {
 		while (stack.length > 0 && isForeign(stack.length - 1)) popTo(stack.length - 1);
 	};
+	/**
+	 * Index of the <select> the parser is "in select" for — the current node
+	 * is a select, or an option/optgroup inside one — else -1
+	 */
+	const openSelectIndex = () => {
+		for (let i = stack.length - 1; i >= 0; i--) {
+			if (ns[i] !== null) return -1;
+			if (stack[i] === "select") return i;
+			if (stack[i] !== "option" && stack[i] !== "optgroup") return -1;
+		}
+		return -1;
+	};
 
 	/**
 	 * Feed a tag. Returns false once the page exceeded a cap (stop scanning).
@@ -662,6 +687,30 @@ function createTreeTracker() {
 		}
 
 		// HTML rules
+		// "In select": while a <select> is the current node (or an option/optgroup
+		// inside it), the parser IGNORES almost every other token — no element is
+		// inserted for a stray <base>, <title> or <div> there — until the select
+		// is closed by </select>, another <select>, or an <input>/<textarea>/<hr>
+		const selectIndex = openSelectIndex();
+		if (selectIndex !== -1) {
+			if (!closing) {
+				if (name === "select") {
+					popTo(selectIndex); // a nested <select> acts as </select>
+					return !hostile;
+				}
+				if (name === "input" || name === "keygen" || name === "textarea" || name === "hr") {
+					popTo(selectIndex); // acts as </select>, then the token is reprocessed
+				} else if (!SELECT_CONTENT.has(name)) {
+					tag.rawText = false; // an ignored <title> never switches the tokenizer
+					return !hostile;
+				}
+			} else if (name === "select") {
+				popTo(selectIndex);
+				return !hostile;
+			} else if (!SELECT_CONTENT.has(name)) {
+				return !hostile;
+			}
+		}
 		if (
 			!closing &&
 			stack.length > 0 &&
@@ -755,6 +804,10 @@ function createTreeTracker() {
 		/** Inside a <template> (an inert fragment) */
 		get inTemplate() {
 			return templates > 0;
+		},
+		/** "In select": the parser ignores most tokens here */
+		get inSelect() {
+			return openSelectIndex() !== -1;
 		},
 		/** Inside an element the converter drops (nav, footer, form, svg, ...) */
 		get dropped() {
@@ -1189,8 +1242,9 @@ export function extractHtmlTitle(html) {
 		(tag) => {
 			const { name, closing } = tag;
 			// What the element IS depends on where it is inserted: judge <title>
-			// by the state before the tag (its parent's namespace)
-			const inert = tree.inTemplate || tree.inForeign;
+			// by the state before the tag (its parent's namespace); one the parser
+			// ignores (inside an open <select>) is no title at all
+			const inert = tree.inTemplate || tree.inForeign || tree.inSelect;
 			if (!tree.handle(tag)) return false;
 			if (collecting) {
 				if (name === collecting && closing) {
@@ -1276,7 +1330,8 @@ function documentBaseUrl(html, responseUrl) {
 	tokenizeHtml(
 		html,
 		(tag) => {
-			const inert = tree.inTemplate || tree.inForeign;
+			// ...and a <base> the parser ignores (inside an open <select>) is not one
+			const inert = tree.inTemplate || tree.inForeign || tree.inSelect;
 			if (!tree.handle(tag)) return false;
 			if (inert || tag.closing || tag.name !== "base") return true;
 			// A <base> without href (target only) does not count: keep looking.

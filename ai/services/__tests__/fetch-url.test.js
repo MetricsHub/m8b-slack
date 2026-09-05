@@ -947,6 +947,26 @@ describe("content negotiation", () => {
 		}
 	});
 
+	it("falls back to windows-1252 for HTML without any encoding declaration", async () => {
+		// The HTML fallback encoding: a lone 0xE9 is "é"...
+		const latin = Buffer.from("<html><body><p>Caf\xe9 du march\xe9</p></body></html>", "latin1");
+		// ...but an undeclared UTF-8 page (well-formed UTF-8 bytes) stays UTF-8
+		const utf8 = Buffer.from("<html><body><p>Café du marché</p></body></html>", "utf8");
+		// XML and plain text keep the UTF-8 default (replacement character for 0xE9)
+		const plain = Buffer.from("Caf\xe9", "latin1");
+		const routes = {
+			"https://example.com/old": response(latin, { contentType: "text/html" }),
+			"https://example.com/new": response(utf8, { contentType: "text/html" }),
+			"https://example.com/note.txt": response(plain, { contentType: "text/plain" }),
+		};
+		for (const url of ["https://example.com/old", "https://example.com/new"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.content).toContain("Café du marché");
+		}
+		const { result } = await run({ url: "https://example.com/note.txt" }, { routes });
+		expect(result.content).toBe("Caf\uFFFD");
+	});
+
 	it("lets a UTF-8 byte-order mark override a wrong declared charset", async () => {
 		// WHATWG decode: the BOM is sniffed before any label, so a UTF-8 document
 		// served as windows-1252 (or declaring it in a meta tag) is still UTF-8
@@ -1533,6 +1553,30 @@ describe("GitHub", () => {
 			url,
 			finalUrl: "https://raw.githubusercontent.com/acme/tool/refs/heads/feature/foo/docs/guide.md",
 			content: "# On feature/foo",
+		});
+
+		// Resolved ref and path segments are percent-encoded in the raw URL: a "#"
+		// in a file name must not become a fragment
+		const encoded = await run(
+			{ url: "https://github.com/acme/tool/blob/feature/foo/docs/guide%23intro.md" },
+			{
+				routes: {
+					"https://raw.githubusercontent.com/acme/tool/feature/foo/docs/guide%23intro.md":
+						notFound(),
+					[`${api}/git/matching-refs/heads/feature?per_page=100`]: json([
+						{ ref: "refs/heads/feature/foo" },
+					]),
+					[`${api}/git/matching-refs/tags/feature?per_page=100`]: json([]),
+					"https://raw.githubusercontent.com/acme/tool/refs/heads/feature/foo/docs/guide%23intro.md":
+						response("# Intro", { contentType: "text/plain" }),
+				},
+				config,
+			}
+		);
+		expect(encoded.result).toMatchObject({
+			ok: true,
+			content: "# Intro",
+			title: "docs/guide#intro.md",
 		});
 
 		// A tag with a slash is read the same way, under refs/tags
