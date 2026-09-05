@@ -113,11 +113,37 @@ async function _ensureConnected(server) {
 		await client.connect(transport);
 		server.client = client;
 		console.log(`[MCP] Connected to ${server.server_label}`);
-		return true;
 	} catch (e) {
 		console.error(`[MCP] Failed to connect to ${server.server_label}:`, e);
 		return false;
 	}
+	// A (re)connected agent may have restarted with other tools: routing and
+	// validation must follow its current definitions, not the ones it had
+	try {
+		await _loadTools(server);
+	} catch (e) {
+		console.warn(
+			`[MCP] Tool list of ${server.server_label} could not be loaded: ${e?.message || e}`
+		);
+	}
+	return true;
+}
+
+/**
+ * (Re)load a server's tool map from its listTools(). Called on every
+ * (re)connection and by refreshToolsForServer(). The map keeps its identity
+ * (cleared and refilled), definitions are replaced by the fresh objects, so
+ * the validators cached per definition are rebuilt for changed schemas.
+ *
+ * @param {Object} server - Server entry with a connected client
+ * @returns {Promise<number>} Number of tools loaded
+ */
+async function _loadTools(server) {
+	const toolsResult = await server.client.listTools();
+	const tools = (toolsResult?.tools || []).filter((t) => t?.name);
+	server.tools.clear();
+	for (const t of tools) server.tools.set(t.name, t);
+	return tools.length;
 }
 
 function _indexHostsFromList(server, hostsData) {
@@ -236,18 +262,12 @@ export async function initializeMcpRegistry(logger) {
 				continue;
 			}
 
-			// Get all tools
-			const toolsResult = await server.client.listTools();
-			const tools = toolsResult.tools || [];
+			// Tools were loaded by the connection; a failed load is retried once here
+			if (server.tools.size === 0) await _loadTools(server);
 			_log(logger, "info", "Tools discovered", {
 				server: server.server_label,
-				count: tools.length,
+				count: server.tools.size,
 			});
-
-			for (const t of tools) {
-				if (!t?.name) continue;
-				server.tools.set(t.name, t);
-			}
 
 			// Try to load hosts via ListHosts if present
 			if (server.tools.has("ListHosts")) {
@@ -294,6 +314,33 @@ function _removeHostsForServer(serverLabel) {
  * @param {Object} [logger] - Logger instance
  * @returns {Promise<{ok: boolean, hostCount?: number, error?: string}>}
  */
+/**
+ * Reload one server's tool definitions from the agent (see _loadTools): what
+ * the model is offered and what calls are validated against follow the
+ * agent's current schemas.
+ *
+ * @param {string} serverLabel - Agent label
+ * @param {Object} [logger]
+ * @returns {Promise<number>} Number of tools loaded, -1 when the server is unknown or unreachable
+ */
+export async function refreshToolsForServer(serverLabel, logger) {
+	const server = state.servers.find((s) => s.server_label === serverLabel);
+	if (!server) {
+		_log(logger, "warn", "Tool refresh for unknown server", { label: serverLabel });
+		return -1;
+	}
+	const connected = await _ensureConnected(server);
+	if (!connected) return -1;
+	try {
+		const count = await _loadTools(server);
+		_log(logger, "info", "Tools refreshed", { server: serverLabel, count });
+		return count;
+	} catch (e) {
+		_log(logger, "warn", "Tool refresh failed", { server: serverLabel, error: String(e) });
+		return -1;
+	}
+}
+
 export async function refreshHostsForServer(serverLabel, logger) {
 	const server = state.servers.find((s) => s.server_label === serverLabel);
 	if (!server) {

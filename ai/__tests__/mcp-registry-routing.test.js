@@ -8,6 +8,7 @@ import {
 	executeMcpFunctionCall,
 	getOpenAiFunctionTools,
 	refreshHostsForServer,
+	refreshToolsForServer,
 } from "../mcp_registry.js";
 
 /**
@@ -156,6 +157,54 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 				.slice(before)
 				.map((c) => c.args.hostname)
 		).toEqual(["h-01", "h-02"]);
+	});
+
+	it("follows an agent's new tool definitions after a refresh", async () => {
+		// The agent restarts with fetch_url routed by "hostname" and a new required
+		// "mode": after the refresh, the advertised schema and the routing/validation
+		// use the new definition, not the one loaded at startup
+		const server = fakeServer("upgraded", { "u-01": host("u-01") }, { fetch_url: HOST_ROUTED });
+		const upgraded = {
+			name: "fetch_url",
+			description: "New version.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					url: { type: "string" },
+					mode: { type: "string" },
+					hostname: { type: "string" },
+				},
+				required: ["url", "mode", "hostname"],
+				additionalProperties: false,
+			},
+		};
+		server.client.listTools = async () => ({ tools: [{ name: "ListHosts" }, upgraded] });
+		_setServersForTests([server]);
+		await refreshHostsForServer("upgraded");
+		expect(getOpenAiFunctionTools().find((t) => t.name === "fetch_url").description).toBe(
+			"Host-routed reader."
+		);
+
+		expect(await refreshToolsForServer("upgraded")).toBe(2);
+		const advertised = getOpenAiFunctionTools().find((t) => t.name === "fetch_url");
+		expect(advertised.description).toBe("New version.");
+		expect(advertised.parameters.required).toEqual(expect.arrayContaining(["mode", "hostname"]));
+		// A call shaped for the old schema is refused by the new one; a fitting one
+		// is routed by the new field
+		const stale = await executeMcpFunctionCall("fetch_url", { url: "https://x/", hosts: ["u-01"] });
+		expect(stale.results[0].ok).toBe(false);
+		expect(stale.results[0].error).toContain("mode");
+		const fresh = await executeMcpFunctionCall("fetch_url", {
+			url: "https://x/",
+			mode: "text",
+			hosts: ["u-01"],
+		});
+		expect(fresh.results[0].ok).toBe(true);
+		expect(server.calls.filter((c) => c.name === "fetch_url").at(-1).args).toEqual({
+			url: "https://x/",
+			mode: "text",
+			hostname: "u-01",
+		});
 	});
 
 	it("advertises the definitions local references point to", () => {
