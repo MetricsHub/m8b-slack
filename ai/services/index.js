@@ -9,6 +9,7 @@ export * from "./config-editor.js";
 export * from "./context-budget.js";
 export * from "./context-manager.js";
 export * from "./conversation-store.js";
+export * from "./fetch-url.js";
 export * from "./function-calls.js";
 export * from "./knowledge-base.js";
 export * from "./media-store.js";

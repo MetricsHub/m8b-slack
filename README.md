@@ -267,6 +267,14 @@ KNOWLEDGE_BASE_DIR=data/knowledge
 # Web search backend (optional; unset = web search unavailable)
 WEB_SEARCH_PROVIDER=searxng
 SEARXNG_URL=http://searxng.internal:8080
+
+# Page reader (fetch_url; enabled by default)
+# FETCH_URL_ENABLED=true
+# FETCH_URL_ALLOWED_HOSTS=            # comma-separated host suffixes; empty = any public host
+# FETCH_URL_BLOCKED_HOSTS=
+# FETCH_URL_TIMEOUT_MS=20000
+# FETCH_URL_MAX_BYTES=2097152
+# GITHUB_TOKEN=                       # private repositories / higher rate limit (api.github.com only)
 ```
 
 ### Ollama preset
@@ -482,6 +490,7 @@ Environment=VLLM_MEDIA_CACHE_TTL_HOURS=24
 | Knowledge base search | ✅ hosted `file_search`            | ✅ local `search_knowledge_base` (after `kb:index`)                                                     |
 | Knowledge base writes | ✅ vector store upload             | ✅ local markdown + embeddings                                                                          |
 | Web search            | ✅ hosted `web_search_preview`     | ⚙️ app-side `web_search` via SearXNG or opt-in Ollama cloud                                             |
+| Web page reading      | ✅ hosted web search reads pages   | ✅ app-side `fetch_url` (Markdown / `llms.txt` first, GitHub via API, HTML → text; see below)           |
 | Code Interpreter      | ✅ hosted sandbox                  | ⚙️ local Python sandbox (`run_python` via Pyodide/WebAssembly; see below)                               |
 | File/image analysis   | ✅ via OpenAI Files API            | ⚙️ images described by a local vision model (`OLLAMA_VISION_MODEL`); data files staged for `run_python` |
 | Conversation state    | Server-side `previous_response_id` | Application-side per-thread store                                                                       |
@@ -515,9 +524,28 @@ bounded by a hard timeout (`CODE_SANDBOX_TIMEOUT_MS`, default 60s) enforced with
 `worker.terminate()`. Set `CODE_SANDBOX_ENABLED=false` to disable the tool entirely; the
 system prompt then tells the model to provide file contents inline instead.
 
+**Reading web pages in local modes:** OpenAI's hosted web search reads pages by itself; the
+app-side `web_search` only returns titles and snippets, and the Python sandbox has no network.
+So the local modes get a `fetch_url` function tool that reads the URLs users paste (and
+`web_search` results in full). It negotiates the cheapest faithful rendition first — an
+`Accept: text/markdown` request, then the sibling `.md` resource and the site's `/llms.txt`
+index (the [llms.txt](https://llmstxt.org) convention) — and otherwise reduces the HTML page to
+Markdown-ish text (no scripts, styles, navigation or footers). GitHub issue and pull request
+URLs are read through the REST API (body, comments, reviews; optional `GITHUB_TOKEN` for
+private repositories and a higher rate limit), `blob` URLs through their raw counterpart. The
+tool output names the variant used (`source: markdown | llms.txt | html | text | github`).
+Only `http`/`https` URLs to public hosts are read: private, loopback, link-local and cloud
+metadata addresses are refused at resolution time and again when the socket is opened, redirects
+included; `FETCH_URL_ALLOWED_HOSTS` / `FETCH_URL_BLOCKED_HOSTS` (host suffixes) scope the tool
+further, `FETCH_URL_TIMEOUT_MS` and `FETCH_URL_MAX_BYTES` bound each request, binary responses
+are refused (PDFs included), and long pages are staged for `run_python` like any large tool
+output. `FETCH_URL_ENABLED=false` removes the tool.
+
 **Privacy note:** in Ollama, vLLM and OpenAI-compatible modes, prompts, documents, and tool
 results never go to OpenAI, and never leave your network (beyond your own inference endpoint) unless you explicitly opt in to `WEB_SEARCH_PROVIDER=ollama-cloud` (which sends
-the search query — not the conversation — to ollama.com).
+the search query — not the conversation — to ollama.com). `fetch_url` contacts the sites whose
+URLs users paste (plus `api.github.com` for GitHub links) with a plain GET carrying no Slack or
+MCP credentials; only `GITHUB_TOKEN`, when set, is sent, and only to `api.github.com`.
 
 `NODE_ENV` controls Bolt logging:
 

@@ -4,6 +4,7 @@
 
 import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
+import { getFetchUrlTool } from "../services/fetch-url.js";
 import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
 import { getWebSearchTool } from "../services/web-search.js";
 import { getMetricsHubConfigTools } from "./metricshub-config.js";
@@ -197,6 +198,13 @@ export function buildFunctionToolsArray({
 		tools.push(webSearchTool);
 	}
 
+	// Application-side page reader (hosted web search reads pages itself;
+	// here the model needs an explicit tool). Removed by FETCH_URL_ENABLED=false
+	const fetchUrlTool = getFetchUrlTool();
+	if (fetchUrlTool) {
+		tools.push(fetchUrlTool);
+	}
+
 	// Local Python sandbox (app-side code_interpreter replacement)
 	if (codeSandboxAvailable) {
 		tools.push(RUN_PYTHON_TOOL);
@@ -369,6 +377,11 @@ export async function logToolWarnings({
 		if (!getWebSearchTool()) {
 			logger?.info?.(
 				"No web-search backend configured (WEB_SEARCH_PROVIDER unset). web_search tool disabled."
+			);
+		}
+		if (!getFetchUrlTool()) {
+			logger?.info?.(
+				"Page reader disabled (FETCH_URL_ENABLED=false). The bot cannot read URLs pasted by users."
 			);
 		}
 		if (provider.capabilities.localCodeInterpreter) {

@@ -177,6 +177,27 @@ describe("buildToolsArray", () => {
 		expect(names).not.toContain("update_knowledge");
 	});
 
+	it("exposes fetch_url to function-only providers unless disabled, never to OpenAI", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		try {
+			const local = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			const fetchUrl = local.find((t) => t.name === "fetch_url");
+			expect(fetchUrl).toMatchObject({ type: "function", name: "fetch_url" });
+			expect(fetchUrl.parameters.required).toEqual(["url"]);
+
+			const hosted = buildToolsArray({ vectorStoreIds: [], provider: openAiProvider });
+			expect(hosted.map((t) => t.name)).not.toContain("fetch_url");
+
+			process.env.FETCH_URL_ENABLED = "false";
+			const disabled = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			expect(disabled.map((t) => t.name)).not.toContain("fetch_url");
+		} finally {
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
 	it("exposes web_search as a function tool only when a backend is configured", () => {
 		const withoutSearch = buildToolsArray({ provider: ollamaProvider });
 		expect(withoutSearch.map((t) => t.name)).not.toContain("web_search");

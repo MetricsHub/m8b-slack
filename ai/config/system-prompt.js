@@ -110,11 +110,13 @@ export const DEPLOYMENT_NOTES_HEADING =
  *   adds guidance about truncated tool outputs
  * @param {string|null} [options.organizationName] - Slack workspace name (null = generic wording)
  * @param {string} [options.deploymentNotes] - Administrator-supplied text appended verbatim
+ * @param {boolean} [options.fetchUrl] - The app-side fetch_url page reader is offered
+ *   (function-only providers; hosted web search reads pages by itself)
  * @returns {string} System prompt text
  */
 export function buildSystemPrompt(
 	capabilities = {},
-	{ contextWindow, organizationName = null, deploymentNotes = "" } = {}
+	{ contextWindow, organizationName = null, deploymentNotes = "", fetchUrl = false } = {}
 ) {
 	const {
 		codeInterpreter = true,
@@ -210,6 +212,12 @@ export function buildSystemPrompt(
 				? "7. When users ask for files (CSV, TXT, Excel, etc.) or charts, use the run_python tool to create them: write the files in the working directory and they are automatically posted to Slack. Confirm the creation with the file name only (e.g., \"I've created hosts.csv for you\"). NEVER include sandbox paths (/outputs/, /data/, /mnt/data/) or download links in your response — these don't work for users."
 				: "7. You cannot create or generate downloadable files in this deployment. If a user asks for a file (CSV, TXT, etc.), provide the content inline in a Slack code block instead, or say it is not possible."
 		);
+	}
+
+	if (fetchUrl) {
+		prompt += `
+
+**Web pages and links:** When a user pastes a URL (web page, documentation, GitHub issue or pull request), read it with the fetch_url tool and base your answer on its actual content; use it as well to read a web_search result in full. MetricsHub protocol checks (HTTP, ping, ...) are monitoring probes, not page readers — never use them to read a page. If fetch_url refuses or fails, say so instead of guessing what the page contains.`;
 	}
 
 	const notes = typeof deploymentNotes === "string" ? deploymentNotes.trim() : "";

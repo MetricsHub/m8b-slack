@@ -21,6 +21,7 @@ import {
 	handleRequestCredentials,
 	handleSaveConfigFile,
 } from "./config-editor.js";
+import { executeFetchUrl } from "./fetch-url.js";
 import { openai } from "./openai.js";
 import { uploadGeneratedFilesToSlack } from "./slack-files.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
@@ -148,6 +149,18 @@ export async function processFunctionCall(functionCall, context) {
 			// Application-side web search (Ollama mode)
 			case "web_search":
 				output = await executeWebSearch(args, logger);
+				break;
+
+			// Application-side page reader (function-only providers). Through the
+			// middleware so a long page is staged for run_python instead of being
+			// truncated blindly by the provider inline cap
+			case "fetch_url":
+				output = await executeWithMiddleware(
+					name,
+					args,
+					async (_name, cleanArgs) => executeFetchUrl(cleanArgs, logger),
+					middlewareOptions
+				);
 				break;
 
 			// Local Python sandbox (Ollama mode replacement for code_interpreter)

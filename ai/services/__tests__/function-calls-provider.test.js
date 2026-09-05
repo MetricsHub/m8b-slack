@@ -77,6 +77,19 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.error).toContain("not available");
 	});
 
+	it("routes fetch_url to the application-side page reader", async () => {
+		// A loopback target is refused before any network access: deterministic
+		// proof that the call reached the reader and its address policy
+		const items = await processFunctionCall(
+			{ name: "fetch_url", call_id: "call_1", arguments: '{"url":"http://127.0.0.1:8080/"}' },
+			makeContext()
+		);
+
+		const output = parseOutput(items);
+		expect(output.ok).toBe(false);
+		expect(output.error).toContain("Refused");
+	});
+
 	it("routes search_knowledge_base to the local knowledge base", async () => {
 		const knowledgeBase = {
 			search: jest.fn(async () => ({

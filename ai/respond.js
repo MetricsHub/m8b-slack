@@ -40,6 +40,7 @@ import {
 	getConversation,
 	setConversation,
 } from "./services/conversation-store.js";
+import { isFetchUrlEnabled } from "./services/fetch-url.js";
 import { processFunctionCall } from "./services/function-calls.js";
 import { createLocalKnowledgeBase } from "./services/knowledge-base.js";
 import {
@@ -396,6 +397,9 @@ async function respondCore({
 		// the workspace this message comes from and the deployment notes (both modes)
 		const systemPrompt = buildSystemPrompt(provider.capabilities, {
 			contextWindow: stateless ? provider.contextWindow : undefined,
+			// Hosted web search reads pages itself; function-only providers get
+			// the app-side fetch_url tool (unless the operator disabled it)
+			fetchUrl: !provider.capabilities.hostedWebSearch && isFetchUrlEnabled(),
 			...(await getDeploymentContext({ client, teamId, logger })),
 		});
 		const promptVersion = systemPromptVersion(systemPrompt);
