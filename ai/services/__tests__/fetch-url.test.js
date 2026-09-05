@@ -991,6 +991,36 @@ describe("content negotiation", () => {
 		expect(withBom.result.content).toContain("Café");
 	});
 
+	it("ignores HTML meta charset declarations inside XML documents", async () => {
+		// An Atom entry embedding XHTML with <meta charset="windows-1252">: the feed
+		// is UTF-8 and HTML meta declarations have no authority over XML
+		const feed = Buffer.from(
+			'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><content type="xhtml">' +
+				'<div xmlns="http://www.w3.org/1999/xhtml"><meta charset="windows-1252"/><p>Café du marché</p></div>' +
+				"</content></entry></feed>",
+			"utf8"
+		);
+		const routes = {
+			"https://example.com/feed.xml": response(feed, { contentType: "application/atom+xml" }),
+			"https://example.com/data.xml": response(feed, { contentType: "text/xml" }),
+		};
+		for (const url of ["https://example.com/feed.xml", "https://example.com/data.xml"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.ok).toBe(true);
+			expect(result.content).toContain("Café du marché");
+		}
+		// The same meta element still decides for an HTML document without an HTTP charset
+		const html = Buffer.from(
+			'<html><head><meta charset="windows-1252"><title>Caf\xe9</title></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		const page = await run(
+			{ url: "https://example.com/page" },
+			{ routes: { "https://example.com/page": response(html, { contentType: "text/html" }) } }
+		);
+		expect(page.result.content).toContain("Café");
+	});
+
 	it("accepts whitespace around the XML encoding assignment", async () => {
 		const latinXml = Buffer.from(
 			'<?xml version="1.0" encoding = "windows-1252"?><rss><channel><title>Caf\xe9</title></channel></rss>',

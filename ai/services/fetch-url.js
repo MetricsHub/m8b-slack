@@ -518,15 +518,17 @@ function metaCharset(head) {
 function decodeBody(bytes, charset, type) {
 	// A UTF-16 byte-order mark (or declared charset) wins over any sniffing
 	let label = utf16Label(bytes, charset) || charset;
-	// No HTTP charset: HTML <meta charset> and XML encoding declarations decide
-	// (for HTML and XML media types alike — RSS/Atom feeds, sitemaps, ...)
-	const declaresEncoding =
-		!type || HTML_TYPES.has(type) || type === "text/xml" || /xml$/.test(type);
-	if (!label && declaresEncoding) {
-		// Sniff <meta charset> in the first bytes of the document
+	// No HTTP charset: the document's own declaration decides. For HTML that is
+	// <meta charset> (then an XML declaration, as browsers accept on XHTML served
+	// as text/html); for XML media types (RSS/Atom feeds, sitemaps, ...) only the
+	// leading XML declaration has any authority — a <meta charset> inside an
+	// embedded XHTML fragment is content, not a declaration
+	const isHtml = !type || HTML_TYPES.has(type);
+	const isXml = type === "text/xml" || /xml$/.test(type);
+	if (!label && (isHtml || isXml)) {
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
-			metaCharset(head) ||
+			(isHtml ? metaCharset(head) : null) ||
 			// An XML declaration is only valid at the very start of the document (a
 			// UTF-8 BOM, read as latin1, is the "ï»¿" prefix); one inside a comment
 			// or CDATA is example text and must not decide the encoding

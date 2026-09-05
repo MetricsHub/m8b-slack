@@ -180,7 +180,10 @@ function isTagNameTerminator(code) {
  * element swallows the rest of the input, as the HTML tokenizer does.
  *
  * @param {string} html - Markup
- * @param {(tag: {name: string, closing: boolean, selfClosing: boolean, start: number, end: number, attrs: string}) => (boolean|void)} onTag
+ * @param {(tag: {name: string, closing: boolean, selfClosing: boolean, start: number, end: number, attrs: string, rawText: boolean}) => (boolean|void)} onTag
+ *   Called per tag; return false to stop. `rawText` tells whether the body that
+ *   follows is tokenized as raw text/RCDATA — clear it for a tag that opens in
+ *   foreign content, where the parser never switches state.
  * @param {(text: string) => (boolean|void)} onText
  */
 function tokenizeHtml(html, onTag, onText) {
@@ -246,12 +249,17 @@ function tokenizeHtml(html, onTag, onText) {
 		// content); the HTML parser opens <div/> like <div>. Reported as a fact,
 		// consumers decide.
 		const selfClosing = !closing && gt > nameEnd && html.charCodeAt(gt - 1) === 47;
-		const tag = { name, closing, selfClosing, start: lt, end: gt + 1, attrs: "" };
+		const tag = { name, closing, selfClosing, start: lt, end: gt + 1, attrs: "", rawText: false };
 		if (!closing && gt > nameEnd) tag.attrs = html.slice(nameEnd, selfClosing ? gt - 1 : gt);
+		// The switch to raw text / RCDATA is the tree builder's, and only for HTML
+		// elements: inside foreign content (svg, math) a <textarea> or <style> is
+		// an ordinary element whose content is markup. A consumer tracking the
+		// namespace clears `rawText` before returning to keep tokenizing tags.
+		tag.rawText = !closing && (RAW_TEXT_ELEMENTS.has(name) || RCDATA_ELEMENTS.has(name));
 		if (onTag(tag) === false) return;
 		pos = gt + 1;
 
-		if (!closing && (RAW_TEXT_ELEMENTS.has(name) || RCDATA_ELEMENTS.has(name))) {
+		if (tag.rawText) {
 			// Not markup until the matching closer (or the end of input). The closer
 			// is "</name" followed by ">", "/" or whitespace: "</scripture>" inside
 			// a script is script text, as in the HTML tokenizer. Each miss resumes
@@ -272,6 +280,7 @@ function tokenizeHtml(html, onTag, onText) {
 				start: close,
 				end: closeEnd,
 				attrs: "",
+				rawText: false,
 			};
 			if (onTag(closer) === false) return;
 			pos = closeEnd;
@@ -524,12 +533,19 @@ function selectContentRegion(html) {
 						}
 						if (SCOPE_BOUNDARY.has(tracked[i])) break;
 					}
-					if (index !== -1) {
-						for (let i = index; i < tracked.length; i++) {
-							if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
-						}
-						tracked.length = index;
+					if (index === -1) return;
+					if (name === "form") {
+						// </form> removes only the form element from the parser's stack: a
+						// <nav> opened inside it stays open, so a <main> that follows is
+						// still inside the nav (`<form><nav></form><main>` is no way out)
+						tracked.splice(index, 1);
+						droppedDepth--;
+						return;
 					}
+					for (let i = index; i < tracked.length; i++) {
+						if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
+					}
+					tracked.length = index;
 				} else if (!(selfClosing && (name === "svg" || name === "math"))) {
 					tracked.push(name);
 					if (DROP_ELEMENT_SET.has(name)) droppedDepth++;
@@ -570,7 +586,7 @@ function selectContentRegion(html) {
  * per level; browsers cap the DOM at a few hundred levels for the same
  * reason. Real pages sit far below this; only hostile ones exceed it.
  */
-const MAX_DOM_DEPTH = 512;
+export const MAX_DOM_DEPTH = 512;
 
 /** Longest URL emitted for a link or image (browsers accept ~2 KB in practice) */
 const MAX_URL_CHARS = 2048;
@@ -591,10 +607,13 @@ const MAX_URL_CHARS_PER_DOCUMENT = 300000;
  * output). Stops as soon as either cap is exceeded, so the stack — and each
  * closer's search through it — stays bounded.
  *
+ * Exported for tests only: the estimate is the guard, so tests pin its value
+ * on parser corner cases rather than infer it from timing.
+ *
  * @param {string} html - Markup
  * @returns {{depth: number, prefixDepth: number}}
  */
-function estimateNesting(html) {
+export function estimateNesting(html) {
 	const stack = [];
 	let depth = 0;
 	let prefixDepth = 0;
@@ -614,10 +633,14 @@ function estimateNesting(html) {
 	};
 	tokenizeHtml(
 		html,
-		({ name, closing, selfClosing }) => {
+		(tag) => {
+			const { name, closing, selfClosing, attrs } = tag;
 			if (foreignOpen > 0 && !closing && inForeignMode(stack)) {
 				if (selfClosing) return true; // "<path/>" is an empty element in foreign content
-				if (FOREIGN_BREAKOUT.has(name)) {
+				if (
+					FOREIGN_BREAKOUT.has(name) &&
+					(name !== "font" || hasAnyAttribute(attrs, FONT_BREAKOUT_ATTRIBUTES))
+				) {
 					// The breakout closes the foreign subtree: pop to below the innermost svg/math
 					for (let i = stack.length - 1; i >= 0; i--) {
 						if (stack[i] === "svg" || stack[i] === "math") {
@@ -625,6 +648,11 @@ function estimateNesting(html) {
 							break;
 						}
 					}
+				} else {
+					// Any other start tag opens a foreign element, <textarea>, <title>,
+					// <script> and <style> included: the tokenizer stays in the data
+					// state and their content is markup that nests (and counts) as usual
+					tag.rawText = false;
 				}
 			}
 			// </body> and </html> only change the parser's insertion mode: nothing is
@@ -877,6 +905,8 @@ function inForeignMode(stack) {
 /**
  * HTML start tags that end foreign content (svg, math) in the HTML parser:
  * everything after them is ordinary HTML again and counts towards depth.
+ * `font` is only a breakout when it carries one of FONT_BREAKOUT_ATTRIBUTES
+ * (a bare <font> stays a foreign element).
  */
 const FOREIGN_BREAKOUT = new Set([
 	"b",
@@ -925,6 +955,27 @@ const FOREIGN_BREAKOUT = new Set([
 	"var",
 	"font",
 ]);
+
+/** Attributes that make a <font> start tag a breakout from foreign content */
+const FONT_BREAKOUT_ATTRIBUTES = new Set(["color", "face", "size"]);
+
+/**
+ * Whether a tag's attribute string (as sliced by the tokenizer) names one of
+ * `names`. Attribute names are ASCII case-insensitive; a value-less attribute
+ * (`<font color>`) counts. Single pass over the string.
+ *
+ * @param {string} attrs - Raw attribute text of a start tag
+ * @param {Set<string>} names - Lowercase attribute names
+ * @returns {boolean}
+ */
+function hasAnyAttribute(attrs, names) {
+	if (!attrs) return false;
+	const attribute = /([^\s=/>"']+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+	for (const match of attrs.matchAll(attribute)) {
+		if (names.has(asciiLower(match[1]))) return true;
+	}
+	return false;
+}
 
 /** Elements whose content is dropped by the fallback converter */
 const FALLBACK_DROP = new Set([...DROP_ELEMENTS, "title"]);

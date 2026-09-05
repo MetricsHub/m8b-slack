@@ -3,7 +3,13 @@
  */
 
 import { describe, expect, it } from "@jest/globals";
-import { decodeHtmlEntities, extractHtmlTitle, htmlToMarkdown } from "../html-text.js";
+import {
+	decodeHtmlEntities,
+	estimateNesting,
+	extractHtmlTitle,
+	htmlToMarkdown,
+	MAX_DOM_DEPTH,
+} from "../html-text.js";
 
 const PAGE = `<!DOCTYPE html>
 <html><head><title>Install &amp; Configure &mdash; Docs</title>
@@ -548,6 +554,61 @@ describe("htmlToMarkdown", () => {
 		// Ordinary inline SVG (shallow, self-closed shapes) still converts normally
 		const icon = `<body><p>Before</p><svg><g><g><path d="M0 0"/><circle r="1"/></g></g></svg><p>After</p></body>`;
 		expect(htmlToMarkdown(icon)).toBe("Before\n\nAfter");
+	});
+
+	it("treats <font> as a breakout from foreign content only with color/face/size", () => {
+		// A bare <font> is an ordinary foreign element: the svg subtree stays open and
+		// every repetition nests three levels deeper, which the DOM route must refuse
+		const bare = "<svg><g><font>".repeat(200);
+		expect(estimateNesting(bare).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// With color/face/size (any case, with or without a value) the parser breaks
+		// out: the svg subtree is popped each time and only the <font> elements nest
+		for (const attribute of ["color=red", 'FACE="serif"', "size", "id=x size='3'"]) {
+			const shallow = `<svg><g><font ${attribute}>`.repeat(200);
+			expect(estimateNesting(shallow).depth).toBeLessThan(MAX_DOM_DEPTH);
+		}
+		// Other attributes do not make it a breakout
+		expect(estimateNesting('<svg><g><font id="size">'.repeat(200)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// End to end: the deep page is refused up front and still converts quickly
+		const page = `<body><p>Before</p>${"<svg><g><font>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("tokenizes the content of foreign <textarea>/<style>/<title> as markup, not raw text", () => {
+		// Inside svg the tokenizer never enters RCDATA/raw text: the nested tags are
+		// real elements the DOM route would have to build, so they count
+		const deep = "<g>".repeat(600);
+		for (const element of ["textarea", "style", "title", "script", "xmp"]) {
+			const foreign = `<svg><${element}>${deep}</${element}></svg>`;
+			expect(estimateNesting(foreign).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+			// The same element in HTML (top level, or below an integration point) is
+			// raw text: the "tags" inside are text and nothing nests
+			expect(estimateNesting(`<${element}>${deep}</${element}>`).depth).toBe(1);
+			expect(
+				estimateNesting(
+					`<svg><foreignObject><${element}>${deep}</${element}></foreignObject></svg>`
+				).depth
+			).toBe(3);
+		}
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg><textarea>${"<g>".repeat(100000)}</textarea></svg></body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("keeps a <main> inside a nav that </form> failed to close out of the region", () => {
+		// </form> removes only the form element: the nav stays open, the main is its
+		// descendant and Turndown drops it with the form. Region selection must agree.
+		const decoy = "decoy ".repeat(60);
+		const page = `<body><form><nav></form><main><p>${decoy}</p></main></nav><p>Real content</p></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real content");
+		expect(out).not.toContain("decoy");
 	});
 
 	it("removes only the form element on </form>, keeping its open descendants", () => {
