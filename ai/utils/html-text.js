@@ -668,6 +668,9 @@ function attributeValue(attrs, name) {
 	return null;
 }
 
+/** Pending text is decoded in batches of at least this many characters */
+const DECODE_BATCH = 4096;
+
 /**
  * Whether the text the converter will expose reaches a minimum length (stops
  * early): character references decoded, whitespace (non-breaking spaces
@@ -698,12 +701,17 @@ export function hasTextOfAtLeast(html, minimum) {
 			if (tree.dropped || tree.inTemplate) return true;
 			pending.push(text);
 			pendingLength += text.length;
-			if (visible + pendingLength < minimum) return true; // cannot reach it yet
+			// Decode once the pending text could reach the threshold, and in batches of
+			// at least DECODE_BATCH characters: entity-only fragments then cost a few
+			// hundred decodes over the whole region, while a page with real text still
+			// stops at its first batch
+			if (visible + pendingLength < minimum || pendingLength < DECODE_BATCH) return true;
 			decodePending();
 			return visible < minimum;
 		},
 		tree.tokenizerOptions
 	);
+	if (visible < minimum && visible + pendingLength >= minimum) decodePending();
 	return visible >= minimum;
 }
 
