@@ -78,6 +78,68 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		expect(sent[0].args).toEqual({ url: "https://example.com/", hosts: ["db-01"] });
 	});
 
+	it("fills the routing field each destination declares, one call per single-valued host", async () => {
+		const byName = fakeServer(
+			"byname",
+			{ "h-01": host("h-01"), "h-02": host("h-02") },
+			{
+				fetch_url: {
+					description: "Routes by hostname, one at a time.",
+					inputSchema: {
+						type: "object",
+						properties: { url: { type: "string" }, hostname: { type: "string" } },
+						required: ["url", "hostname"],
+						additionalProperties: false,
+					},
+				},
+			}
+		);
+		const byList = fakeServer(
+			"bylist",
+			{ "l-01": host("l-01"), "l-02": host("l-02") },
+			{
+				fetch_url: {
+					description: "Routes by a list of host names.",
+					inputSchema: {
+						type: "object",
+						properties: { url: { type: "string" }, hostnames: { type: "array" } },
+						required: ["url", "hostnames"],
+						additionalProperties: false,
+					},
+				},
+			}
+		);
+		_setServersForTests([byName, byList]);
+		await refreshHostsForServer("byname");
+		await refreshHostsForServer("bylist");
+
+		const out = await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			hosts: ["h-01", "h-02", "l-01", "l-02"],
+		});
+		expect(out.results.every((r) => r.ok)).toBe(true);
+		// hostname is single-valued: two calls, "hosts" (undeclared) dropped
+		const named = byName.calls.filter((c) => c.name === "fetch_url").map((c) => c.args);
+		expect(named).toEqual([
+			{ url: "https://example.com/", hostname: "h-01" },
+			{ url: "https://example.com/", hostname: "h-02" },
+		]);
+		// hostnames takes the whole bucket in one call
+		const listed = byList.calls.filter((c) => c.name === "fetch_url").map((c) => c.args);
+		expect(listed).toEqual([{ url: "https://example.com/", hostnames: ["l-01", "l-02"] }]);
+
+		// A hostname the model supplied itself is kept (it may be an alias the agent knows)
+		await executeMcpFunctionCall("fetch_url", {
+			url: "https://example.com/",
+			hostname: "h-01.example.com",
+			hosts: ["h-01"],
+		});
+		expect(byName.calls.filter((c) => c.name === "fetch_url").at(-1).args).toEqual({
+			url: "https://example.com/",
+			hostname: "h-01.example.com",
+		});
+	});
+
 	it("refuses servers whose definition rejects or retypes a supplied argument", async () => {
 		const strict = fakeServer(
 			"strict",

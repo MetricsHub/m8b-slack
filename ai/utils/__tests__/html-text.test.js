@@ -636,6 +636,27 @@ describe("htmlToMarkdown", () => {
 		expect(out).not.toContain("decoy");
 	});
 
+	it("treats <annotation-xml> as an integration point only with an HTML encoding", () => {
+		// Without encoding="text/html" (or application/xhtml+xml) the element is
+		// ordinary MathML: a <textarea> below it is foreign, its content is markup
+		const deep = "<mi>".repeat(600);
+		for (const open of [
+			'<math><annotation-xml encoding="application/xml">',
+			"<math><annotation-xml>",
+			"<math><annotation-xml encoding=text/plain>",
+		]) {
+			expect(estimateNesting(`${open}<textarea>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		}
+		// With an HTML encoding (ASCII case-insensitive) the children are HTML:
+		// the textarea is RCDATA and nothing below it nests
+		for (const encoding of ["text/html", "application/xhtml+xml", "TEXT/HTML", " text/html "]) {
+			expect(
+				estimateNesting(`<math><annotation-xml encoding="${encoding}"><textarea>${deep}</textarea>`)
+					.depth
+			).toBe(3);
+		}
+	});
+
 	it("reprocesses a self-closing breakout tag as HTML: <div/> in svg opens a div", () => {
 		// The parser leaves foreign content on <div/>, then handles the token as
 		// HTML, where the slash means nothing on a non-void element

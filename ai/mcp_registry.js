@@ -412,14 +412,14 @@ export function isHostRoutedMcpTool(name) {
 
 /**
  * Whether an MCP tool definition declares a host-routing argument of its own
- * (hosts / hostname / host).
+ * (hosts / hostnames / hostname / host).
  *
  * @param {{inputSchema?: {properties?: object}}|undefined} def - Tool definition
  * @returns {boolean}
  */
 function hasHostRoutingParam(def) {
 	const props = def?.inputSchema?.properties;
-	return Boolean(props && ("hosts" in props || "hostname" in props || "host" in props));
+	return Boolean(props && [...ROUTING_FIELDS].some((field) => field in props));
 }
 
 /** Arguments the router fills in itself: never "missing" on the caller's side */
@@ -427,6 +427,37 @@ const ROUTING_FIELDS = new Set(["hosts", "host", "hostname", "hostnames"]);
 
 /** Arguments handled app-side (routing, middleware filters): not the destination's business */
 const APP_SIDE_FIELDS = new Set([...ROUTING_FIELDS, "monitorTypes"]);
+
+/**
+ * Argument sets for one destination server: the call's arguments with the
+ * routing field THIS server declares filled from its bucket of host keys.
+ * `hosts` (the advertised routing field) is always set from the bucket;
+ * another declared routing field (hostnames, hostname, host) is filled only
+ * when the model left it empty — a value it supplied may be an alias the
+ * agent knows better than the key — with one call per host when the field
+ * takes a single value. Routing fields the destination does not declare are
+ * dropped: an older schema with additionalProperties:false would reject them.
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Destination's tool definition
+ * @param {Object} args - Call arguments
+ * @param {string[]} hosts - Host keys bucketed to this server
+ * @returns {Object[]} One argument object per call to make
+ */
+function routedCalls(def, args, hosts) {
+	const props = def?.inputSchema?.properties || {};
+	const base = {};
+	for (const [key, value] of Object.entries(args || {})) {
+		if (!ROUTING_FIELDS.has(key) || key in props) base[key] = value;
+	}
+	if ("hosts" in props) return [{ ...base, hosts }];
+	const field = ["hostnames", "hostname", "host"].find((candidate) => candidate in props);
+	if (!field || (base[field] !== undefined && base[field] !== null)) return [base];
+	const type = props[field]?.type;
+	const takesList =
+		type === "array" || (Array.isArray(type) && type.includes("array")) || field === "hostnames";
+	if (takesList) return [{ ...base, [field]: hosts }];
+	return hosts.map((host) => ({ ...base, [field]: host }));
+}
 
 /**
  * Whether a value fits the JSON Schema `type` of a property (one type or a
@@ -831,27 +862,28 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 			continue;
 		}
 
-		// Build args for this server, including the hosts for this server
-		const callArgs = { ...args, hosts: hs };
-
-		try {
-			// Use a longer timeout (120 seconds) for tool calls as some operations can be slow
-			console.log(
-				`[MCP] Calling tool '${name}' on ${server.server_label} with args:`,
-				JSON.stringify(callArgs)
-			);
-			const startTime = Date.now();
-			const res = await server.client.callTool({ name, arguments: callArgs }, undefined, {
-				timeout: 120000,
-			});
-			console.log(
-				`[MCP] Tool '${name}' on ${server.server_label} completed in ${Date.now() - startTime}ms`
-			);
-			const parsed = _parseToolResult(res);
-			results.push({ server_label: server.server_label, ok: true, result: parsed });
-		} catch (e) {
-			console.error(`[MCP] Tool '${name}' on ${server.server_label} failed:`, e);
-			results.push({ server_label: server.server_label, ok: false, error: String(e) });
+		// One call per argument set: the destination's own routing field is filled
+		// from its bucket (several calls when that field takes a single host)
+		for (const callArgs of routedCalls(server.tools.get(name), args, hs)) {
+			try {
+				// Use a longer timeout (120 seconds) for tool calls as some operations can be slow
+				console.log(
+					`[MCP] Calling tool '${name}' on ${server.server_label} with args:`,
+					JSON.stringify(callArgs)
+				);
+				const startTime = Date.now();
+				const res = await server.client.callTool({ name, arguments: callArgs }, undefined, {
+					timeout: 120000,
+				});
+				console.log(
+					`[MCP] Tool '${name}' on ${server.server_label} completed in ${Date.now() - startTime}ms`
+				);
+				const parsed = _parseToolResult(res);
+				results.push({ server_label: server.server_label, ok: true, result: parsed });
+			} catch (e) {
+				console.error(`[MCP] Tool '${name}' on ${server.server_label} failed:`, e);
+				results.push({ server_label: server.server_label, ok: false, error: String(e) });
+			}
 		}
 	}
 

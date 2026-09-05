@@ -492,7 +492,9 @@ function decodeBody(bytes, charset, type) {
 	// as text/html); for XML media types (RSS/Atom feeds, sitemaps, ...) only the
 	// leading XML declaration has any authority — a <meta charset> inside an
 	// embedded XHTML fragment is content, not a declaration
-	const isHtml = !type || HTML_TYPES.has(type);
+	// (application/xhtml+xml is an XML media type: its <meta charset> has no
+	// authority, only the XML declaration does — it is converted as HTML later)
+	const isHtml = !type || type === "text/html";
 	const isXml = type === "text/xml" || /xml$/.test(type);
 	if (!label && (isHtml || isXml)) {
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));

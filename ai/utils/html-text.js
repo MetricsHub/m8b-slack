@@ -714,18 +714,23 @@ export function estimateNesting(html) {
 	// matter: "/>" really closes an element there (inline icons stay shallow),
 	// and an HTML "breakout" start tag pops the foreign subtree in the parser.
 	let foreignOpen = 0; // svg/math elements currently on the stack
+	// Parallel to the stack: whether each element is an integration point (an
+	// island of HTML inside svg/math). Decided at push time from the tag's
+	// attributes: <annotation-xml> only counts with an HTML encoding
+	const integration = [];
 	const popTo = (index) => {
 		for (let i = index; i < stack.length; i++) {
 			if (PREFIXING.has(stack[i])) prefixes--;
 			if (stack[i] === "svg" || stack[i] === "math") foreignOpen--;
 		}
 		stack.length = index;
+		integration.length = index;
 	};
 	tokenizeHtml(
 		html,
 		(tag) => {
 			const { name, closing, selfClosing, attrs } = tag;
-			if (foreignOpen > 0 && !closing && inForeignMode(stack)) {
+			if (foreignOpen > 0 && !closing && inForeignMode(stack, integration)) {
 				if (
 					FOREIGN_BREAKOUT.has(name) &&
 					(name !== "font" || hasAnyAttribute(attrs, FONT_BREAKOUT_ATTRIBUTES))
@@ -753,6 +758,7 @@ export function estimateNesting(html) {
 			if (name === "body" || name === "html") {
 				if (!closing && !stack.includes(name)) {
 					stack.push(name);
+					integration.push(false);
 					if (stack.length > depth) depth = stack.length;
 				}
 				return true;
@@ -793,6 +799,7 @@ export function estimateNesting(html) {
 						// </form> removes only the form element from the stack; the
 						// descendants above it stay open (`<form><div></form>` keeps nesting)
 						stack.splice(index, 1);
+						integration.splice(index, 1);
 						return true;
 					}
 					popTo(index);
@@ -812,6 +819,7 @@ export function estimateNesting(html) {
 				}
 			}
 			stack.push(name);
+			integration.push(isIntegrationPoint(name, attrs));
 			if (PREFIXING.has(name)) prefixes++;
 			if (stack.length > depth) depth = stack.length;
 			if (prefixes > prefixDepth) prefixDepth = prefixes;
@@ -981,15 +989,39 @@ const FOREIGN_INTEGRATION = new Set([
 	"mtext",
 ]);
 
+/** Encodings that make a MathML <annotation-xml> an HTML integration point */
+const INTEGRATION_ENCODINGS = new Set(["text/html", "application/xhtml+xml"]);
+
+/**
+ * Whether a start tag opens an integration point: an svg foreignObject, desc
+ * or title, a MathML text element (mi, mo, mn, ms, mtext), or an
+ * <annotation-xml> whose encoding attribute is text/html or
+ * application/xhtml+xml (ASCII case-insensitive) — without that encoding it
+ * is an ordinary MathML element and its children stay foreign.
+ *
+ * @param {string} name - Tag name
+ * @param {string} attrs - Raw attribute text of the tag
+ * @returns {boolean}
+ */
+function isIntegrationPoint(name, attrs) {
+	if (!FOREIGN_INTEGRATION.has(name)) return false;
+	if (name !== "annotation-xml") return true;
+	const encoding = attributeValue(attrs, "encoding");
+	return encoding !== null && INTEGRATION_ENCODINGS.has(asciiLower(encoding.trim()));
+}
+
 /**
  * Whether the innermost namespace context on the stack is foreign: the
  * nearest svg/math or integration point decides (the stack is capped, so this
  * walk is bounded).
+ *
+ * @param {string[]} stack - Open element names
+ * @param {boolean[]} integration - Parallel flags: element is an integration point
  */
-function inForeignMode(stack) {
+function inForeignMode(stack, integration) {
 	for (let i = stack.length - 1; i >= 0; i--) {
 		if (stack[i] === "svg" || stack[i] === "math") return true;
-		if (FOREIGN_INTEGRATION.has(stack[i])) return false;
+		if (integration[i]) return false;
 	}
 	return false;
 }

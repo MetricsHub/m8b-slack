@@ -1064,6 +1064,28 @@ describe("content negotiation", () => {
 		expect(page.result.content).toContain("Café");
 	});
 
+	it("sniffs XHTML (application/xhtml+xml) as XML: the meta charset has no authority", async () => {
+		const utf8 = Buffer.from(
+			'<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="windows-1252"/><title>Café</title></head><body><p>Café du marché</p></body></html>',
+			"utf8"
+		);
+		const latin = Buffer.from(
+			'<?xml version="1.0" encoding="iso-8859-1"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Caf\xe9</title></head><body><p>Caf\xe9 du march\xe9</p></body></html>',
+			"latin1"
+		);
+		const routes = {
+			"https://example.com/utf8.xhtml": response(utf8, { contentType: "application/xhtml+xml" }),
+			"https://example.com/latin.xhtml": response(latin, { contentType: "application/xhtml+xml" }),
+		};
+		for (const url of ["https://example.com/utf8.xhtml", "https://example.com/latin.xhtml"]) {
+			const { result } = await run({ url }, { routes });
+			expect(result.ok).toBe(true);
+			// Still converted as HTML (title extracted, Markdown body)
+			expect(result.title).toBe("Café");
+			expect(result.content).toContain("Café du marché");
+		}
+	});
+
 	it("accepts whitespace around the XML encoding assignment", async () => {
 		const latinXml = Buffer.from(
 			'<?xml version="1.0" encoding = "windows-1252"?><rss><channel><title>Caf\xe9</title></channel></rss>',
