@@ -480,6 +480,54 @@ describe("htmlToMarkdown", () => {
 		expect(based).toContain("[Guide](https://d.example/docs/guide)");
 	});
 
+	it("stops generic end tags at special elements, like the parser", () => {
+		// </span> gives up at the special <div>: every div stays open and nests
+		const page = `<body>${"<span><div></span>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary inline markup still closes and converts
+		expect(htmlToMarkdown("<body><p><span>a</span> <em>b</em></p></body>")).toBe("a *b*");
+	});
+
+	it("keeps a dropped ancestor open when a scope boundary blocks its closer", () => {
+		// </nav> is ignored (the open <object> is a boundary): the main stays inside the nav
+		const decoy = `<nav><object></nav></object><main>${"Decoy text. ".repeat(40)}</main></nav>`;
+		const page = `<body>${decoy}<article>${"Real text. ".repeat(40)}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real text.");
+		expect(out).not.toContain("Decoy text.");
+	});
+
+	it("closes a fence only with a run at least as long as the opener", () => {
+		// Turndown lengthens the fence around code that contains ```: the inner
+		// line must not end the block and expose the code to the prose rewrites
+		const page =
+			"<body><p>Intro</p><pre><code>line 1\n```\nrun   this , now\n</code></pre><p>after   this , ok</p></body>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("run   this , now");
+		expect(out).toContain("after this, ok");
+		expect(out.match(/````/g)?.length).toBe(2);
+	});
+
+	it("ignores SVG titles when extracting the page title", () => {
+		const page =
+			"<html><body><svg><title>Search icon</title></svg><h1>Dashboard</h1></body></html>";
+		expect(extractHtmlTitle(page)).toBe("Dashboard");
+		expect(
+			extractHtmlTitle(
+				"<head><title>Real</title></head><body><svg><title>Icon</title></svg></body>"
+			)
+		).toBe("Real");
+	});
+
+	it("ignores <base> inside <template> (a separate document fragment)", () => {
+		const page = `<html><head><template><base href="/preview/"></template><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://d.example/" });
+		expect(out).toContain("[Guide](https://d.example/docs/guide)");
+	});
+
 	it("handles tables without a header row", () => {
 		const out = htmlToMarkdown(
 			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"

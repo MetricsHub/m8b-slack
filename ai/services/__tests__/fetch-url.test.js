@@ -436,6 +436,61 @@ describe("limits", () => {
 		expect(quotes.result.chars).toBeGreaterThan(MAX_CONTENT_CHARS / 2 - 10);
 	});
 
+	it("stages the complete text for the sandbox when the inline content had to be cut", async () => {
+		const staged = new Map();
+		const body = '"'.repeat(700000);
+		const fetchImpl = makeFetch({
+			"https://example.com/quotes.txt": response(body, { contentType: "text/plain" }),
+		});
+		const result = await executeFetchUrl(
+			{ url: "https://example.com/quotes.txt" },
+			{ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+			{
+				fetchImpl,
+				lookup: publicLookup,
+				config: baseConfig,
+				stageText: (text, toolName) => {
+					const name = `${toolName}_full.txt`;
+					staged.set(name, text);
+					return name;
+				},
+			}
+		);
+		expect(result.truncated).toBe(true);
+		expect(result.fullTextFile).toBe("fetch_url_full.txt");
+		expect(staged.get("fetch_url_full.txt")).toBe(body);
+		expect(result.hint).toContain("/data/fetch_url_full.txt");
+		// Without a staging hook nothing is promised
+		const plain = await run(
+			{ url: "https://example.com/quotes.txt" },
+			{
+				routes: { "https://example.com/quotes.txt": response(body, { contentType: "text/plain" }) },
+			}
+		);
+		expect(plain.result.fullTextFile).toBeUndefined();
+	});
+
+	it("does not mistake 'charset=' inside another attribute's value for a declaration", async () => {
+		const utf8 = Buffer.from(
+			'<html><head><meta name="description" content="Example of charset=windows-1252 pages"><title>Café</title></head><body><p>Café</p></body></html>',
+			"utf8"
+		);
+		const routes = { "https://example.com/desc": response(utf8, { contentType: "text/html" }) };
+		const { result } = await run({ url: "https://example.com/desc" }, { routes });
+		expect(result.title).toBe("Café");
+		expect(result.content).toContain("Café");
+		// The http-equiv form still counts
+		const latin = Buffer.from(
+			'<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252"></head><body><p>Caf\xe9</p></body></html>',
+			"latin1"
+		);
+		const equiv = await run(
+			{ url: "https://example.com/equiv" },
+			{ routes: { "https://example.com/equiv": response(latin, { contentType: "text/html" }) } }
+		);
+		expect(equiv.result.content).toContain("Café");
+	});
+
 	it("reports HTTP errors and network failures without throwing", async () => {
 		const routes = {
 			"https://example.com/missing": notFound(),

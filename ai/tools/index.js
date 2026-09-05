@@ -283,7 +283,10 @@ export function buildToolsArray({
 	// per-host schemas until GPT-5.6 determines that it needs them.
 	// FETCH_URL_ENABLED=false removes page reading everywhere: an MCP-provided
 	// fetch_url is not advertised here either (its calls are refused anyway)
-	const mcpFunctionTools = isFetchUrlEnabled()
+	// ...and a URL-only MCP fetch_url is not advertised either: it cannot be
+	// driven through the host router, so a call would silently go elsewhere
+	const advertiseMcpFetchUrl = isFetchUrlEnabled() && isHostRoutedMcpTool("fetch_url");
+	const mcpFunctionTools = advertiseMcpFetchUrl
 		? getOpenAiFunctionTools()
 		: getOpenAiFunctionTools().filter((tool) => tool.name !== "fetch_url");
 	const mcpNamespaces = buildFunctionNamespaces({

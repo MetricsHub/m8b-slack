@@ -274,6 +274,41 @@ describe("buildToolsArray", () => {
 		}
 	});
 
+	it("does not advertise a URL-only MCP fetch_url in the hosted namespaces", () => {
+		// It cannot be driven through the host router, so a call would go elsewhere
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "URL-only reader.",
+							inputSchema: { type: "object", properties: { url: { type: "string" } } },
+						},
+					],
+					["OtherTool", { description: "Kept.", inputSchema: { type: "object" } }],
+				]),
+			},
+		]);
+		try {
+			const hosted = buildToolsArray({ vectorStoreIds: [], provider: openAiProvider });
+			const namespaced = hosted
+				.filter((t) => t.type === "namespace")
+				.flatMap((namespace) => namespace.tools.map((t) => t.name));
+			expect(namespaced).not.toContain("fetch_url");
+			expect(namespaced).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
 	it("does not advertise a disabled MCP fetch_url in the hosted namespaces either", () => {
 		const saved = process.env.FETCH_URL_ENABLED;
 		process.env.FETCH_URL_ENABLED = "false";

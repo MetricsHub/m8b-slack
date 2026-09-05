@@ -479,6 +479,33 @@ function isTextualType(type) {
 	);
 }
 
+/**
+ * Charset declared by a real <meta> attribute in the first bytes of an HTML
+ * document: `<meta charset="...">` or `<meta http-equiv="content-type"
+ * content="...; charset=...">`. Attributes are parsed (quoted values are
+ * consumed whole), so "charset=" appearing inside another attribute's value
+ * is not mistaken for a declaration.
+ *
+ * @param {string} head - Leading bytes decoded as latin1
+ * @returns {string|null}
+ */
+function metaCharset(head) {
+	const tags = head.matchAll(/<meta\b([^>]*)>/gi);
+	for (const tag of tags) {
+		const attrs = {};
+		const attrPattern = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+		for (const match of tag[1].matchAll(attrPattern)) {
+			attrs[match[1].toLowerCase()] = (match[2] ?? match[3] ?? match[4] ?? "").trim();
+		}
+		if (attrs.charset) return attrs.charset;
+		if ((attrs["http-equiv"] || "").toLowerCase() === "content-type" && attrs.content) {
+			const inContent = attrs.content.match(/charset\s*=\s*["']?\s*([a-z0-9_-]+)/i);
+			if (inContent) return inContent[1];
+		}
+	}
+	return null;
+}
+
 function decodeBody(bytes, charset, type) {
 	// A UTF-16 byte-order mark (or declared charset) wins over any sniffing
 	let label = utf16Label(bytes, charset) || charset;
@@ -490,9 +517,7 @@ function decodeBody(bytes, charset, type) {
 		// Sniff <meta charset> in the first bytes of the document
 		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 4096));
 		label =
-			head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_-]+)/i)?.[1] ||
-			head.match(/<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] ||
-			null;
+			metaCharset(head) || head.match(/<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_-]+)/i)?.[1] || null;
 	}
 	try {
 		return new TextDecoder(label || "utf-8", { fatal: false }).decode(bytes);
@@ -901,7 +926,28 @@ function finalizeContent(text) {
 		content = content.slice(0, Math.max(keep, 0));
 		serialized = JSON.stringify(content).length;
 	}
-	return { content, truncated: content.length < clean.length, totalChars: clean.length };
+	return {
+		content,
+		truncated: content.length < clean.length,
+		totalChars: clean.length,
+		full: clean,
+	};
+}
+
+/**
+ * Complete text of results whose inline content had to be cut, kept aside
+ * (never serialized) so the caller can stage it in full for the sandbox.
+ */
+const FULL_TEXT = new WeakMap();
+
+/**
+ * Complete text behind a truncated result, or null when nothing was cut.
+ *
+ * @param {Object} result - A result produced by buildResult
+ * @returns {string|null}
+ */
+export function fullTextOf(result) {
+	return FULL_TEXT.get(result) ?? null;
 }
 
 /**
@@ -918,7 +964,7 @@ function finalizeContent(text) {
  * @returns {Object}
  */
 function buildResult({ requestedUrl, finalUrl, source, title, contentType, text, note }) {
-	const { content, truncated, totalChars } = finalizeContent(text);
+	const { content, truncated, totalChars, full } = finalizeContent(text);
 	const result = {
 		ok: true,
 		url: requestedUrl,
@@ -933,7 +979,10 @@ function buildResult({ requestedUrl, finalUrl, source, title, contentType, text,
 	if (truncated) {
 		result.truncated = true;
 		result.totalChars = totalChars;
-		result.hint = `Only the first ${MAX_CONTENT_CHARS} of ${totalChars} characters are shown.`;
+		result.hint = `Only the first ${content.length} of ${totalChars} characters are shown.`;
+		// The complete text stays out of the serialized result but is kept for
+		// the caller to stage in full (see executeFetchUrl's stageText option)
+		FULL_TEXT.set(result, full);
 	}
 	if (note) result.note = note;
 	return result;
@@ -1544,6 +1593,9 @@ async function resolveGitHubRefSegments(base, segments, runtime) {
  * @param {Function} [options.fetchImpl] - fetch replacement (default: global fetch with the guarded dispatcher)
  * @param {Function} [options.lookup] - dns.promises.lookup replacement
  * @param {Object} [options.config] - Configuration override (default: from the environment)
+ * @param {(text: string, toolName: string) => (string|null)} [options.stageText] - Stages
+ *   the complete text of a page whose inline content had to be cut (for the Python
+ *   sandbox); returns the staged file name, or null when staging is unavailable
  * @returns {Promise<Object>} {ok: true, url, finalUrl, source, title?, contentType, chars, content, truncated?, note?}
  *   or {ok: false, error, hint?}
  */
@@ -1585,6 +1637,26 @@ export async function executeFetchUrl(args, logger, options = {}) {
 		dispatcher,
 	};
 
+	// A result whose inline content had to be cut keeps its complete text aside;
+	// when the caller can stage files for the Python sandbox, the full text is
+	// staged there and the result says where, so nothing is lost to the cut
+	const finish = (result) => {
+		const full = fullTextOf(result);
+		if (full && typeof options.stageText === "function") {
+			try {
+				const fileName = options.stageText(full, "fetch_url");
+				if (fileName) {
+					result.fullTextFile = fileName;
+					result.hint =
+						`${result.hint || ""} The complete text (${full.length} chars) is staged in the Python sandbox at /data/${fileName}; read it with run_python.`.trim();
+				}
+			} catch (e) {
+				logger?.warn?.(`[FETCH_URL] Could not stage the full text: ${e?.message || e}`);
+			}
+		}
+		return result;
+	};
+
 	try {
 		// Slack wraps pasted links in <...|label>; models sometimes forward that form
 		// Slack wraps links as <url|label> and escapes &, < and > inside them:
@@ -1601,16 +1673,16 @@ export async function executeFetchUrl(args, logger, options = {}) {
 			logger?.info?.(
 				`[FETCH_URL] GitHub ${github.kind} ${github.owner}/${github.repo}#${github.number}`
 			);
-			return await readGitHubItem(github, url.toString(), runtime);
+			return finish(await readGitHubItem(github, url.toString(), runtime));
 		}
 		if (github?.kind === "blob") {
 			logger?.info?.(`[FETCH_URL] GitHub blob ${github.owner}/${github.repo} ${github.path}`);
-			return await readGitHubBlob(github, url.toString(), runtime);
+			return finish(await readGitHubBlob(github, url.toString(), runtime));
 		}
 
 		const result = await readWebPage(url, runtime);
 		logger?.info?.(`[FETCH_URL] ${url.hostname} read via ${result.source} (${result.chars} chars)`);
-		return result;
+		return finish(result);
 	} catch (e) {
 		if (e instanceof FetchUrlError) {
 			logger?.warn?.(`[FETCH_URL] ${e.message}`);

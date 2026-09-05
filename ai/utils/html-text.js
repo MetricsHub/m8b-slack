@@ -501,26 +501,42 @@ function selectContentRegion(html) {
 	};
 	// A <main> inside a <template>, <nav>, <footer>... is not the page's content:
 	// slicing it out would also detach it from the ancestor Turndown removes.
-	// Open dropped elements are counted per name (constant time per tag: no
-	// stack a flood of unmatched closers could make this rescan); a closer with
-	// nothing open of its name is ignored, as the parser ignores it
-	const openDropped = new Map();
+	// Dropped elements and scope boundaries are tracked on a small stack with
+	// the parser's end-tag rule (a closer below a scope boundary is ignored, so
+	// `<nav><object></nav>` keeps the nav open). The stack is bounded: past the
+	// bound the page is hostile anyway (the depth guard refuses it) and region
+	// selection just stops
+	const tracked = [];
 	let droppedDepth = 0;
+	let hostile = false;
 	tokenizeHtml(
 		html,
 		({ name, closing, selfClosing, start }) => {
-			if (DROP_ELEMENT_SET.has(name)) {
+			if (DROP_ELEMENT_SET.has(name) || SCOPE_BOUNDARY.has(name)) {
 				// A void dropped element (<embed>) has no content and never closes
 				if (VOID_ELEMENTS.has(name)) return;
-				const open = openDropped.get(name) || 0;
 				if (closing) {
-					if (open > 0) {
-						openDropped.set(name, open - 1);
-						droppedDepth--;
+					let index = -1;
+					for (let i = tracked.length - 1; i >= 0; i--) {
+						if (tracked[i] === name) {
+							index = i;
+							break;
+						}
+						if (SCOPE_BOUNDARY.has(tracked[i])) break;
+					}
+					if (index !== -1) {
+						for (let i = index; i < tracked.length; i++) {
+							if (DROP_ELEMENT_SET.has(tracked[i])) droppedDepth--;
+						}
+						tracked.length = index;
 					}
 				} else if (!(selfClosing && (name === "svg" || name === "math"))) {
-					openDropped.set(name, open + 1);
-					droppedDepth++;
+					tracked.push(name);
+					if (DROP_ELEMENT_SET.has(name)) droppedDepth++;
+					if (tracked.length > MAX_DOM_DEPTH * 2) {
+						hostile = true;
+						return false;
+					}
 				}
 				return;
 			}
@@ -535,6 +551,7 @@ function selectContentRegion(html) {
 		},
 		() => undefined
 	);
+	if (hostile) return html;
 
 	for (const tag of ["main", "article"]) {
 		const { opens, start, end } = marks[tag];
@@ -625,7 +642,11 @@ function estimateNesting(html) {
 				// table, td, template, ...) sits above it: the parser then ignores
 				// the end tag and everything stays open. The stack is capped, so this
 				// walk is bounded.
-				// </li> uses list-item scope (ul/ol are boundaries too), </p> button scope
+				// Special elements have their own end-tag rules ("in scope": stop at the
+				// scope boundaries; </li> adds ul/ol, </p> adds button). Any other end
+				// tag uses the generic algorithm, which gives up at the first SPECIAL
+				// element it meets (`<span><div></span>` leaves the div open)
+				const special = SPECIAL_ELEMENTS.has(name);
 				const extraBoundary = name === "li" ? LIST_SCOPE : name === "p" ? BUTTON_SCOPE : null;
 				let index = -1;
 				for (let i = stack.length - 1; i >= 0; i--) {
@@ -633,7 +654,11 @@ function estimateNesting(html) {
 						index = i;
 						break;
 					}
-					if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
+					if (special) {
+						if (SCOPE_BOUNDARY.has(stack[i]) || extraBoundary?.has(stack[i])) break;
+					} else if (SPECIAL_ELEMENTS.has(stack[i])) {
+						break;
+					}
 				}
 				if (index !== -1) {
 					if (FORMATTING_ELEMENTS.has(name) && index !== stack.length - 1) {
@@ -704,6 +729,98 @@ const SCOPE_BOUNDARY = new Set([
 /** Additional boundaries of list-item scope (</li>) and button scope (</p>) */
 const LIST_SCOPE = new Set(["ul", "ol"]);
 const BUTTON_SCOPE = new Set(["button"]);
+
+/**
+ * The parser's "special" category. The generic end-tag algorithm (used for
+ * elements without their own end-tag rules, e.g. </span>) walks the stack and
+ * gives up as soon as it meets a special element, so `<span><div></span>`
+ * leaves the div open and nesting.
+ */
+const SPECIAL_ELEMENTS = new Set([
+	"address",
+	"applet",
+	"area",
+	"article",
+	"aside",
+	"base",
+	"basefont",
+	"bgsound",
+	"blockquote",
+	"body",
+	"br",
+	"button",
+	"caption",
+	"center",
+	"col",
+	"colgroup",
+	"dd",
+	"details",
+	"dir",
+	"div",
+	"dl",
+	"dt",
+	"embed",
+	"fieldset",
+	"figcaption",
+	"figure",
+	"footer",
+	"form",
+	"frame",
+	"frameset",
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"head",
+	"header",
+	"hgroup",
+	"hr",
+	"html",
+	"iframe",
+	"img",
+	"input",
+	"keygen",
+	"li",
+	"link",
+	"listing",
+	"main",
+	"marquee",
+	"menu",
+	"meta",
+	"nav",
+	"noembed",
+	"noframes",
+	"noscript",
+	"object",
+	"ol",
+	"p",
+	"param",
+	"plaintext",
+	"pre",
+	"script",
+	"search",
+	"section",
+	"select",
+	"source",
+	"style",
+	"summary",
+	"table",
+	"tbody",
+	"td",
+	"template",
+	"textarea",
+	"tfoot",
+	"th",
+	"thead",
+	"title",
+	"tr",
+	"track",
+	"ul",
+	"wbr",
+	"xmp",
+]);
 
 /** Formatting elements, whose end tags go through the adoption agency algorithm */
 const FORMATTING_ELEMENTS = new Set([
@@ -878,9 +995,17 @@ export function extractHtmlTitle(html) {
 	let heading = null;
 	let collecting = null; // "title" | "h1" while inside the element being captured
 	let buffer = [];
+	// <title> inside inline <svg>/<math> is an accessibility label, not the page title
+	let foreignDepth = 0;
 	tokenizeHtml(
 		source,
-		({ name, closing }) => {
+		({ name, closing, selfClosing }) => {
+			if (name === "svg" || name === "math") {
+				if (closing) foreignDepth = Math.max(0, foreignDepth - 1);
+				else if (!selfClosing) foreignDepth++;
+				return true;
+			}
+			if (foreignDepth > 0 && !collecting) return true;
 			if (collecting) {
 				if (name === collecting && closing) {
 					const text = buffer.join(" ");
@@ -917,9 +1042,18 @@ export function extractHtmlTitle(html) {
  */
 function documentBaseUrl(html, responseUrl) {
 	let base = responseUrl;
+	let inert = 0; // open <template>/<svg>/<math> elements
 	tokenizeHtml(
 		html,
-		({ name, closing, attrs }) => {
+		({ name, closing, selfClosing, attrs }) => {
+			// A <base> inside <template> (a separate document fragment) or inside
+			// inline svg/math does not establish the document base
+			if (name === "template" || name === "svg" || name === "math") {
+				if (closing) inert = Math.max(0, inert - 1);
+				else if (!selfClosing) inert++;
+				return true;
+			}
+			if (inert > 0) return true;
 			if (name === "base" && !closing) {
 				// A <base> without href (target only) does not count: keep looking.
 				// Attribute values are raw source: character references are decoded
@@ -1092,11 +1226,21 @@ function tidyMarkdown(markdown) {
 		);
 		prose = [];
 	};
+	// A fence closes only with a backtick run at least as long as the opener:
+	// Turndown lengthens the fence around code that itself contains ```
+	let fenceLength = 0;
 	for (const line of markdown.split("\n")) {
-		if (/^\s*```/.test(line)) {
-			if (!inFence) flush();
+		const fence = line.match(/^\s*(`{3,})\s*(\S*)\s*$/);
+		if (!inFence && fence) {
+			flush();
 			out.push(line);
-			inFence = !inFence;
+			inFence = true;
+			fenceLength = fence[1].length;
+			continue;
+		}
+		if (inFence && fence && fence[1].length >= fenceLength && !fence[2]) {
+			out.push(line);
+			inFence = false;
 			continue;
 		}
 		if (inFence) out.push(line);

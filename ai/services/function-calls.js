@@ -177,7 +177,17 @@ export async function processFunctionCall(functionCall, context) {
 					async (_name, cleanArgs) =>
 						isHostRoutedMcpTool("fetch_url")
 							? handleMcpFunctionCall(_name, cleanArgs, logger)
-							: executeFetchUrl(cleanArgs, logger),
+							: executeFetchUrl(cleanArgs, logger, {
+									// A page whose inline content had to be cut is staged in full
+									// for run_python, so the model can still read all of it
+									stageText: middlewareOptions.sandboxFiles
+										? (text, toolName) => {
+												const fileName = `${toolName}_${Date.now()}_full.txt`;
+												middlewareOptions.sandboxFiles.set(fileName, text);
+												return fileName;
+											}
+										: undefined,
+								}),
 					middlewareOptions
 				);
 				break;
