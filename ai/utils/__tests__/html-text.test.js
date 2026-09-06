@@ -1,0 +1,1337 @@
+/**
+ * Tests for the HTML → Markdown conversion (Turndown + model-oriented pre/post passes).
+ */
+
+import { describe, expect, it } from "@jest/globals";
+import {
+	decodeAttributeEntities,
+	decodeHtmlEntities,
+	estimateNesting,
+	extractHtmlTitle,
+	hasTextOfAtLeast,
+	htmlToMarkdown,
+	MAX_DOM_DEPTH,
+} from "../html-text.js";
+
+const PAGE = `<!DOCTYPE html>
+<html><head><title>Install &amp; Configure &mdash; Docs</title>
+<style>body { color: red }</style>
+<script>window.track = function () { return "noise"; };</script>
+</head>
+<body>
+<nav><ul><li><a href="/">Home</a></li><li><a href="/docs">Docs<nav>nested</nav></a></li></ul></nav>
+<main>
+<h1>Install &amp; Configure</h1>
+<p>Download the <a href="../releases/latest">latest release</a>, then run the installer. This paragraph is
+long enough to make the main region the obvious content of the page for the region selector.</p>
+<h2>Steps</h2>
+<ul>
+  <li>Unpack the <code>archive</code></li>
+  <li>Run <strong>setup</strong> as <em>root</em></li>
+</ul>
+<pre><code class="language-bash">./setup   --prefix=/opt   &amp;&amp; echo   done
+echo "&lt;ok&gt;"</code></pre>
+<table>
+  <tr><th>Option</th><th>Default</th></tr>
+  <tr><td>port</td><td>8080 | 8443</td></tr>
+</table>
+<blockquote>Do not run as a service user.</blockquote>
+<img src="/x.png" alt="Architecture diagram">
+<script>inline()</script>
+</main>
+<footer>Copyright &copy; 2026 Example</footer>
+</body></html>`;
+
+describe("htmlToMarkdown", () => {
+	const text = htmlToMarkdown(PAGE, { baseUrl: "https://docs.example.com/guide/install.html" });
+
+	it("drops scripts, styles, navigation and footers (nested ones included)", () => {
+		expect(text).not.toContain("window.track");
+		expect(text).not.toContain("inline()");
+		expect(text).not.toContain("color: red");
+		expect(text).not.toContain("Home");
+		expect(text).not.toContain("nested");
+		expect(text).not.toContain("Copyright");
+	});
+
+	it("keeps headings, paragraphs, lists and quotes as Markdown", () => {
+		expect(text).toContain("# Install & Configure");
+		expect(text).toContain("## Steps");
+		expect(text).toContain("- Unpack the `archive`");
+		expect(text).toContain("- Run **setup** as *root*");
+		expect(text).toContain("> Do not run as a service user.");
+	});
+
+	it("resolves relative links and images against the page URL", () => {
+		expect(text).toContain(
+			"Download the [latest release](https://docs.example.com/releases/latest), then run the installer."
+		);
+		expect(text).toContain("![Architecture diagram](https://docs.example.com/x.png)");
+	});
+
+	it("preserves whitespace and entities inside fenced code blocks", () => {
+		expect(text).toContain('```bash\n./setup   --prefix=/opt   && echo   done\necho "<ok>"\n```');
+	});
+
+	it("renders tables as GFM tables with escaped pipes", () => {
+		expect(text).toMatch(/^\| Option +\| Default +\|$/m);
+		expect(text).toMatch(/^\| -+ +\| -+ +\|$/m);
+		expect(text).toMatch(/^\| port +\| 8080 \\\| 8443 +\|$/m);
+	});
+
+	it("keeps the output compact: no blank-line runs, no padded list markers", () => {
+		expect(text).not.toMatch(/\n{3,}/);
+		expect(text).not.toMatch(/^-\s{2,}\S/m);
+	});
+
+	it("falls back to the body when there is no single main region", () => {
+		const plain = htmlToMarkdown("<html><body><p>Hello</p><p>World</p></body></html>");
+		expect(plain).toBe("Hello\n\nWorld");
+	});
+
+	it("converts <br> and <hr> and drops empty markup", () => {
+		expect(htmlToMarkdown("<p>a<br>b</p><hr><p><b></b>c</p>")).toBe("a\nb\n\n---\n\nc");
+	});
+
+	it("skips javascript: links and duplicate label/URL links", () => {
+		const out = htmlToMarkdown(
+			'<p><a href="javascript:void(0)">Click</a> <a href="https://x.example/">https://x.example/</a> <a href="#top">top</a></p>'
+		);
+		expect(out).toBe("Click https://x.example/ top");
+	});
+
+	it("bounds link expansion: many relative hrefs against a long base URL cannot blow up the output", () => {
+		const baseUrl = `https://docs.example.com/${"segment/".repeat(180)}page.html`;
+		expect(baseUrl.length).toBeGreaterThan(1400);
+		const links = Array.from({ length: 5000 }, (_, i) => `<a href="l${i}">L${i}</a> `).join("");
+		const page = `<body><p>${links}</p></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page, { baseUrl });
+		expect(Date.now() - started).toBeLessThan(5000);
+		// Unbounded resolution would be ~5000 × 1.4 KB ≈ 7 MB; the budget keeps it well below
+		expect(out.length).toBeLessThan(400000);
+		// Early links resolved, later ones keep their label only — no link is lost
+		expect(out).toContain("[L0](https://docs.example.com/");
+		expect(out).toContain("L4999");
+		expect(out).not.toContain("[L4999](");
+	});
+
+	it("drops absurdly long single URLs but keeps the label", () => {
+		const out = htmlToMarkdown(`<p><a href="https://x.example/${"a".repeat(5000)}">Long</a></p>`);
+		expect(out).toBe("Long");
+	});
+
+	it("stays linear on malformed markup designed to make scanners rescan", () => {
+		const cases = [
+			// One unterminated <main> followed by many "<" without any ">"
+			`<body><main>${"<".repeat(120000)}</body>`,
+			// Mismatched closers: the parser ignores </span>, so the DOM nests
+			`<body>${"<div></span>".repeat(150000)}Deep</body>`,
+			// Fallback route (600 nested divs) then a flood of unterminated <script>
+			`<body>${"<div>".repeat(600)}Text ${"<script>".repeat(100000)}</body>`,
+			// Many unterminated tags inside the region check
+			`<body><main>${"<a href=x".repeat(50000)}</main></body>`,
+		];
+		for (const page of cases) {
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(typeof out).toBe("string");
+		}
+	});
+
+	it("does not mistake everyday unclosed list items and cells for hostile nesting", () => {
+		const items = Array.from({ length: 1500 }, (_, i) => `<li>Item ${i}`).join("");
+		const rows = Array.from({ length: 800 }, (_, i) => `<tr><td>${i}<td>x`).join("");
+		const page = `<body><ul>${items}</ul><table>${rows}</table></body>`;
+		const out = htmlToMarkdown(page);
+		// DOM route taken: Markdown list markers and a table came out of Turndown
+		expect(out).toContain("- Item 0");
+		expect(out).toContain("- Item 1499");
+		expect(out).toMatch(/\| 799 +\| x +\|/);
+	});
+
+	it("keeps dropping noise elements in the fallback route", () => {
+		const page = `<body>${"<div>".repeat(600)}<nav>menu</nav><script>evil()</script><p>Kept</p></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Kept");
+		expect(out).not.toContain("menu");
+		expect(out).not.toContain("evil()");
+	});
+
+	it("treats the self-closing slash on non-void tags as an opener, like the parser", () => {
+		// <div/> nests in HTML; the depth guard must see it
+		const page = `<body>${"<div/>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+		// ...while inline SVG with many self-closed paths is not nesting at all
+		const svg = `<body><p>Chart:</p><svg>${"<path d='M0 0'/>".repeat(2000)}</svg><p>Legend</p></body>`;
+		const converted = htmlToMarkdown(svg);
+		expect(converted).toBe("Chart:\n\nLegend");
+	});
+
+	it("extracts the title in one pass even with a flood of unterminated <title> tags", () => {
+		const page = `<html><head>${"<title>".repeat(60000)}x</head><body><h1>H</h1></body></html>`;
+		const started = Date.now();
+		const title = extractHtmlTitle(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof title).toBe("string");
+		expect(
+			extractHtmlTitle(
+				"<html><head><title>Real &amp; first</title><title>Second</title></head></html>"
+			)
+		).toBe("Real & first");
+	});
+
+	it("does not mistake a custom element or script text for the <main> region", () => {
+		const long = "Article text. ".repeat(40);
+		const page = `<body><main-menu>${"Menu item. ".repeat(40)}</main-menu><script>var s = "<main>";</script><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Article text.");
+		expect(out).not.toContain("Menu item.");
+	});
+
+	it("resolves relative links against <base href> when the document declares one", () => {
+		const page = `<html><head><base href="/docs/v2/"><title>T</title></head><body><p><a href="guide">Guide</a> <img src="img/a.png" alt="A"></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/index.html" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs/v2/guide)");
+		expect(out).toContain("![A](https://docs.example.com/docs/v2/img/a.png)");
+		// Without <base>, the response URL is the base
+		const plain = htmlToMarkdown("<body><a href='guide'>Guide</a></body>", {
+			baseUrl: "https://docs.example.com/index.html",
+		});
+		expect(plain).toContain("[Guide](https://docs.example.com/guide)");
+	});
+
+	it("keeps code blocks intact without a sentinel that page text could collide with", () => {
+		// Private-use characters and digits in the prose must not expand into code blocks
+		const pua = "";
+		const page = `<body><pre><code>${"x".repeat(5000)}</code></pre><p>${`${pua}0${pua} `.repeat(3000)}</p><ul><li>a</li></ul></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out.length).toBeLessThan(page.length + 1000);
+		expect(out.split("```").length).toBe(3); // exactly one fenced block
+		expect(out).toContain("- a");
+	});
+
+	it("refuses list/blockquote nesting that would multiply the output", () => {
+		// ~255 nested lists then thousands of siblings: each line would carry ~1 KB of indentation
+		const depth = 255;
+		const page = `<body>${"<ul><li>".repeat(depth)}${"<li>x</li>".repeat(20000)}${"</li></ul>".repeat(depth)}</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out.length).toBeLessThan(page.length + 1000);
+		expect(out).toContain("x");
+
+		const quotes = `<body>${"<blockquote>".repeat(200)}${"<p>q</p>".repeat(5000)}${"</blockquote>".repeat(200)}</body>`;
+		expect(htmlToMarkdown(quotes).length).toBeLessThan(quotes.length + 1000);
+
+		// Ordinary nesting keeps the DOM route
+		const normal = htmlToMarkdown(
+			"<body><ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li></ul></body>"
+		);
+		expect(normal).toContain("- a");
+		expect(normal).toMatch(/\n\s+- b/);
+	});
+
+	it("counts HTML breakout tags inside SVG towards nesting depth", () => {
+		const page = `<body><svg>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("ignores a <main> nested inside a dropped element", () => {
+		const long = "Article text. ".repeat(40);
+		const decoy = `<template><main>${"Template text. ".repeat(40)}</main></template>`;
+		const page = `<body>${decoy}<nav><main>${"Menu text. ".repeat(40)}</main></nav><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Article text.");
+		expect(out).not.toContain("Template text.");
+		expect(out).not.toContain("Menu text.");
+	});
+
+	it("only accepts a complete closing tag name for raw-text elements", () => {
+		const long = "Real article. ".repeat(40);
+		const page = `<body><script>var s = "</scripture>"; var m = "<main>${"Injected. ".repeat(40)}</main>";</script><article>${long}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real article.");
+		expect(out).not.toContain("Injected.");
+		expect(extractHtmlTitle("<head><title>Ti</titles>tle</title></head>")).toBe("Ti</titles>tle");
+	});
+
+	it("honours quoted attribute values when finding the end of a tag", () => {
+		// A ">" and a fake closer hidden in a quoted attribute: the parser nests all the divs
+		const page = `<body>${'<div title="></div>">'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+		// Ordinary attributes with ">" inside still convert normally
+		const normal = htmlToMarkdown(
+			`<body><p><a title="a > b" href="/x">Link</a> <img alt='1 > 0' src="/i.png"></p></body>`,
+			{ baseUrl: "https://d.example/" }
+		);
+		expect(normal).toContain("[Link](https://d.example/x)");
+		expect(normal).toContain("![1 > 0](https://d.example/i.png)");
+		// A quote in attribute-name position is not a value delimiter (parser rule):
+		// these are separate divs, not one giant tag
+		const bare = `<body>${'<div ">'.repeat(100000)}Deep</body>`;
+		const startedBare = Date.now();
+		expect(htmlToMarkdown(bare)).toContain("Deep");
+		expect(Date.now() - startedBare).toBeLessThan(2000);
+	});
+
+	it("honours quoted attributes on closing tags too", () => {
+		// The tokenizer parses (and discards) attributes on malformed end tags: the
+		// quoted "></div>" belongs to the </span> closer, so every div stays open
+		const page = `<body>${'<div></span title="></div>">'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Deep");
+	});
+
+	it("counts HTML inside SVG integration points (foreignObject) towards depth", () => {
+		const page = `<body><svg><foreignObject>${"<x>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// An ordinary SVG with a description keeps converting normally
+		const svg = `<body><p>Before</p><svg><desc>Chart</desc>${"<path d='M0 0'/>".repeat(50)}</svg><p>After</p></body>`;
+		const normal = htmlToMarkdown(svg);
+		expect(normal).toContain("Before");
+		expect(normal).toContain("After");
+	});
+
+	it("tracks dropped ancestors in constant time per tag", () => {
+		// Many open dropped elements, then a flood of unmatched closers of another name
+		const page = `<body><main>${"Real text. ".repeat(40)}</main>${"<nav>".repeat(100000)}${"</footer>".repeat(100000)}</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Real text.");
+	});
+
+	it("treats an equals sign at attribute-name position as a name, not an assignment", () => {
+		// The parser ends this tag at the first ">" and nests every following div
+		const page = `<body>${'<x ="<div>'.repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary assignments still hide their quoted ">"
+		expect(
+			htmlToMarkdown(`<body><p><a href="/x" title="a > b">Link</a></p></body>`, {
+				baseUrl: "https://d.example/",
+			})
+		).toContain("[Link](https://d.example/x)");
+	});
+
+	it("recognizes every HTML comment terminator", () => {
+		// Abrupt and "--!>" closings end the comment; what follows is markup again
+		for (const comment of ["<!-->", "<!--->", "<!-- x --!>"]) {
+			const page = `<body>${comment}${"<div>".repeat(100000)}Deep</body>`;
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(typeof out).toBe("string");
+		}
+		// Dashes inside a comment do not end it; an unterminated comment swallows the rest
+		expect(htmlToMarkdown("<body><p>A</p><!-- a -- b -- c --><p>B</p></body>")).toBe("A\n\nB");
+		expect(htmlToMarkdown("<body><p>A</p><!-- never closed <p>B</p></body>")).toBe("A");
+	});
+
+	it("respects scope boundaries: an end tag below an open <object> is ignored", () => {
+		// The parser keeps both elements open per repetition; the estimate must too
+		const page = `<body>${"<div><object></div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary tables (td/th are boundaries too) still convert on the DOM route
+		const table = htmlToMarkdown(
+			"<body><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></body>"
+		);
+		expect(table).toMatch(/\| 1 +\| 2 +\|/);
+	});
+
+	it("consumes the complete tag name, underscores included", () => {
+		// "<x_y>" is the element x_y: each "</x>" is unmatched and the chain nests
+		const page = `<body>${"<x_y></x>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("finds raw-text closers without a length-changing lowercase copy", () => {
+		// "İ" lowercases to two code units: an index from a lowercased copy would drift
+		const page = `<body><script>${"İ".repeat(5000)}</script>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Case-insensitive closer, on the original indices
+		expect(htmlToMarkdown("<body><SCRIPT>x()</Script><p>Kept</p></body>")).toBe("Kept");
+	});
+
+	it("reads self-closing from the attribute state: a slash inside an unquoted value is value", () => {
+		// "<svg a=x/>" has the attribute a="x/" and OPENS an svg (not self-closing):
+		// hundreds of them nest
+		expect(estimateNesting("<svg a=x/>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<div a=x/>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// With a space before the slash, or no attribute value, the tag is self-closing
+		expect(estimateNesting("<svg a=x />".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<svg a/>".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<svg a='x'/>".repeat(600)).depth).toBe(0);
+		// The slash stays in the attribute value: <base href=/docs/> is "/docs/"
+		const page = `<html><head><base href=/docs/></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("skips a DOCTYPE with quoted identifiers containing '>'", () => {
+		const deep = "<div>".repeat(600);
+		// The system identifier holds ">" and a fake <textarea>: the tokenizer stays in
+		// the DOCTYPE until its closing quote and final ">", so the divs are live
+		expect(estimateNesting(`<!doctype html SYSTEM "x><textarea>">${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(
+			estimateNesting(`<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0//EN" "http://x/>y.dtd">${deep}`)
+				.depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Without a PUBLIC/SYSTEM keyword the quotes mean nothing: a bogus DOCTYPE
+		// ends at the first ">" and the <textarea> that follows is real RCDATA
+		expect(estimateNesting(`<!doctype html "x><textarea>">${deep}`).depth).toBe(1);
+		// Everyday doctypes still work, and the title after one is found
+		expect(estimateNesting(`<!DOCTYPE html>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(extractHtmlTitle('<!doctype html SYSTEM "about:legacy-compat"><title>T</title>')).toBe(
+			"T"
+		);
+	});
+
+	it("ends a content region only where the parser really closes the element", () => {
+		// The first </main> is ignored by the parser (the open <table> is a scope
+		// boundary), so the cell is still inside main and must survive selection
+		const intro = "Intro text. ".repeat(20);
+		const page = `<html><body><main><p>${intro}</p><table></main><tr><td>Actual content</td></tr></table></main><footer>f</footer></body></html>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Actual content");
+		expect(out).toContain("Intro text.");
+		// A </div> that pops the main with it ends the region there
+		const popped = `<html><body><div><main><p>${intro}</p></div><nav>menu</nav><p>Outside</p></body></html>`;
+		const region = htmlToMarkdown(popped);
+		expect(region).toContain("Intro text.");
+		expect(region).not.toContain("Outside");
+		// A <main> the parser discards (inside an open <select>) opens nothing
+		const ignored = `<html><body><select><main></select><main><p>${intro}</p></main><p>Outside</p></body></html>`;
+		expect(htmlToMarkdown(ignored)).not.toContain("Outside");
+		// A later <main> inside a dropped <nav> neither counts nor extends the region
+		const decoyLater = `<html><body><main><p>${intro}</p></main><p>Outside</p><nav><main>menu</main></nav></body></html>`;
+		const narrowed = htmlToMarkdown(decoyLater);
+		expect(narrowed).toContain("Intro text.");
+		expect(narrowed).not.toContain("Outside");
+	});
+
+	it("leaves inline code spans alone when tidying punctuation and spacing", () => {
+		const page =
+			"<html><body><p>Use <code>div :hover</code> and <code>a ; b</code> here , now .</p>" +
+			"<p>Nested ticks: <code>x ` y ;</code> then text , more</p></body></html>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("`div :hover`");
+		expect(out).toContain("`a ; b`");
+		expect(out).toContain("here, now.");
+		// A span whose content holds a backtick is fenced with two: still untouched
+		expect(out).toContain("x ` y ;");
+		expect(out).toContain("then text, more");
+		// A literal (escaped) backtick in prose does not open a span
+		expect(htmlToMarkdown("<body><p>a ` b , c</p></body>")).toBe("a \\` b, c");
+	});
+
+	it("keeps <mglyph> and <malignmark> in MathML inside text integration points", () => {
+		const deep = "<x>".repeat(600);
+		// Children of <mtext> are HTML, except these two: a <textarea> below them
+		// is a foreign element again and its content is markup that nests
+		expect(estimateNesting(`<math><mtext><mglyph><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<math><mtext><malignmark><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// Any other child is HTML: the textarea is RCDATA and nothing nests below it
+		expect(estimateNesting(`<math><mtext><b><textarea>${deep}</textarea>`).depth).toBe(4);
+		// Outside MathML the names mean nothing special
+		expect(estimateNesting(`<svg><foreignObject><mglyph><textarea>${deep}</textarea>`).depth).toBe(
+			4
+		);
+	});
+
+	it("closes an open <button> when another <button> starts", () => {
+		const real = "Actual content. ".repeat(20);
+		const intro = "Article text. ".repeat(20);
+		// The second <button> closes the first, so the single </button> leaves no
+		// dropped ancestor and the <main> that follows is the content region
+		const page = `<html><body><article><p>${intro}</p></article><button><button>menu</button><main><p>${real}</p></main></body></html>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Actual content.");
+		expect(out).not.toContain("Article text.");
+		expect(estimateNesting("<button>".repeat(600)).depth).toBe(1);
+		// A button inside a scope boundary (a table cell) is not in scope: both stay
+		// (button, table, implied tbody, implied tr, td, button)
+		expect(estimateNesting("<button><table><td><button>").depth).toBe(6);
+	});
+
+	it("ignores a <head> start tag once the head or the body has begun", () => {
+		// Both late <head> openers are ignored by the parser, so the single </head>
+		// changes nothing and the article after it is visible — on the fallback route too
+		const hostile = `<body><p>Before</p>${"<div>".repeat(200000)}<head><head></head>Actual article`;
+		const out = htmlToMarkdown(hostile);
+		expect(out).toContain("Before");
+		expect(out).toContain("Actual article");
+		// A nested <head> does not open a second head either
+		expect(estimateNesting("<head><head><head>").depth).toBe(1);
+		// The first <head> still counts (html, head, title at the deepest point)
+		expect(estimateNesting("<html><head><title>t</title></head><body>").depth).toBe(3);
+	});
+
+	it("closes a select opened inside a table on table tokens (in select in table)", () => {
+		const deep = "<div>".repeat(600);
+		// <td> closes the select and is reprocessed: implied tbody/tr, the cell, and
+		// the deep div subtree inside it
+		expect(estimateNesting(`<table><select><td>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><select><option>a<td>x").depth).toBe(4);
+		// </table> closes the select (and the table): the divs after it are live
+		expect(estimateNesting(`<table><select><option>x</table>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// Outside a table, table tokens in a select are still ignored
+		expect(estimateNesting(`<select><td>${deep}`).depth).toBe(1);
+	});
+
+	it("keeps <hr> inside an open <select>", () => {
+		// <hr> in a select closes an open option/optgroup and is inserted (void):
+		// the select stays open, so a <base> after it is still ignored
+		const page = `<html><body><select><hr><base href="/preview/"></select><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(estimateNesting("<select><optgroup><option><hr><option>x").depth).toBe(3);
+	});
+
+	it("treats foreign integration points as special elements for end tags", () => {
+		// </span> below an svg <foreignObject> (or a MathML <mi>) is rejected by the
+		// generic end-tag algorithm, which stops at that special element: every
+		// repetition nests four more levels
+		expect(
+			estimateNesting("<span><svg><foreignObject><x></span>".repeat(200)).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<span><math><mi><x></span>".repeat(200)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// An ordinary foreign element (<g>) is not special: the span still closes
+		expect(estimateNesting("<span><svg><g></span>".repeat(200)).depth).toBe(3);
+	});
+
+	it("measures region text without one DOM parse per fragment", () => {
+		// 100,000 entity-only fragments never reach the threshold: the text is decoded
+		// in batches (a few hundred decodes, not one per fragment), so the check is cheap
+		const fragments = "<i>&nbsp;</i>".repeat(100000);
+		let started = Date.now();
+		expect(hasTextOfAtLeast(fragments, 200)).toBe(false);
+		expect(Date.now() - started).toBeLessThan(1000);
+		// A reference cannot span the markup that separated two fragments: "&am<i>p;"
+		// is five visible characters each time, not a fabricated "&amp;"
+		expect(hasTextOfAtLeast("&am<i>p;</i>".repeat(50), 200)).toBe(true);
+		// Visible text still counts once decoded, whatever the batching
+		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(200)}`, 200)).toBe(true);
+		expect(hasTextOfAtLeast(`${"&nbsp;".repeat(50)}${"&eacute;".repeat(199)}`, 200)).toBe(false);
+		// End to end, the empty-looking main is skipped and the real text kept
+		const real = "Real content. ".repeat(20);
+		const page = `<html><body><main>${"<i>&nbsp;</i>".repeat(20000)}</main><p>${real}</p></body></html>`;
+		started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Real content.");
+		expect(Date.now() - started).toBeLessThan(3000);
+	});
+
+	it("reads attribute names as the tokenizer does: quotes are part of a name", () => {
+		const deep = "<x>".repeat(600);
+		// <font "color"> has the attribute named "color" (with the quotes): not a
+		// breakout, the svg stays open and the textarea below it is foreign
+		expect(estimateNesting(`<svg><font "color"><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<svg><font 'size'><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// A real color/face/size attribute (any form) still breaks out: RCDATA follows
+		expect(estimateNesting(`<svg><font color="red"><textarea>${deep}`).depth).toBe(2);
+		expect(estimateNesting(`<svg><font size><textarea>${deep}`).depth).toBe(2);
+		// Unquoted values run to whitespace or ">", quotes included
+		const page = `<html><head><base href=/docs/"x/><base href="/decoy/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/%22x/guide)"
+		);
+	});
+
+	it("ignores a nested <form> and the fallback keeps what follows the outer one", () => {
+		// The form element pointer: the inner <form> is ignored, so the single
+		// </form> closes the outer form and the article after it is live — on the
+		// fallback route (forced by hostile depth) as on the DOM route
+		const hostile = `<body><p>Before</p>${"<div>".repeat(200000)}<form><form>menu</form>Actual article</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(hostile);
+		expect(Date.now() - started).toBeLessThan(3000);
+		expect(out).toContain("Actual article");
+		expect(out).not.toContain("menu");
+		expect(estimateNesting("<form>".repeat(600)).depth).toBe(1);
+		// Inside a <template> the pointer does not apply
+		expect(estimateNesting("<template><form><form>").depth).toBe(3);
+	});
+
+	it("models the frameset insertion mode: ignored tags never switch the tokenizer", () => {
+		// Below <frameset> a <textarea> is ignored (not RCDATA): the nested framesets
+		// after it are real and deep
+		expect(
+			estimateNesting(`<html><frameset><textarea>${"<frameset>".repeat(600)}`).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<html><frameset><frame><frame><div><p>").depth).toBe(2);
+		// <noframes> is still raw text inside a frameset
+		expect(
+			estimateNesting(`<html><frameset><noframes>${"<frameset>".repeat(600)}</noframes>`).depth
+		).toBe(3);
+	});
+
+	it("keeps CDATA opaque at integration points too (the current node is foreign)", () => {
+		// Inside <foreignObject> the children are HTML, but the tokenizer's CDATA
+		// rule looks at the current node's namespace, which is SVG: the fake
+		// <textarea> inside the section is text, the divs after it are live
+		const deep = "<div>".repeat(600);
+		expect(
+			estimateNesting(`<svg><foreignObject><![CDATA[x><textarea>]]></foreignObject></svg>${deep}`)
+				.depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(
+			estimateNesting(`<math><mi><![CDATA[x><textarea>]]></mi></math>${deep}`).depth
+		).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Below an HTML child of the integration point it is a bogus comment again, ending
+		// at the first ">": the <textarea> that follows is real RCDATA (four open elements)
+		expect(estimateNesting(`<svg><foreignObject><div><![CDATA[x><textarea>]]>${deep}`).depth).toBe(
+			4
+		);
+	});
+
+	it("hands the content of <plaintext> to text consumers", () => {
+		// The depth guard sends the page to the tag-strip fallback: the article
+		// that follows <plaintext> is text the DOM exposes, so it must survive
+		const page = `<body><p>Before</p>${"<div>".repeat(200000)}<plaintext>Actual article <text> here`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toContain("Before");
+		expect(out).toContain("Actual article <text> here");
+	});
+
+	it("does not select a MathML or SVG element named main as the content region", () => {
+		const filler = "Visible text. ".repeat(20);
+		const page = `<html><body><math><main>${filler}</main></math><p>Actual page content</p></body></html>`;
+		expect(htmlToMarkdown(page)).toContain("Actual page content");
+	});
+
+	it("keeps foreign CDATA sections opaque, as the parser does", () => {
+		// In svg/math "<![CDATA[" opens text through "]]>": the tags inside are not
+		// tokens (no breakout, no live <base>); in HTML it is a bogus comment
+		// ending at the first ">"
+		const page = `<html><body><svg><![CDATA[x><div><base href="/preview/">]]></svg><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(estimateNesting(`<svg><![CDATA[${"<div>".repeat(600)}]]>`).depth).toBe(1);
+		expect(estimateNesting(`<div><![CDATA[${"<div>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// An unterminated CDATA section swallows the rest of the document
+		expect(estimateNesting(`<svg><![CDATA[${"<div>".repeat(600)}`).depth).toBe(1);
+	});
+
+	it("does not treat the vertical tab as whitespace in tag names or attributes", () => {
+		// U+000B is not tokenizer whitespace: "<input\u000b>" is the element
+		// "input\u000b", non-void, and hundreds of them nest
+		expect(estimateNesting("<input\u000b>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<div\u000bx>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Real whitespace still ends the name: <input\t> and <br > are void
+		expect(estimateNesting("<input\t>".repeat(600) + "<br >".repeat(600)).depth).toBe(0);
+		// In attributes too: "href\u000b" is not the href attribute
+		const page = `<html><head><base href\u000b="/decoy/" href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("treats iframe, noembed and noframes fallback content as raw text", () => {
+		// The DOM parser never sees markup inside them: a decoy <base> or <title>
+		// there is text, and nothing nests
+		const page = `<html><body><iframe><base href="https://decoy.example/"></iframe><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/guide)"
+		);
+		expect(
+			extractHtmlTitle("<body><noembed><title>Decoy</title></noembed><h1>Real</h1></body>")
+		).toBe("Real");
+		expect(extractHtmlTitle("<body><noframes><h1>Decoy</h1></noframes><h1>Real</h1></body>")).toBe(
+			"Real"
+		);
+		expect(estimateNesting(`<iframe>${"<div>".repeat(600)}</iframe>`).depth).toBe(1);
+		// <plaintext> swallows the rest of the document, closer or not
+		expect(estimateNesting(`<plaintext>${"<div>".repeat(600)}</plaintext><div>`).depth).toBe(1);
+		expect(extractHtmlTitle("<body><plaintext><title>Decoy</title></plaintext><h1>X</h1>")).toBe(
+			""
+		);
+		// noscript content IS markup to the parser (and dropped by the converter)
+		expect(estimateNesting(`<noscript>${"<div>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+	});
+
+	it("ignores <base> and <title> the parser discards inside an open <select>", () => {
+		// "In select": a stray <base> or <title> is dropped, no element is created;
+		// the select is closed by </select>, so the next <base> is the live one
+		const page = `<html><body><select><base href="/preview/"></select><base href="/docs/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		// An ignored <title> does not switch the tokenizer either: the tags after it
+		// are live (</select> closes the select, the <base> counts)
+		const unswitched = `<html><body><select><title></select><base href="/docs/"></title><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(unswitched, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		expect(
+			extractHtmlTitle("<body><select><title>Decoy</title></select><h1>Real</h1></body>")
+		).toBe("Real");
+		// <option>s still nest normally, and an <input> ends the select like </select>
+		expect(estimateNesting("<select><option>a<option>b<optgroup><option>c").depth).toBe(3);
+		expect(estimateNesting("<select><input><div><div>").depth).toBe(2);
+	});
+
+	it("honours a <base href> once a breakout has left the svg it follows", () => {
+		// <div> breaks out of the svg and is reprocessed as HTML: the <base> after
+		// it is an HTML base (an svg:base right inside the svg would not be)
+		const page = `<html><body><svg><div><base href="/docs/"><p><a href="guide">Guide</a></p></div></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		const foreign = `<html><body><svg><base href="/docs/"></svg><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(foreign, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/guide)"
+		);
+		// ...and one inside a foreignObject is HTML again
+		const island = `<html><body><svg><foreignObject><base href="/docs/"></foreignObject></svg><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(island, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("honours a <base href> placed after </head> or inside <body>", () => {
+		// Browsers process a base start tag with the in-head rules wherever it is
+		const page = `<html><head><title>T</title></head><body><base href="/docs/v2/"><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" })).toContain(
+			"[Guide](https://docs.example.com/docs/v2/guide)"
+		);
+	});
+
+	it("skips <base> elements without href when looking for the document base", () => {
+		const page = `<html><head><base target="_blank"><base href="/docs/v2/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/index.html" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs/v2/guide)");
+	});
+
+	it("leaves blank lines inside fenced code blocks untouched", () => {
+		const page =
+			"<body><p>Intro</p><pre><code>line 1\n\n\n\nline 5</code></pre><p>Outro</p></body>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("```\nline 1\n\n\n\nline 5\n```");
+		expect(out.startsWith("Intro\n\n```")).toBe(true);
+	});
+
+	it("folds only ASCII case in tag names, like the tokenizer", () => {
+		// "<xİ>" and "</xi̇>" are different elements to the parser: the chain nests
+		const page = `<body>${"<xİ></xi̇>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// ASCII case still folds
+		expect(htmlToMarkdown("<body><P>Mixed</p><DIV>Case</div></body>")).toBe("Mixed\n\nCase");
+	});
+
+	it("applies list-item scope to </li>: an intervening <ul> keeps the item open", () => {
+		const page = `<body>${"<li><ul></li>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("honours the script double-escaped state when finding the closer", () => {
+		// The first </script> is inside "<!--<script>": script text, not the closer
+		const decoy = `<main>${"Decoy text. ".repeat(40)}</main>`;
+		const page = `<body><script><!--<script></script>${decoy}--></script><article>${"Real text. ".repeat(40)}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real text.");
+		expect(out).not.toContain("Decoy text.");
+	});
+
+	it("does not count void dropped elements (<embed>) as open ancestors", () => {
+		const page = `<body><article>${"Earlier. ".repeat(40)}</article><embed src="x.swf"><main>${"Real main. ".repeat(40)}</main></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real main.");
+		expect(out).not.toContain("Earlier.");
+	});
+
+	it("reads <base href> by attribute grammar, not by the first 'href=' in the tag", () => {
+		// The "href=" inside the title's quoted value is text; the real href follows
+		const page = `<html><head><base title="see href=/evil/" href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("decodes character references in <base href>", () => {
+		const page = `<html><head><base href="/docs&amp;api/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://docs.example.com/" });
+		expect(out).toContain("[Guide](https://docs.example.com/docs&api/guide)");
+		// The complete named set, as the parser decodes it: "&colon;" is ":" and the
+		// base is absolute, so links resolve against it, not the response origin
+		const named = `<html><head><base href="https&colon;//cdn.example/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(named, { baseUrl: "https://docs.example.com/" })).toContain(
+			"[Guide](https://cdn.example/docs/guide)"
+		);
+	});
+
+	it("accounts for the adoption agency on formatting end tags", () => {
+		// </b> with a <div> above it reconstructs the <b> and leaves the div open:
+		// the divs keep nesting in the parser, so they must in the estimate
+		const page = `<body>${"<b><div></b>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary formatting still converts on the DOM route
+		expect(htmlToMarkdown("<body><p>a <b>bold</b> <i>it</i> c</p></body>")).toBe(
+			"a **bold** *it* c"
+		);
+	});
+
+	it("keeps reconstructed formatting elements in the depth estimate", () => {
+		// The adoption agency reconstructs <b> and <i> inside each div: the DOM
+		// grows by three levels per repetition, never fewer than the estimate
+		const page = `<body>${"<b><i><div></i></b>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("does not let </body> or </html> reset the depth estimate", () => {
+		// The parser ignores extra <body> start tags and a </body> only changes the
+		// insertion mode: the divs stay open and keep nesting
+		const page = `${"<body><div></body>".repeat(100000)}Deep`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("judges blocked schemes on the parsed URL (tabs and newlines stripped)", () => {
+		const out = htmlToMarkdown(
+			`<body><p><a href="java&#x09;script:alert(1)">Click</a> <a href="jav&#10;ascript:x">Two</a> <img src="da&#x09;ta:image/png;base64,AAAA" alt="pic"></p></body>`,
+			{ baseUrl: "https://d.example/" }
+		);
+		expect(out).not.toContain("javascript:");
+		expect(out).not.toContain("data:");
+		expect(out).toContain("Click");
+		expect(out).toContain("Two");
+		// A <base> with a non-http(s) scheme is ignored
+		const based = htmlToMarkdown(
+			`<html><head><base href="java&#x09;script:void(0)/"></head><body><p><a href="guide">Guide</a></p></body></html>`,
+			{ baseUrl: "https://d.example/docs/" }
+		);
+		expect(based).toContain("[Guide](https://d.example/docs/guide)");
+	});
+
+	it("stops generic end tags at special elements, like the parser", () => {
+		// </span> gives up at the special <div>: every div stays open and nests
+		const page = `<body>${"<span><div></span>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary inline markup still closes and converts
+		expect(htmlToMarkdown("<body><p><span>a</span> <em>b</em></p></body>")).toBe("a *b*");
+	});
+
+	it("keeps a dropped ancestor open when a scope boundary blocks its closer", () => {
+		// </nav> is ignored (the open <object> is a boundary): the main stays inside the nav
+		const decoy = `<nav><object></nav></object><main>${"Decoy text. ".repeat(40)}</main></nav>`;
+		const page = `<body>${decoy}<article>${"Real text. ".repeat(40)}</article></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real text.");
+		expect(out).not.toContain("Decoy text.");
+	});
+
+	it("closes a fence only with a run at least as long as the opener", () => {
+		// Turndown lengthens the fence around code that contains ```: the inner
+		// line must not end the block and expose the code to the prose rewrites
+		const page =
+			"<body><p>Intro</p><pre><code>line 1\n```\nrun   this , now\n</code></pre><p>after   this , ok</p></body>";
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("run   this , now");
+		expect(out).toContain("after this, ok");
+		expect(out.match(/````/g)?.length).toBe(2);
+	});
+
+	it("ignores SVG titles when extracting the page title", () => {
+		const page =
+			"<html><body><svg><title>Search icon</title></svg><h1>Dashboard</h1></body></html>";
+		expect(extractHtmlTitle(page)).toBe("Dashboard");
+		expect(
+			extractHtmlTitle(
+				"<head><title>Real</title></head><body><svg><title>Icon</title></svg></body>"
+			)
+		).toBe("Real");
+	});
+
+	it("ignores <base> inside <template> (a separate document fragment)", () => {
+		const page = `<html><head><template><base href="/preview/"></template><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		const out = htmlToMarkdown(page, { baseUrl: "https://d.example/" });
+		expect(out).toContain("[Guide](https://d.example/docs/guide)");
+		// A mismatched closer inside the template is ignored by the parser: the
+		// template stays open and its <base> still does not count
+		const stray = `<html><head><template></svg><base href="/preview/"></template><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(stray, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+		// ...and a "<svg/>" opens nothing, so a <base> after it is live
+		const empty = `<html><head><svg/><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(empty, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("ends a tag at the '>' that closes an unquoted attribute value", () => {
+		// <body class=page> then a flood of <div>: the tag must end at its ">"
+		const page = `<body class=page>${"<div>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		expect(htmlToMarkdown("<body class=page><p>Kept</p></body>")).toBe("Kept");
+	});
+
+	it("counts foreign (svg/math) descendants towards nesting depth", () => {
+		// Turndown recurses into the svg subtree before dropping it: deep <g> nesting costs
+		const page = `<body><svg>${"<g>".repeat(100000)}<text>Deep</text></svg></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+		// Ordinary inline SVG (shallow, self-closed shapes) still converts normally
+		const icon = `<body><p>Before</p><svg><g><g><path d="M0 0"/><circle r="1"/></g></g></svg><p>After</p></body>`;
+		expect(htmlToMarkdown(icon)).toBe("Before\n\nAfter");
+	});
+
+	it("treats <font> as a breakout from foreign content only with color/face/size", () => {
+		// A bare <font> is an ordinary foreign element: the svg subtree stays open and
+		// every repetition nests three levels deeper, which the DOM route must refuse
+		const bare = "<svg><g><font>".repeat(200);
+		expect(estimateNesting(bare).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// With color/face/size (any case, with or without a value) the parser breaks
+		// out: the svg subtree is popped each time and only the <font> elements nest
+		for (const attribute of ["color=red", 'FACE="serif"', "size", "id=x size='3'"]) {
+			const shallow = `<svg><g><font ${attribute}>`.repeat(200);
+			expect(estimateNesting(shallow).depth).toBeLessThan(MAX_DOM_DEPTH);
+		}
+		// Other attributes do not make it a breakout
+		expect(estimateNesting('<svg><g><font id="size">'.repeat(200)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		// End to end: the deep page is refused up front and still converts quickly
+		const page = `<body><p>Before</p>${"<svg><g><font>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("tokenizes the content of foreign <textarea>/<style>/<title> as markup, not raw text", () => {
+		// Inside svg the tokenizer never enters RCDATA/raw text: the nested tags are
+		// real elements the DOM route would have to build, so they count
+		const deep = "<g>".repeat(600);
+		for (const element of ["textarea", "style", "title", "script", "xmp"]) {
+			const foreign = `<svg><${element}>${deep}</${element}></svg>`;
+			expect(estimateNesting(foreign).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+			// The same element in HTML (top level, or below an integration point) is
+			// raw text: the "tags" inside are text and nothing nests
+			expect(estimateNesting(`<${element}>${deep}</${element}>`).depth).toBe(1);
+			expect(
+				estimateNesting(
+					`<svg><foreignObject><${element}>${deep}</${element}></foreignObject></svg>`
+				).depth
+			).toBe(3);
+		}
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg><textarea>${"<g>".repeat(100000)}</textarea></svg></body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("keeps a <main> inside a nav that </form> failed to close out of the region", () => {
+		// </form> removes only the form element: the nav stays open, the main is its
+		// descendant and Turndown drops it with the form. Region selection must agree.
+		const decoy = "decoy ".repeat(60);
+		const page = `<body><form><nav></form><main><p>${decoy}</p></main></nav><p>Real content</p></body>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Real content");
+		expect(out).not.toContain("decoy");
+	});
+
+	it("treats <annotation-xml> as an integration point only with an HTML encoding", () => {
+		// Without encoding="text/html" (or application/xhtml+xml) the element is
+		// ordinary MathML: a <textarea> below it is foreign, its content is markup
+		const deep = "<mi>".repeat(600);
+		for (const open of [
+			'<math><annotation-xml encoding="application/xml">',
+			"<math><annotation-xml>",
+			"<math><annotation-xml encoding=text/plain>",
+		]) {
+			expect(estimateNesting(`${open}<textarea>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		}
+		// With an HTML encoding (ASCII case-insensitive) the children are HTML:
+		// the textarea is RCDATA and nothing below it nests
+		for (const encoding of ["text/html", "application/xhtml+xml", "TEXT/HTML", " text/html "]) {
+			expect(
+				estimateNesting(`<math><annotation-xml encoding="${encoding}"><textarea>${deep}</textarea>`)
+					.depth
+			).toBe(3);
+		}
+	});
+
+	it("counts HTML void names opened in foreign content as elements with children", () => {
+		// <input> is not a breakout: inside svg it is an ordinary foreign element
+		// that nests (hundreds of unclosed ones build a deep subtree)
+		expect(estimateNesting(`<svg>${"<input>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg>${"<link>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Self-closed, they are empty; and in HTML they never open anything
+		expect(estimateNesting(`<svg>${"<input/>".repeat(600)}`).depth).toBe(1);
+		expect(estimateNesting(`<div>${"<input>".repeat(600)}`).depth).toBe(1);
+		// Void breakouts (<br>, <img>, <embed>) leave the svg and open nothing
+		expect(estimateNesting(`<svg>${"<img>".repeat(600)}`).depth).toBe(1);
+	});
+
+	it("binds integration points to their namespace", () => {
+		const deep = "<mi>".repeat(600);
+		// <desc>, <title> and <foreignObject> are integration points in svg only:
+		// a MathML <desc> is an ordinary element and its <textarea> stays foreign
+		expect(estimateNesting(`<math><desc><textarea>${deep}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<math><foreignObject><textarea>${deep}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<svg><desc><textarea>${deep}</textarea>`).depth).toBe(3);
+		// <mi>... are MathML text integration points, not svg ones
+		expect(estimateNesting(`<svg><mi><textarea>${"<g>".repeat(600)}`).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting(`<math><mi><textarea>${deep}</textarea>`).depth).toBe(3);
+	});
+
+	it("breaks out of foreign content on </p> and </br> end tags too", () => {
+		// The parser leaves svg on </p> or </br> and reprocesses them as HTML; the
+		// following "<x/>" are HTML tokens whose slash means nothing: they nest
+		expect(estimateNesting(`<svg></p>${"<x/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg></br>${"<x/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// Other end tags do not: "</g>" closes a g, "</x>" with none open is ignored
+		expect(estimateNesting(`<svg></x>${"<x/>".repeat(600)}`).depth).toBe(1);
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg></p>${"<x/>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("reprocesses a self-closing breakout tag as HTML: <div/> in svg opens a div", () => {
+		// The parser leaves foreign content on <div/>, then handles the token as
+		// HTML, where the slash means nothing on a non-void element
+		expect(estimateNesting(`<svg>${"<div/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting(`<svg>${"<span/>".repeat(600)}`).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// (a repeated <p/> breaks out too, but <p> closes the previous <p>, as in HTML)
+		expect(estimateNesting(`<svg>${"<p/>".repeat(600)}`).depth).toBe(1);
+		// Self-closed foreign elements are still empty (inline icons stay shallow),
+		// and self-closed void breakouts (<br/>, <img/>) open nothing either
+		expect(estimateNesting(`<svg>${"<path/>".repeat(600)}</svg>`).depth).toBe(1);
+		expect(estimateNesting(`<svg>${"<br/>".repeat(600)}`).depth).toBe(1);
+		// End to end: refused up front, converts quickly
+		const page = `<body><p>Before</p><svg>${"<div/>".repeat(20000)}Deep</body>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(page)).toContain("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("removes only the form element on </form>, keeping its open descendants", () => {
+		// The parser removes the form node alone: every div stays open and nests
+		const page = `<body>${"<form><div></form>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("parses integration-point children as HTML: <x/> nests below <foreignObject>", () => {
+		const page = `<body><svg><foreignObject>${"<x/>".repeat(100000)}Deep</body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(page);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(typeof out).toBe("string");
+	});
+
+	it("skips title candidates inside <template>", () => {
+		expect(
+			extractHtmlTitle("<body><template><h1>Card preview</h1></template><h1>Dashboard</h1></body>")
+		).toBe("Dashboard");
+		expect(
+			extractHtmlTitle(
+				"<html><head><template><title>Tpl</title></template><title>Real</title></head></html>"
+			)
+		).toBe("Real");
+	});
+
+	it("handles tables without a header row", () => {
+		const out = htmlToMarkdown(
+			"<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>"
+		);
+		expect(out).toMatch(/\| a +\| b +\|/);
+		expect(out).toMatch(/\| 1 +\| 2 +\|/);
+	});
+
+	it("survives unterminated noise elements", () => {
+		expect(htmlToMarkdown("<p>Visible</p><script>var x = 1;")).toBe("Visible");
+	});
+
+	it("removes deeply nested noise elements in the DOM within the depth cap", () => {
+		const depth = 400;
+		const nested = `<body><p>Before</p>${"<nav>".repeat(depth)}menu${"</nav>".repeat(depth)}<p>After</p></body>`;
+		const started = Date.now();
+		const out = htmlToMarkdown(nested);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(out).toBe("Before\n\nAfter");
+	});
+
+	it("refuses hostile nesting depth up front and degrades to a fast tag strip", () => {
+		// Attacker-controlled pages: the HTML tree builder is quadratic in depth
+		// and the converter recurses per level, so depth is bounded before parsing
+		for (const page of [
+			`<body><p>Before</p>${"<nav>".repeat(20000)}menu${"</nav>".repeat(20000)}<p>After</p></body>`,
+			`<body><p>Before</p>${"<div>".repeat(200000)}After${"</div>".repeat(200000)}</body>`,
+		]) {
+			const started = Date.now();
+			const out = htmlToMarkdown(page);
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(out).toContain("Before");
+			expect(out).toContain("After");
+			expect(out).not.toContain("menu");
+		}
+		// Unterminated navs swallow the rest of the page, as a browser would nest it
+		const open = `<body><p>Before</p>${"<nav>".repeat(20000)}menu <p>After</p>`;
+		const started = Date.now();
+		expect(htmlToMarkdown(open)).toBe("Before");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("handles null and empty input", () => {
+		expect(htmlToMarkdown("")).toBe("");
+		expect(htmlToMarkdown(null)).toBe("");
+	});
+});
+
+describe("extractHtmlTitle", () => {
+	it("closes a script at the first </script> after a double-escaped -->", () => {
+		// Tokenizer: "-->" in the script data double escaped (dash dash) state switches
+		// to the script data state, so the next </script> ends the element and the
+		// markup after it is live again (browsers and domino agree)
+		const page =
+			"<html><head><script><!--<script>--></script><title>Real title</title></head>" +
+			"<body><h1>Heading</h1></body></html>";
+		expect(extractHtmlTitle(page)).toBe("Real title");
+		// Whereas before "-->" the </script> only leaves the double-escaped state
+		const stillOpen =
+			"<html><head><script><!--<script></script><title>Not a title</title>--></script>" +
+			"<title>Real title</title></head></html>";
+		expect(extractHtmlTitle(stillOpen)).toBe("Real title");
+	});
+
+	it("prefers <title>, decoded and whitespace-normalized", () => {
+		expect(extractHtmlTitle(PAGE)).toBe("Install & Configure — Docs");
+	});
+
+	it("judges <title> by its namespace: svg titles are labels, a broken-out one is the page's", () => {
+		// The div breaks out of the svg, so the <title> after it is an HTML title
+		expect(
+			extractHtmlTitle("<body><svg><div><title>Page title</title></div><h1>H</h1></body>")
+		).toBe("Page title");
+		// A <title> under an svg foreignObject is HTML as well
+		expect(
+			extractHtmlTitle(
+				"<body><svg><foreignObject><title>Island</title></foreignObject></svg></body>"
+			)
+		).toBe("Island");
+		// An unclosed <head> ends at the first body start tag: the <h1> is live
+		expect(extractHtmlTitle("<html><head><meta charset=utf-8><h1>Heading</h1></html>")).toBe(
+			"Heading"
+		);
+	});
+
+	it("ends the heading fallback where the parser closes the heading", () => {
+		// An unclosed <h1> is closed by the next heading start tag: the section
+		// and body text are not part of the title
+		expect(extractHtmlTitle("<body><h1>Page title<h2>Section</h2><p>Body</p></body>")).toBe(
+			"Page title"
+		);
+		// ...or by a same-name start tag
+		expect(extractHtmlTitle("<body><h1>A<h1>B</h1></body>")).toBe("A");
+		// Inline children are still part of the heading
+		expect(extractHtmlTitle("<body><h1>Keep <em>this</em> too</h1></body>")).toBe("Keep this too");
+		// The same closers count in the depth estimate: headings never nest
+		expect(estimateNesting("<h1>a<h2>b<h3>c".repeat(300)).depth).toBe(1);
+	});
+
+	it("follows the table insertion modes: colgroup and caption close before a cell", () => {
+		// <table><colgroup><td>: the colgroup is closed, then tbody and tr inserted
+		// (four levels per repetition), likewise after a <caption>
+		expect(estimateNesting("<table><colgroup><td>".repeat(170)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting("<table><caption><td>".repeat(170)).depth).toBeGreaterThan(
+			MAX_DOM_DEPTH
+		);
+		expect(estimateNesting("<table><colgroup><td>x").depth).toBe(4);
+		expect(estimateNesting("<table><caption>c<td>x").depth).toBe(4);
+		// A <col> gets its colgroup; a row group closes the previous one
+		expect(estimateNesting("<table><col><col>").depth).toBe(2);
+		expect(estimateNesting("<table><thead><tr><th>h<tbody><tr><td>d").depth).toBe(4);
+		// Table parts outside any table are ignored, as in body
+		expect(estimateNesting("<td>".repeat(600)).depth).toBe(0);
+		expect(estimateNesting("<div><tr><td>x</td></tr></div>").depth).toBe(1);
+	});
+
+	it("keeps a NUL inside a tag name, as the tokenizer does", () => {
+		// "<input\u0000>" is the non-void element "input\uFFFD" to the parser
+		expect(estimateNesting("<input\u0000>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<br\u0000>".repeat(600)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		// ...and "<base\u0000 href>" is not a base
+		const page = `<html><head><base\u0000 href="/decoy/"><base href="/docs/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/docs/guide)"
+		);
+	});
+
+	it("measures a candidate region by its visible text", () => {
+		const real = "Real content. ".repeat(20);
+		// 60 non-breaking spaces are 360 source characters but no visible text: the
+		// <main> is not substantial, the body (with the real paragraph) is used
+		const blank = `<html><body><main>${"&nbsp;".repeat(60)}</main><p>${real}</p></body></html>`;
+		expect(htmlToMarkdown(blank)).toContain("Real content.");
+		// Text inside dropped elements (a nav) does not count either
+		const menu = `<html><body><main><nav>${"Menu item. ".repeat(30)}</nav><p>short</p></main><p>${real}</p></body></html>`;
+		expect(htmlToMarkdown(menu)).toContain("Real content.");
+		// A genuinely substantial main is still selected
+		const substantial = `<html><body><main><p>${real}</p></main><p>Outside</p></body></html>`;
+		expect(htmlToMarkdown(substantial)).not.toContain("Outside");
+	});
+
+	it("counts the implied <tbody> and <tr> the parser inserts around cells", () => {
+		// <table><td> builds table > tbody > tr > td: four levels per repetition
+		expect(estimateNesting("<table><td>".repeat(200)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><tr><td>".repeat(200)).depth).toBeGreaterThan(MAX_DOM_DEPTH);
+		expect(estimateNesting("<table><tr><td>x</td></tr></table>").depth).toBe(4);
+		expect(estimateNesting("<table><td>x</td></table>").depth).toBe(4);
+		// Explicit sections are not doubled, and sibling cells/rows still close each other
+		expect(estimateNesting("<table><tbody><tr><td>x</td></tr></tbody></table>").depth).toBe(4);
+		expect(estimateNesting("<table><thead><td>x").depth).toBe(4);
+		expect(estimateNesting("<table><td>a<td>b<tr><td>c").depth).toBe(4);
+		// Everyday tables still convert on the DOM route
+		const page =
+			"<body><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></body>";
+		expect(htmlToMarkdown(page)).toMatch(/| As+| Bs+|/);
+	});
+
+	it("skips headings inside dropped page furniture for the fallback", () => {
+		// The nav's <h1> is removed by the converter with the whole nav: the
+		// page's own heading is the fallback title
+		expect(
+			extractHtmlTitle(
+				"<body><nav><h1>Product menu</h1></nav><main><h1>Account settings</h1></main></body>"
+			)
+		).toBe("Account settings");
+		// </form> removes only the form: the nav it left open still hides its heading
+		expect(
+			extractHtmlTitle("<body><form><nav></form><h1>Menu</h1></nav><h1>Settings</h1></body>")
+		).toBe("Settings");
+		// A stray closer inside a template does not end it: its <title> stays inert
+		expect(
+			extractHtmlTitle(
+				"<head><template></svg><title>Hidden</title></template><title>Real</title></head>"
+			)
+		).toBe("Real");
+	});
+
+	it("falls back to the first heading", () => {
+		expect(extractHtmlTitle("<body><h1>Only <em>Heading</em></h1></body>")).toBe("Only Heading");
+		expect(extractHtmlTitle("<body><p>no title</p></body>")).toBe("");
+	});
+});
+
+describe("decodeHtmlEntities", () => {
+	it("decodes named, decimal and hexadecimal references", () => {
+		expect(
+			decodeHtmlEntities("&lt;a&gt; &amp; &quot;b&quot; &#39;c&#39; &#x41;&#66; &nbsp;x")
+		).toBe("<a> & \"b\" 'c' AB \u00a0x");
+	});
+
+	it("decodes the complete HTML named reference set with the parser's rules", () => {
+		// Names outside any small table, and the legacy semicolon-less forms
+		expect(decodeHtmlEntities("https&colon;//x/&hellip; &Aacute;&eacute; &amp&lt;b>")).toBe(
+			"https://x/… Áé &<b>"
+		);
+		// Quotes and markup-looking text inside the input are never interpreted
+		expect(decodeHtmlEntities('say "hi" <b>&amp;</b> &quot;')).toBe('say "hi" <b>&</b> "');
+	});
+
+	it("decodes text in the data state and attributes in the attribute state", () => {
+		// In text a legacy semicolon-less reference is decoded even when a letter
+		// follows; in an attribute value it stays literal (the tokenizer's rule)
+		expect(decodeHtmlEntities("&copyx &notit; &amp=")).toBe("©x ¬it; &=");
+		expect(decodeAttributeEntities("&copyx &notit; &amp=")).toBe("&copyx &notit; &amp=");
+		// Markup-looking text is never interpreted in either context
+		expect(decodeHtmlEntities("a <b> &lt;/body&gt; &amp;")).toBe("a <b> </body> &");
+		// The measure of a region uses the text rules: 100 "&copyx" are 200 visible characters
+		expect(hasTextOfAtLeast("&copyx".repeat(100), 200)).toBe(true);
+		expect(hasTextOfAtLeast("&copyx".repeat(99), 200)).toBe(false);
+		// A base href is an attribute: "&copyx" stays as written in the URL
+		const page = `<html><head><base href="/a&copyx/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/a&copyx/guide)"
+		);
+	});
+
+	it("leaves unknown references untouched", () => {
+		expect(decodeHtmlEntities("&unknownthing; &#xZZ;")).toBe("&unknownthing; &#xZZ;");
+	});
+});

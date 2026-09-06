@@ -77,6 +77,36 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.error).toContain("not available");
 	});
 
+	it("refuses fetch_url calls outright when the switch is off", async () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		process.env.FETCH_URL_ENABLED = "false";
+		try {
+			const items = await processFunctionCall(
+				{ name: "fetch_url", call_id: "call_1", arguments: '{"url":"https://example.com/"}' },
+				makeContext()
+			);
+			const output = parseOutput(items);
+			expect(output.ok).toBe(false);
+			expect(output.error).toContain("FETCH_URL_ENABLED=false");
+		} finally {
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("routes fetch_url to the application-side page reader", async () => {
+		// A loopback target is refused before any network access: deterministic
+		// proof that the call reached the reader and its address policy
+		const items = await processFunctionCall(
+			{ name: "fetch_url", call_id: "call_1", arguments: '{"url":"http://127.0.0.1:8080/"}' },
+			makeContext()
+		);
+
+		const output = parseOutput(items);
+		expect(output.ok).toBe(false);
+		expect(output.error).toContain("Refused");
+	});
+
 	it("routes search_knowledge_base to the local knowledge base", async () => {
 		const knowledgeBase = {
 			search: jest.fn(async () => ({
@@ -146,6 +176,38 @@ describe("processFunctionCall (provider-aware)", () => {
 		expect(output.truncated).toBe(true);
 		expect(output.originalChars).toBeGreaterThan(100000);
 		expect(output.hint).toContain("TRUNCATED");
+	});
+
+	it("keeps the staged-file reference reachable when the inline cap truncates", async () => {
+		// The middleware appends _file AFTER the bulky payload: a naive slice of
+		// the serialized object would drop the only pointer to the full data
+		const knowledgeBase = {
+			search: jest.fn(async () => ({
+				ok: true,
+				content: "z".repeat(100000),
+				_file: {
+					fileName: "fetch_url_123.json",
+					hint: "Full JSON available in the Python sandbox at /data/fetch_url_123.json.",
+				},
+			})),
+		};
+
+		const items = await processFunctionCall(
+			{ name: "search_knowledge_base", call_id: "call_1", arguments: '{"query":"big"}' },
+			makeContext({
+				knowledgeBase,
+				provider: { ...ollamaProvider, maxToolOutputChars: 30000 },
+			})
+		);
+
+		expect(items[0].output.length).toBeLessThanOrEqual(31000);
+		const output = parseOutput(items);
+		expect(output.truncated).toBe(true);
+		expect(output._file).toEqual({
+			fileName: "fetch_url_123.json",
+			hint: "Full JSON available in the Python sandbox at /data/fetch_url_123.json.",
+		});
+		expect(output.hint).toContain("/data/fetch_url_123.json");
 	});
 
 	it("does not truncate outputs when the provider has no inline cap", async () => {

@@ -6,7 +6,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeMcpFunctionCall, getOpenAiFunctionTools } from "../mcp_registry.js";
+import {
+	executeMcpFunctionCall,
+	getOpenAiFunctionTools,
+	isHostRoutedMcpTool,
+} from "../mcp_registry.js";
 import { executePromQLQuery } from "../prometheus.js";
 import { tryParseJsonString } from "../utils/json-parser.js";
 import { HARD_MAX_OUTPUT_CHARS } from "../utils/output-handler.js";
@@ -21,6 +25,7 @@ import {
 	handleRequestCredentials,
 	handleSaveConfigFile,
 } from "./config-editor.js";
+import { executeFetchUrl, isFetchUrlEnabled } from "./fetch-url.js";
 import { openai } from "./openai.js";
 import { uploadGeneratedFilesToSlack } from "./slack-files.js";
 import { executeWithMiddleware } from "./tool-middleware.js";
@@ -150,6 +155,43 @@ export async function processFunctionCall(functionCall, context) {
 				output = await executeWebSearch(args, logger);
 				break;
 
+			// Application-side page reader (function-only providers). Through the
+			// middleware so a long page is staged for run_python instead of being
+			// truncated blindly by the provider inline cap. An MCP server that
+			// exports its own fetch_url keeps it (the built-in is not offered then)
+			case "fetch_url":
+				// The switch removes page reading entirely, MCP-provided readers included
+				if (!isFetchUrlEnabled()) {
+					output = {
+						ok: false,
+						error: "fetch_url is disabled on this deployment (FETCH_URL_ENABLED=false).",
+					};
+					break;
+				}
+				output = await executeWithMiddleware(
+					name,
+					args,
+					// An MCP fetch_url takes over only when it is host-routed like every
+					// other MCP tool here; a URL-only MCP reader cannot be driven through
+					// this bot, so the built-in serves the call
+					async (_name, cleanArgs) =>
+						isHostRoutedMcpTool("fetch_url")
+							? handleMcpFunctionCall(_name, cleanArgs, logger)
+							: executeFetchUrl(cleanArgs, logger, {
+									// A page whose inline content had to be cut is staged in full
+									// for run_python, so the model can still read all of it
+									stageText: middlewareOptions.sandboxFiles
+										? (text, toolName) => {
+												const fileName = `${toolName}_${Date.now()}_full.txt`;
+												middlewareOptions.sandboxFiles.set(fileName, text);
+												return fileName;
+											}
+										: undefined,
+								}),
+					middlewareOptions
+				);
+				break;
+
 			// Local Python sandbox (Ollama mode replacement for code_interpreter)
 			case "run_python":
 				output = provider?.capabilities?.localCodeInterpreter
@@ -238,13 +280,20 @@ export async function processFunctionCall(functionCall, context) {
 				const kept = finalOutputStr.slice(0, Math.max(charCap - 600, 1000));
 				finalOutputStr = `${kept}\n\n[TRUNCATED: showing ${kept.length} of ${originalChars} chars. ${truncationHint}]`;
 			} else {
-				finalOutputStr = JSON.stringify({
+				// The staged/uploaded full copy (middleware `_file`) is what lets the
+				// model recover the truncated data: keep it out of the sliced blob
+				// and inside the envelope, with room reserved for it
+				const fileRef = output && typeof output === "object" ? output._file : undefined;
+				const fileRefChars = fileRef ? JSON.stringify(fileRef).length : 0;
+				const envelope = {
 					ok: output?.ok ?? true,
 					truncated: true,
 					originalChars: finalOutputStr.length,
-					data: finalOutputStr.slice(0, Math.max(charCap - 500, 1000)),
-					hint: truncationHint,
-				});
+					data: finalOutputStr.slice(0, Math.max(charCap - 500 - fileRefChars, 1000)),
+					hint: fileRef?.hint ? `${truncationHint} ${fileRef.hint}` : truncationHint,
+				};
+				if (fileRef) envelope._file = fileRef;
+				finalOutputStr = JSON.stringify(envelope);
 			}
 		}
 	}

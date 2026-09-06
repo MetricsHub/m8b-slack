@@ -67,7 +67,7 @@ import {
 	takePending,
 	threadRunKey,
 } from "./services/thread-inbox.js";
-import { buildToolsArray, logToolWarnings } from "./tools/index.js";
+import { buildToolsArray, isFetchUrlAdvertised, logToolWarnings } from "./tools/index.js";
 import {
 	estimateTokenCount,
 	getTokenCalibration,
@@ -396,6 +396,11 @@ async function respondCore({
 		// the workspace this message comes from and the deployment notes (both modes)
 		const systemPrompt = buildSystemPrompt(provider.capabilities, {
 			contextWindow: stateless ? provider.contextWindow : undefined,
+			// The fetched-content safeguards apply whenever a fetch_url reader is
+			// actually advertised (same predicate as buildToolsArray): the app-side
+			// one on function-only providers, or a host-routed MCP reader alongside
+			// a hosted web search (its pages arrive as ordinary function output too)
+			fetchUrl: isFetchUrlAdvertised(provider.capabilities),
 			...(await getDeploymentContext({ client, teamId, logger })),
 		});
 		const promptVersion = systemPromptVersion(systemPrompt);

@@ -35,6 +35,7 @@
  */
 
 import { getProvider } from "../ai/providers/index.js";
+import { isFetchUrlEnabled } from "../ai/services/fetch-url.js";
 
 /**
  * Whether the active provider can see image attachments (used to skip the
@@ -192,6 +193,21 @@ export const SCENARIOS = [
 			"The answer provides a URL on the metricshub.com or metricshub.org domain as the official " +
 			"MetricsHub website. It must not claim that web search is unavailable.",
 		skipUnlessEnv: "WEB_SEARCH_PROVIDER",
+		timeoutMs: 240000,
+	},
+	{
+		name: "fetch-url-github-issue",
+		prompt:
+			"Read https://github.com/MetricsHub/metricshub-community/issues/1325 and tell me in two " +
+			"sentences what this issue is about.",
+		expectToolCall: /fetch_url/,
+		judge:
+			"The answer summarizes the actual content of the GitHub issue (its title, or what is being " +
+			"reported or requested). It must NOT claim that the repository is private or that the page " +
+			"could not be read, and must not describe an HTTP monitoring/protocol check instead of the " +
+			"issue. An honest 'the issue does not exist (404)' is acceptable only if the tool said so.",
+		skipUnless: () => !getProvider().capabilities.hostedWebSearch && isFetchUrlEnabled(),
+		skipReason: "needs a function-only provider with fetch_url enabled",
 		timeoutMs: 240000,
 	},
 	{

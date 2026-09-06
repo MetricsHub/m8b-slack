@@ -4,6 +4,9 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { Ajv } from "ajv";
+import { Ajv2019 } from "ajv/dist/2019.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
 
 // In-memory registry state
 const state = {
@@ -90,6 +93,9 @@ async function _ensureConnected(server) {
 	if (server.client) {
 		try {
 			await server.client.ping({ timeout: 5000 });
+			// A tool reload that failed after the last (re)connection is retried
+			// here, so routing never keeps a pre-restart schema for long
+			if (server.toolsStale) await _tryLoadTools(server);
 			return true; // Connection is alive
 		} catch (e) {
 			console.log(
@@ -110,11 +116,52 @@ async function _ensureConnected(server) {
 		await client.connect(transport);
 		server.client = client;
 		console.log(`[MCP] Connected to ${server.server_label}`);
-		return true;
 	} catch (e) {
 		console.error(`[MCP] Failed to connect to ${server.server_label}:`, e);
 		return false;
 	}
+	// A (re)connected agent may have restarted with other tools: routing and
+	// validation must follow its current definitions, not the ones it had
+	await _tryLoadTools(server);
+	return true;
+}
+
+/**
+ * Load a server's tools, remembering a failure as `toolsStale` so the next
+ * connection check retries instead of trusting a pre-restart schema.
+ *
+ * @param {Object} server - Server entry with a connected client
+ * @returns {Promise<boolean>} Loaded
+ */
+async function _tryLoadTools(server) {
+	try {
+		await _loadTools(server);
+		server.toolsStale = false;
+		return true;
+	} catch (e) {
+		server.toolsStale = true;
+		console.warn(
+			`[MCP] Tool list of ${server.server_label} could not be loaded: ${e?.message || e}`
+		);
+		return false;
+	}
+}
+
+/**
+ * (Re)load a server's tool map from its listTools(). Called on every
+ * (re)connection and by refreshToolsForServer(). The map keeps its identity
+ * (cleared and refilled), definitions are replaced by the fresh objects, so
+ * the validators cached per definition are rebuilt for changed schemas.
+ *
+ * @param {Object} server - Server entry with a connected client
+ * @returns {Promise<number>} Number of tools loaded
+ */
+async function _loadTools(server) {
+	const toolsResult = await server.client.listTools();
+	const tools = (toolsResult?.tools || []).filter((t) => t?.name);
+	server.tools.clear();
+	for (const t of tools) server.tools.set(t.name, t);
+	return tools.length;
 }
 
 function _indexHostsFromList(server, hostsData) {
@@ -233,18 +280,12 @@ export async function initializeMcpRegistry(logger) {
 				continue;
 			}
 
-			// Get all tools
-			const toolsResult = await server.client.listTools();
-			const tools = toolsResult.tools || [];
+			// Tools were loaded by the connection; a failed load is retried once here
+			if (server.tools.size === 0) await _loadTools(server);
 			_log(logger, "info", "Tools discovered", {
 				server: server.server_label,
-				count: tools.length,
+				count: server.tools.size,
 			});
-
-			for (const t of tools) {
-				if (!t?.name) continue;
-				server.tools.set(t.name, t);
-			}
 
 			// Try to load hosts via ListHosts if present
 			if (server.tools.has("ListHosts")) {
@@ -291,6 +332,33 @@ function _removeHostsForServer(serverLabel) {
  * @param {Object} [logger] - Logger instance
  * @returns {Promise<{ok: boolean, hostCount?: number, error?: string}>}
  */
+/**
+ * Reload one server's tool definitions from the agent (see _loadTools): what
+ * the model is offered and what calls are validated against follow the
+ * agent's current schemas.
+ *
+ * @param {string} serverLabel - Agent label
+ * @param {Object} [logger]
+ * @returns {Promise<number>} Number of tools loaded, -1 when the server is unknown or unreachable
+ */
+export async function refreshToolsForServer(serverLabel, logger) {
+	const server = state.servers.find((s) => s.server_label === serverLabel);
+	if (!server) {
+		_log(logger, "warn", "Tool refresh for unknown server", { label: serverLabel });
+		return -1;
+	}
+	const connected = await _ensureConnected(server);
+	if (!connected) return -1;
+	try {
+		const count = await _loadTools(server);
+		_log(logger, "info", "Tools refreshed", { server: serverLabel, count });
+		return count;
+	} catch (e) {
+		_log(logger, "warn", "Tool refresh failed", { server: serverLabel, error: String(e) });
+		return -1;
+	}
+}
+
 export async function refreshHostsForServer(serverLabel, logger) {
 	const server = state.servers.find((s) => s.server_label === serverLabel);
 	if (!server) {
@@ -393,6 +461,211 @@ export function getMcpServerCount() {
 }
 
 /**
+ * Whether an MCP tool of that name is exported by a registered server AND
+ * declares a host-routing argument of its own (hosts / hostname / host).
+ * Every MCP call is routed to an agent by host key, so a tool without one
+ * cannot be driven through this bot at all.
+ *
+ * @param {string} name - Tool name
+ * @returns {boolean}
+ */
+export function isHostRoutedMcpTool(name) {
+	// Every server is inspected: with mixed agent versions, a later server may
+	// export the host-routed definition the first one lacks
+	for (const server of state.servers) {
+		if (hasHostRoutingParam(server.tools?.get?.(name))) return true;
+	}
+	return false;
+}
+
+/**
+ * Whether an MCP tool definition declares a host-routing argument of its own
+ * (hosts / hostnames / hostname / host).
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Tool definition
+ * @returns {boolean}
+ */
+function hasHostRoutingParam(def) {
+	const props = def?.inputSchema?.properties;
+	return Boolean(props && [...ROUTING_FIELDS].some((field) => field in props));
+}
+
+/** Arguments the router fills in itself: never "missing" on the caller's side */
+const ROUTING_FIELDS = new Set(["hosts", "host", "hostname", "hostnames"]);
+
+/**
+ * Argument sets for one destination server: the call's arguments with the
+ * routing field THIS server declares filled from its bucket of host keys.
+ * `hosts` (the advertised routing field) is always set from the bucket;
+ * another declared routing field (hostnames, hostname, host) is filled only
+ * when the model left it empty — a value it supplied may be an alias the
+ * agent knows better than the key — with one call per host when the field
+ * takes a single value. Routing fields the destination does not declare are
+ * dropped: an older schema with additionalProperties:false would reject them.
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Destination's tool definition
+ * @param {Object} args - Call arguments
+ * @param {string[]} hosts - Host keys bucketed to this server
+ * @returns {Object[]} One argument object per call to make
+ */
+/**
+ * Argument sets for one destination server: the call's arguments with the
+ * routing field THIS server declares filled from its bucket of host keys.
+ * `hosts` (the advertised routing field) and any list-valued field
+ * (hostnames, or an array-typed hostname/host) always take the whole bucket.
+ * A single-valued field (hostname: string) gets one call per bucketed host;
+ * a value the model supplied for it is kept only when the bucket holds a
+ * single host — it may be an alias the agent knows better than the key — since
+ * one value cannot cover several machines. Routing fields the destination
+ * does not declare are dropped (an older schema with additionalProperties:
+ * false would reject them), and so is the app-side monitorTypes filter.
+ *
+ * @param {{inputSchema?: {properties?: object}}|undefined} def - Destination's tool definition
+ * @param {Object} args - Call arguments
+ * @param {string[]} hosts - Host keys bucketed to this server
+ * @returns {Object[]} One argument object per call to make
+ */
+function routedCalls(def, args, hosts) {
+	const props = def?.inputSchema?.properties || {};
+	const base = {};
+	for (const [key, value] of Object.entries(args || {})) {
+		if (key === "monitorTypes") continue;
+		if (!ROUTING_FIELDS.has(key) || key in props) base[key] = value;
+	}
+	if ("hosts" in props) return [{ ...base, hosts }];
+	const field = ["hostnames", "hostname", "host"].find((candidate) => candidate in props);
+	if (!field) return [base]; // unreachable: hasHostRoutingParam() was checked
+	// Does the field take the whole bucket? The destination's own validator
+	// decides (it resolves $ref, anyOf and the rest of the schema); without a
+	// usable validator, the declared type and the field name decide
+	const listCall = { ...base, [field]: hosts };
+	const { validate } = schemaValidator(def);
+	const type = props[field]?.type;
+	const takesList = validate
+		? validate(listCall)
+		: type === "array" || (Array.isArray(type) && type.includes("array")) || field === "hostnames";
+	if (takesList) return [listCall];
+	if (hosts.length === 1 && base[field] !== undefined && base[field] !== null) return [base];
+	return hosts.map((host) => ({ ...base, [field]: host }));
+}
+
+/**
+ * Validator for a tool definition's input schema, compiled once per
+ * definition with the Ajv instance of the dialect its "$schema" declares
+ * (draft-07 when absent, what the MCP SDKs emit; strict mode off, so
+ * server-specific keywords or formats compile). A dialect Ajv cannot
+ * validate faithfully (draft-04 and older, unknown URIs) is reported as a
+ * reason to refuse; a schema that fails to compile in its own dialect is
+ * reported as no validator, and the call is sent as-is, as before this check
+ * existed.
+ *
+ * @param {{inputSchema?: object}} def - Tool definition
+ * @returns {{validate: import("ajv").ValidateFunction|null, reason: string|null}}
+ */
+function schemaValidator(def) {
+	const cached = VALIDATORS.get(def);
+	if (cached) return cached;
+	const { $schema, ...schema } = def?.inputSchema || {};
+	const dialect = schemaDialect($schema);
+	/** @type {{validate: import("ajv").ValidateFunction|null, reason: string|null}} */
+	const entry = { validate: null, reason: null };
+	if (!dialect) {
+		entry.reason = `declares the JSON Schema dialect ${$schema}, which cannot be validated`;
+	} else {
+		try {
+			entry.validate = AJV_BY_DIALECT[dialect].compile(schema);
+		} catch (e) {
+			console.warn(`[MCP] Tool schema could not be compiled for validation: ${e?.message || e}`);
+		}
+	}
+	VALIDATORS.set(def, entry);
+	return entry;
+}
+
+/**
+ * Dialect key of a schema's "$schema" URI: absent means draft-07; draft-06/07,
+ * 2019-09 and 2020-12 are supported; anything else is null.
+ *
+ * @param {unknown} $schema
+ * @returns {"draft-07"|"2019-09"|"2020-12"|null}
+ */
+function schemaDialect($schema) {
+	if ($schema === undefined || $schema === null || $schema === "") return "draft-07";
+	const uri = String($schema);
+	if (/\/draft\/2020-12\//.test(uri)) return "2020-12";
+	if (/\/draft\/2019-09\//.test(uri)) return "2019-09";
+	if (/\/draft-0[67]\//.test(uri)) return "draft-07";
+	return null;
+}
+
+const AJV_OPTIONS = { strict: false, allErrors: true, validateFormats: false };
+/** One Ajv instance per JSON Schema dialect a tool schema may declare */
+const AJV_BY_DIALECT = {
+	"draft-07": new Ajv(AJV_OPTIONS),
+	"2019-09": new Ajv2019(AJV_OPTIONS),
+	"2020-12": new Ajv2020(AJV_OPTIONS),
+};
+/** @type {WeakMap<object, {validate: import("ajv").ValidateFunction|null, reason: string|null}>} */
+const VALIDATORS = new WeakMap();
+
+/**
+ * Human-readable summary of Ajv validation errors ("mode must be equal to one
+ * of the allowed values (summary); arguments must NOT have additional
+ * properties (extra)").
+ *
+ * @param {import("ajv").ErrorObject[]|null|undefined} errors
+ * @returns {string}
+ */
+function describeViolations(errors) {
+	return (errors || [])
+		.map((error) => {
+			const where = error.instancePath
+				? error.instancePath.replace(/^\//, "").replace(/\//g, ".")
+				: "arguments";
+			const params = error.params || {};
+			const detail = params.additionalProperty
+				? ` (${params.additionalProperty})`
+				: Array.isArray(params.allowedValues)
+					? ` (${params.allowedValues.join(", ")})`
+					: params.missingProperty
+						? ` (${params.missingProperty})`
+						: "";
+			return `${where} ${error.message}${detail}`;
+		})
+		.join("; ");
+}
+
+/**
+ * Why `name` cannot be sent to `server` with these (already routed)
+ * arguments, or null when it can. The schema the model saw is ONE server's
+ * (the host-routed definition wins the deduplication); with mixed agent
+ * versions another server may not export the tool at all, export it without
+ * a host-routing argument, or constrain the arguments differently (required
+ * or unknown properties, types, enums, item schemas, ...). The call built
+ * for this server is validated against ITS complete input schema, so it is
+ * refused with the validator's explanation instead of being sent to an
+ * implementation that would reject or misread it.
+ *
+ * @param {{server_label: string, tools: Map<string, any>}} server - Destination server
+ * @param {string} name - Tool name
+ * @param {Object} callArgs - Arguments as they would be sent to this server
+ * @returns {string|null}
+ */
+function toolIncompatibility(server, name, callArgs) {
+	const def = server.tools?.get?.(name);
+	if (!def) return `Agent ${server.server_label} does not provide the tool ${name}`;
+	// A tool without a host argument of its own is still callable: the hosts
+	// the model chose select the servers, routedCalls() drops the routing
+	// fields the destination does not declare, and the call goes out as-is
+	const { validate, reason } = schemaValidator(def);
+	if (reason) return `Agent ${server.server_label}'s version of ${name} ${reason}`;
+	if (validate && !validate(callArgs)) {
+		return `Agent ${server.server_label}'s version of ${name} rejects the call: ${describeViolations(validate.errors)}`;
+	}
+	return null;
+}
+
+/**
  * Return the registered MetricsHub agents (connection settings only, no
  * client/tool state). Used by the REST API client (ai/services/metricshub-api.js)
  * which talks to the same agents on the same origin with the same token.
@@ -482,20 +755,32 @@ export function getOpenAiFunctionTools() {
 		},
 	});
 
-	// Other tools discovered per server (excluding ListHosts)
-	const seen = new Set();
+	// Other tools discovered per server (excluding ListHosts): one definition per
+	// name. With mixed agent versions the same tool may come with different
+	// schemas; the definition that declares its own host-routing argument is the
+	// one that can be driven through the router, so it wins over one without
+	// (otherwise the first seen wins, and the tool keeps its first position)
+	const definitions = new Map();
 	for (const server of state.servers) {
 		for (const [name, def] of server.tools.entries()) {
 			if (name === "ListHosts") continue;
-			if (seen.has(name)) continue;
-			seen.add(name);
-
+			const current = definitions.get(name);
+			if (!current || (!hasHostRoutingParam(current) && hasHostRoutingParam(def))) {
+				definitions.set(name, def);
+			}
+		}
+	}
+	for (const [name, def] of definitions) {
+		{
 			const schema = def?.inputSchema || { type: "object", properties: {} };
 			const params = { type: "object", properties: {}, additionalProperties: false };
 
 			if (schema && typeof schema === "object" && schema.type === "object" && schema.properties) {
 				params.properties = { ...schema.properties };
 				if (Array.isArray(schema.required)) params.required = [...schema.required];
+				// Local references ($ref: "#/$defs/...") need the definitions they point to
+				if (schema.$defs) params.$defs = schema.$defs;
+				if (schema.definitions) params.definitions = schema.definitions;
 				params.additionalProperties = false;
 			}
 
@@ -698,27 +983,36 @@ export async function executeMcpFunctionCall(name, args, _logger) {
 			continue;
 		}
 
-		// Build args for this server, including the hosts for this server
-		const callArgs = { ...args, hosts: hs };
-
-		try {
-			// Use a longer timeout (120 seconds) for tool calls as some operations can be slow
-			console.log(
-				`[MCP] Calling tool '${name}' on ${server.server_label} with args:`,
-				JSON.stringify(callArgs)
-			);
-			const startTime = Date.now();
-			const res = await server.client.callTool({ name, arguments: callArgs }, undefined, {
-				timeout: 120000,
-			});
-			console.log(
-				`[MCP] Tool '${name}' on ${server.server_label} completed in ${Date.now() - startTime}ms`
-			);
-			const parsed = _parseToolResult(res);
-			results.push({ server_label: server.server_label, ok: true, result: parsed });
-		} catch (e) {
-			console.error(`[MCP] Tool '${name}' on ${server.server_label} failed:`, e);
-			results.push({ server_label: server.server_label, ok: false, error: String(e) });
+		// One call per argument set: the destination's own routing field is filled
+		// from its bucket (several calls when that field takes a single host). Each
+		// call, as it would be sent, must satisfy the tool as THIS server exports
+		// it (its tool list is fresh after the connection check)
+		for (const callArgs of routedCalls(server.tools.get(name), args, hs)) {
+			const incompatible = toolIncompatibility(server, name, callArgs);
+			if (incompatible) {
+				console.log(`[MCP] Tool '${name}' not sent to ${server.server_label}: ${incompatible}`);
+				results.push({ server_label: server.server_label, ok: false, error: incompatible });
+				continue;
+			}
+			try {
+				// Use a longer timeout (120 seconds) for tool calls as some operations can be slow
+				console.log(
+					`[MCP] Calling tool '${name}' on ${server.server_label} with args:`,
+					JSON.stringify(callArgs)
+				);
+				const startTime = Date.now();
+				const res = await server.client.callTool({ name, arguments: callArgs }, undefined, {
+					timeout: 120000,
+				});
+				console.log(
+					`[MCP] Tool '${name}' on ${server.server_label} completed in ${Date.now() - startTime}ms`
+				);
+				const parsed = _parseToolResult(res);
+				results.push({ server_label: server.server_label, ok: true, result: parsed });
+			} catch (e) {
+				console.error(`[MCP] Tool '${name}' on ${server.server_label} failed:`, e);
+				results.push({ server_label: server.server_label, ok: false, error: String(e) });
+			}
 		}
 	}
 

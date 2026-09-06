@@ -3,7 +3,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
-import { buildFunctionNamespaces, buildToolsArray, KNOWLEDGE_TOOL } from "../index.js";
+import { _setServersForTests, isHostRoutedMcpTool } from "../../mcp_registry.js";
+import {
+	buildFunctionNamespaces,
+	buildToolsArray,
+	isFetchUrlAdvertised,
+	KNOWLEDGE_TOOL,
+} from "../index.js";
 
 function makeTool(name) {
 	return {
@@ -175,6 +181,294 @@ describe("buildToolsArray", () => {
 		}).map((t) => t.name);
 
 		expect(names).not.toContain("update_knowledge");
+	});
+
+	it("exposes fetch_url to function-only providers unless disabled, never to OpenAI", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		try {
+			const local = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			const fetchUrl = local.find((t) => t.name === "fetch_url");
+			expect(fetchUrl).toMatchObject({ type: "function", name: "fetch_url" });
+			expect(fetchUrl.parameters.required).toEqual(["url"]);
+
+			const hosted = buildToolsArray({ vectorStoreIds: [], provider: openAiProvider });
+			expect(hosted.map((t) => t.name)).not.toContain("fetch_url");
+
+			process.env.FETCH_URL_ENABLED = "false";
+			const disabled = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			expect(disabled.map((t) => t.name)).not.toContain("fetch_url");
+		} finally {
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("lets an MCP server's own fetch_url win over the built-in reader", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "Agent-side page reader with internal access.",
+							// Host-routed like every MCP tool here: it CAN be driven through the bot
+							inputSchema: {
+								type: "object",
+								properties: { url: { type: "string" }, hosts: { type: "array" } },
+								required: ["url", "hosts"],
+							},
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			const tools = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider });
+			const readers = tools.filter((t) => t.name === "fetch_url");
+			expect(readers).toHaveLength(1);
+			expect(readers[0].description).toContain("Agent-side page reader");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("keeps the built-in reader when an MCP fetch_url is URL-only (not host-routed)", () => {
+		// Every MCP call is routed to an agent by host key: a reader without a host
+		// argument cannot be driven through this bot, so it must not shadow the built-in
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "URL-only reader.",
+							inputSchema: {
+								type: "object",
+								properties: { url: { type: "string" } },
+								required: ["url"],
+							},
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			const readers = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).filter(
+				(t) => t.name === "fetch_url"
+			);
+			expect(readers).toHaveLength(1);
+			expect(readers[0].description).not.toContain("URL-only reader");
+			expect(readers[0].parameters.required).toEqual(["url"]);
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("does not advertise a URL-only MCP fetch_url in the hosted namespaces", () => {
+		// It cannot be driven through the host router, so a call would go elsewhere
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "URL-only reader.",
+							inputSchema: { type: "object", properties: { url: { type: "string" } } },
+						},
+					],
+					["OtherTool", { description: "Kept.", inputSchema: { type: "object" } }],
+				]),
+			},
+		]);
+		try {
+			const hosted = buildToolsArray({ vectorStoreIds: [], provider: openAiProvider });
+			const namespaced = hosted
+				.filter((t) => t.type === "namespace")
+				.flatMap((namespace) => namespace.tools.map((t) => t.name));
+			expect(namespaced).not.toContain("fetch_url");
+			expect(namespaced).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("does not advertise a disabled MCP fetch_url in the hosted namespaces either", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		process.env.FETCH_URL_ENABLED = "false";
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{ description: "Agent-side page reader.", inputSchema: { type: "object" } },
+					],
+					["OtherTool", { description: "Kept.", inputSchema: { type: "object" } }],
+				]),
+			},
+		]);
+		try {
+			const hosted = buildToolsArray({ vectorStoreIds: [], provider: openAiProvider });
+			const namespaced = hosted
+				.filter((t) => t.type === "namespace")
+				.flatMap((namespace) => namespace.tools.map((t) => t.name));
+			expect(namespaced).not.toContain("fetch_url");
+			expect(namespaced).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("finds a host-routed MCP fetch_url on a later server (mixed agent versions)", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		_setServersForTests([
+			{
+				server_label: "old",
+				server_url: "https://old.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{ description: "URL-only.", inputSchema: { type: "object", properties: { url: {} } } },
+					],
+				]),
+			},
+			{
+				server_label: "new",
+				server_url: "https://new.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{
+							description: "Host-routed reader.",
+							inputSchema: { type: "object", properties: { url: {}, hosts: { type: "array" } } },
+						},
+					],
+				]),
+			},
+		]);
+		try {
+			expect(isHostRoutedMcpTool("fetch_url")).toBe(true);
+			const readers = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).filter(
+				(t) => t.name === "fetch_url"
+			);
+			// The MCP reader wins (one definition), the built-in is not added alongside
+			expect(readers).toHaveLength(1);
+			expect(readers[0].parameters.properties).toHaveProperty("hosts");
+			// ...and it is the host-routed DEFINITION that is advertised, not the first
+			// server's URL-only schema with a hosts field bolted on
+			expect(readers[0].description).toBe("Host-routed reader.");
+			expect(readers[0].parameters.required).toEqual(expect.arrayContaining(["hosts"]));
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("advertises page-reading guidance only when a fetch_url reader is exposed", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		delete process.env.FETCH_URL_ENABLED;
+		const server = (props) => ({
+			server_label: "a1",
+			server_url: "https://a1.example",
+			token: "",
+			tools: new Map([
+				[
+					"fetch_url",
+					{ description: "Reader.", inputSchema: { type: "object", properties: props } },
+				],
+			]),
+		});
+		const namespaced = (tools) =>
+			tools
+				.filter((tool) => tool.type === "namespace")
+				.flatMap((namespace) => namespace.tools.map((tool) => tool.name));
+		try {
+			// Only a URL-only MCP reader: the hosted path filters it out, so the prompt
+			// must not tell the model to read links with a tool it does not have
+			_setServersForTests([server({ url: {} })]);
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(false);
+			expect(
+				namespaced(buildToolsArray({ vectorStoreIds: [], provider: openAiProvider }))
+			).not.toContain("fetch_url");
+			// Function-only providers get the built-in reader regardless
+			expect(isFetchUrlAdvertised(ollamaProvider.capabilities)).toBe(true);
+
+			// A host-routed MCP reader is advertised on the hosted path
+			_setServersForTests([server({ url: {}, hosts: { type: "array" } })]);
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(true);
+			expect(
+				namespaced(buildToolsArray({ vectorStoreIds: [], provider: openAiProvider }))
+			).toContain("fetch_url");
+
+			// The switch turns everything off
+			process.env.FETCH_URL_ENABLED = "false";
+			expect(isFetchUrlAdvertised(openAiProvider.capabilities)).toBe(false);
+			expect(isFetchUrlAdvertised(ollamaProvider.capabilities)).toBe(false);
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
+	});
+
+	it("removes an MCP-provided fetch_url too when the switch is off", () => {
+		const saved = process.env.FETCH_URL_ENABLED;
+		process.env.FETCH_URL_ENABLED = "false";
+		_setServersForTests([
+			{
+				server_label: "a1",
+				server_url: "https://a1.example",
+				token: "",
+				tools: new Map([
+					[
+						"fetch_url",
+						{ description: "Agent-side page reader.", inputSchema: { type: "object" } },
+					],
+					["OtherTool", { description: "Kept.", inputSchema: { type: "object" } }],
+				]),
+			},
+		]);
+		try {
+			const names = buildToolsArray({ vectorStoreIds: [], provider: ollamaProvider }).map(
+				(t) => t.name
+			);
+			expect(names).not.toContain("fetch_url");
+			expect(names).toContain("OtherTool");
+		} finally {
+			_setServersForTests([]);
+			if (saved === undefined) delete process.env.FETCH_URL_ENABLED;
+			else process.env.FETCH_URL_ENABLED = saved;
+		}
 	});
 
 	it("exposes web_search as a function tool only when a backend is configured", () => {

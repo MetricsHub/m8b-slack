@@ -2,8 +2,9 @@
  * Tool definitions for OpenAI function calling.
  */
 
-import { getMcpServerCount, getOpenAiFunctionTools } from "../mcp_registry.js";
+import { getMcpServerCount, getOpenAiFunctionTools, isHostRoutedMcpTool } from "../mcp_registry.js";
 import { getPromQLTool } from "../prometheus.js";
+import { getFetchUrlTool, isFetchUrlEnabled } from "../services/fetch-url.js";
 import { SEARCH_KNOWLEDGE_TOOL } from "../services/knowledge-base.js";
 import { getWebSearchTool } from "../services/web-search.js";
 import { getMetricsHubConfigTools } from "./metricshub-config.js";
@@ -197,6 +198,30 @@ export function buildFunctionToolsArray({
 		tools.push(webSearchTool);
 	}
 
+	// Application-side page reader (hosted web search reads pages itself;
+	// here the model needs an explicit tool). Removed by FETCH_URL_ENABLED=false.
+	// An MCP server exporting its own fetch_url wins: the built-in would only
+	// shadow it (duplicate names in the tool list, calls intercepted app-side)
+	const fetchUrlTool = getFetchUrlTool();
+	if (fetchUrlTool) {
+		// An MCP fetch_url can only be driven through this bot when it declares a
+		// host-routing argument (every MCP call is routed to an agent by host key).
+		// A URL-only MCP reader is unusable here: the built-in wins and the MCP
+		// definition is dropped so the model never sees two of them.
+		if (!isHostRoutedMcpTool("fetch_url")) {
+			const kept = tools.filter((tool) => tool.name !== "fetch_url");
+			tools.length = 0;
+			tools.push(...kept, fetchUrlTool);
+		}
+	} else if (!isFetchUrlEnabled()) {
+		// The switch removes page reading entirely, an MCP-provided reader
+		// included (it may reach internal URLs, and the prompt's fetched-content
+		// guidance is off when the flag is off)
+		const kept = tools.filter((tool) => tool.name !== "fetch_url");
+		tools.length = 0;
+		tools.push(...kept);
+	}
+
 	// Local Python sandbox (app-side code_interpreter replacement)
 	if (codeSandboxAvailable) {
 		tools.push(RUN_PYTHON_TOOL);
@@ -225,6 +250,23 @@ export function buildFunctionToolsArray({
  * @param {boolean} [options.configEditingAllowed] - Requesting user may edit MetricsHub config
  * @returns {Array} Array of tool definitions
  */
+/**
+ * Whether a fetch_url reader is advertised to the model for a provider with
+ * these capabilities: the built-in reader on function-only providers (unless
+ * FETCH_URL_ENABLED=false), or a host-routed MCP reader on providers with tool
+ * namespaces. buildToolsArray() and the system prompt's page-reading guidance
+ * share this predicate, so the prompt never names a reader that was filtered
+ * out of the tool set.
+ *
+ * @param {{toolNamespaces?: boolean}|undefined} capabilities - Provider capability flags
+ * @returns {boolean}
+ */
+export function isFetchUrlAdvertised(capabilities) {
+	if (!isFetchUrlEnabled()) return false;
+	if (capabilities && !capabilities.toolNamespaces) return true;
+	return isHostRoutedMcpTool("fetch_url");
+}
+
 export function buildToolsArray({
 	vectorStoreIds = [],
 	codeFileIds = new Set(),
@@ -256,10 +298,18 @@ export function buildToolsArray({
 
 	// MCP function tools. Keep host discovery immediately callable; defer the larger
 	// per-host schemas until GPT-5.6 determines that it needs them.
+	// FETCH_URL_ENABLED=false removes page reading everywhere: an MCP-provided
+	// fetch_url is not advertised here either (its calls are refused anyway)
+	// ...and a URL-only MCP fetch_url is not advertised either: it cannot be
+	// driven through the host router, so a call would silently go elsewhere
+	const advertiseMcpFetchUrl = isFetchUrlAdvertised({ toolNamespaces: true });
+	const mcpFunctionTools = advertiseMcpFetchUrl
+		? getOpenAiFunctionTools()
+		: getOpenAiFunctionTools().filter((tool) => tool.name !== "fetch_url");
 	const mcpNamespaces = buildFunctionNamespaces({
 		name: "metricshub",
 		description: "MetricsHub infrastructure discovery, monitoring, and diagnostics.",
-		functionTools: getOpenAiFunctionTools(),
+		functionTools: mcpFunctionTools,
 		immediateToolNames: IMMEDIATE_MCP_TOOLS,
 	});
 	tools.push(...mcpNamespaces);
@@ -369,6 +419,11 @@ export async function logToolWarnings({
 		if (!getWebSearchTool()) {
 			logger?.info?.(
 				"No web-search backend configured (WEB_SEARCH_PROVIDER unset). web_search tool disabled."
+			);
+		}
+		if (!getFetchUrlTool()) {
+			logger?.info?.(
+				"Page reader disabled (FETCH_URL_ENABLED=false). The bot cannot read URLs pasted by users."
 			);
 		}
 		if (provider.capabilities.localCodeInterpreter) {
