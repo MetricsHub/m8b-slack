@@ -93,6 +93,9 @@ async function _ensureConnected(server) {
 	if (server.client) {
 		try {
 			await server.client.ping({ timeout: 5000 });
+			// A tool reload that failed after the last (re)connection is retried
+			// here, so routing never keeps a pre-restart schema for long
+			if (server.toolsStale) await _tryLoadTools(server);
 			return true; // Connection is alive
 		} catch (e) {
 			console.log(
@@ -119,14 +122,29 @@ async function _ensureConnected(server) {
 	}
 	// A (re)connected agent may have restarted with other tools: routing and
 	// validation must follow its current definitions, not the ones it had
+	await _tryLoadTools(server);
+	return true;
+}
+
+/**
+ * Load a server's tools, remembering a failure as `toolsStale` so the next
+ * connection check retries instead of trusting a pre-restart schema.
+ *
+ * @param {Object} server - Server entry with a connected client
+ * @returns {Promise<boolean>} Loaded
+ */
+async function _tryLoadTools(server) {
 	try {
 		await _loadTools(server);
+		server.toolsStale = false;
+		return true;
 	} catch (e) {
+		server.toolsStale = true;
 		console.warn(
 			`[MCP] Tool list of ${server.server_label} could not be loaded: ${e?.message || e}`
 		);
+		return false;
 	}
-	return true;
 }
 
 /**

@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "@jest/globals";
 import {
+	decodeAttributeEntities,
 	decodeHtmlEntities,
 	estimateNesting,
 	extractHtmlTitle,
@@ -472,6 +473,34 @@ describe("htmlToMarkdown", () => {
 		expect(estimateNesting(`<svg><foreignObject><mglyph><textarea>${deep}</textarea>`).depth).toBe(
 			4
 		);
+	});
+
+	it("closes an open <button> when another <button> starts", () => {
+		const real = "Actual content. ".repeat(20);
+		const intro = "Article text. ".repeat(20);
+		// The second <button> closes the first, so the single </button> leaves no
+		// dropped ancestor and the <main> that follows is the content region
+		const page = `<html><body><article><p>${intro}</p></article><button><button>menu</button><main><p>${real}</p></main></body></html>`;
+		const out = htmlToMarkdown(page);
+		expect(out).toContain("Actual content.");
+		expect(out).not.toContain("Article text.");
+		expect(estimateNesting("<button>".repeat(600)).depth).toBe(1);
+		// A button inside a scope boundary (a table cell) is not in scope: both stay
+		// (button, table, implied tbody, implied tr, td, button)
+		expect(estimateNesting("<button><table><td><button>").depth).toBe(6);
+	});
+
+	it("ignores a <head> start tag once the head or the body has begun", () => {
+		// Both late <head> openers are ignored by the parser, so the single </head>
+		// changes nothing and the article after it is visible — on the fallback route too
+		const hostile = `<body><p>Before</p>${"<div>".repeat(200000)}<head><head></head>Actual article`;
+		const out = htmlToMarkdown(hostile);
+		expect(out).toContain("Before");
+		expect(out).toContain("Actual article");
+		// A nested <head> does not open a second head either
+		expect(estimateNesting("<head><head><head>").depth).toBe(1);
+		// The first <head> still counts (html, head, title at the deepest point)
+		expect(estimateNesting("<html><head><title>t</title></head><body>").depth).toBe(3);
 	});
 
 	it("closes a select opened inside a table on table tokens (in select in table)", () => {
@@ -1283,6 +1312,23 @@ describe("decodeHtmlEntities", () => {
 		);
 		// Quotes and markup-looking text inside the input are never interpreted
 		expect(decodeHtmlEntities('say "hi" <b>&amp;</b> &quot;')).toBe('say "hi" <b>&</b> "');
+	});
+
+	it("decodes text in the data state and attributes in the attribute state", () => {
+		// In text a legacy semicolon-less reference is decoded even when a letter
+		// follows; in an attribute value it stays literal (the tokenizer's rule)
+		expect(decodeHtmlEntities("&copyx &notit; &amp=")).toBe("©x ¬it; &=");
+		expect(decodeAttributeEntities("&copyx &notit; &amp=")).toBe("&copyx &notit; &amp=");
+		// Markup-looking text is never interpreted in either context
+		expect(decodeHtmlEntities("a <b> &lt;/body&gt; &amp;")).toBe("a <b> </body> &");
+		// The measure of a region uses the text rules: 100 "&copyx" are 200 visible characters
+		expect(hasTextOfAtLeast("&copyx".repeat(100), 200)).toBe(true);
+		expect(hasTextOfAtLeast("&copyx".repeat(99), 200)).toBe(false);
+		// A base href is an attribute: "&copyx" stays as written in the URL
+		const page = `<html><head><base href="/a&copyx/"></head><body><p><a href="guide">Guide</a></p></body></html>`;
+		expect(htmlToMarkdown(page, { baseUrl: "https://d.example/" })).toContain(
+			"[Guide](https://d.example/a&copyx/guide)"
+		);
 	});
 
 	it("leaves unknown references untouched", () => {

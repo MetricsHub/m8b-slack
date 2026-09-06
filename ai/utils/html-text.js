@@ -78,8 +78,11 @@ const NAMED_ENTITIES = {
 };
 
 /**
- * Decode HTML character references (named, decimal, hexadecimal) in a text
- * fragment, without a DOM. Used for the <title>; Turndown handles the body.
+ * Decode HTML character references in TEXT with the parser's complete rules
+ * for the data state: every named reference, numeric overrides, and the
+ * legacy semicolon-less forms even when a letter follows ("&copyx" is "©x" in
+ * text). The fragment is parsed as body text — its "<" written as "&lt;" so
+ * nothing in it is markup — and the text read back. Linear in the length.
  *
  * @param {string} text - Text with HTML entities
  * @returns {string} Decoded text
@@ -87,10 +90,31 @@ const NAMED_ENTITIES = {
 export function decodeHtmlEntities(text) {
 	const source = String(text ?? "");
 	if (!source.includes("&")) return source;
-	// The HTML parser's complete rules (every named reference, legacy
-	// semicolon-less forms, numeric overrides): the text is parsed as a quoted
-	// attribute value — its own quotes escaped — so nothing in it can be read as
-	// markup, and the decoded value is read back. Linear in the text length.
+	try {
+		const doc = domino.createDocument(
+			`<!DOCTYPE html><html><body>${source.replace(/</g, "&lt;")}</body></html>`
+		);
+		const decoded = doc.body?.textContent;
+		if (typeof decoded === "string") return decoded;
+	} catch {
+		// Parser failure: the small table below still covers the common references
+	}
+	return decodeWithTable(source);
+}
+
+/**
+ * Decode HTML character references in an ATTRIBUTE VALUE, with the rules of
+ * the attribute-value states: as for text, except that a legacy
+ * semicolon-less reference followed by "=" or an alphanumeric stays literal
+ * ("&copyx" is "&copyx" in an href). The value is parsed as a quoted
+ * attribute — its own quotes escaped — and read back.
+ *
+ * @param {string} value - Raw attribute value
+ * @returns {string} Decoded value
+ */
+export function decodeAttributeEntities(value) {
+	const source = String(value ?? "");
+	if (!source.includes("&")) return source;
 	try {
 		const doc = domino.createDocument(
 			`<!DOCTYPE html><html><head><meta name="m8b" content="${source.replace(/"/g, "&quot;")}"></head></html>`
@@ -738,7 +762,6 @@ const TABLE_SECTIONS = new Set(["tbody", "thead", "tfoot"]);
 
 /** Elements allowed inside <head>: any other start tag ends an unclosed <head> */
 const HEAD_ELEMENTS = new Set([
-	"head",
 	"html",
 	"title",
 	"meta",
@@ -808,6 +831,7 @@ function createTreeTracker() {
 	let prefixes = 0; // list/blockquote ancestors currently open
 	let dropped = 0; // ancestors the converter drops
 	let templates = 0;
+	let headDone = false; // a <head> was inserted or the body began: later <head> tags are ignored
 	let hostile = false;
 
 	const isForeign = (i) => ns[i] !== null && !integration[i];
@@ -887,6 +911,7 @@ function createTreeTracker() {
 		}
 		if (DROP_ELEMENT_SET.has(name)) dropped++;
 		if (name === "template") templates++;
+		if (namespace === null && (name === "head" || name === "body")) headDone = true;
 		if (stack.length > depth) depth = stack.length;
 		if (prefixes > prefixDepth) prefixDepth = prefixes;
 		if (depth > MAX_DOM_DEPTH || prefixDepth > MAX_PREFIX_DEPTH) hostile = true;
@@ -1088,6 +1113,8 @@ function createTreeTracker() {
 				return !hostile;
 			}
 		}
+		// A second <head> — nested, or once the body has begun — is ignored
+		if (!closing && name === "head" && headDone) return !hostile;
 		if (
 			!closing &&
 			stack.length > 0 &&
@@ -1143,6 +1170,12 @@ function createTreeTracker() {
 		if (name === "svg" || name === "math") {
 			if (!selfClosing) push(name, name, false); // an empty <svg/> opens nothing
 			return !hostile;
+		}
+		// A <button> while one is in scope closes it first (the parser generates
+		// the implied end tags and pops the open button): buttons never nest
+		if (name === "button") {
+			const open = nearest("button");
+			if (open !== -1 && nearestAlive(boundaries) < open) popTo(open);
 		}
 		// The form element pointer: a <form> while one is open (outside a template)
 		// is ignored, so a single </form> closes the outer one
@@ -1810,7 +1843,7 @@ function documentBaseUrl(html, responseUrl) {
 			// ("&amp;" in the source is "&" in the URL), as the parser does
 			const rawHref = attributeValue(tag.attrs, "href");
 			if (rawHref === null) return true;
-			const href = decodeHtmlEntities(rawHref).trim();
+			const href = decodeAttributeEntities(rawHref).trim();
 			try {
 				// Judged on the parsed URL (tabs/newlines stripped by the parser):
 				// only an http(s) base can be a base for links

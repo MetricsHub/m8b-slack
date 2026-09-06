@@ -207,6 +207,36 @@ describe("executeMcpFunctionCall schema compatibility", () => {
 		});
 	});
 
+	it("retries a failed tool reload on the next connection check", async () => {
+		// The reload after a reconnection failed (toolsStale): the next call's
+		// connection check reloads the tools before routing
+		const server = fakeServer("flaky", { "f-01": host("f-01") }, { fetch_url: URL_ONLY });
+		const upgraded = {
+			name: "fetch_url",
+			description: "Reloaded.",
+			inputSchema: {
+				type: "object",
+				properties: { url: { type: "string" }, hosts: { type: "array" } },
+				required: ["url", "hosts"],
+			},
+		};
+		server.client.listTools = async () => ({ tools: [{ name: "ListHosts" }, upgraded] });
+		server.toolsStale = true;
+		_setServersForTests([server]);
+		await refreshHostsForServer("flaky");
+		const out = await executeMcpFunctionCall("fetch_url", { url: "https://x/", hosts: ["f-01"] });
+		expect(out.results[0].ok).toBe(true);
+		expect(server.toolsStale).toBe(false);
+		expect(getOpenAiFunctionTools().find((t) => t.name === "fetch_url").description).toBe(
+			"Reloaded."
+		);
+		// The reloaded (host-routed) definition shaped the call
+		expect(server.calls.filter((c) => c.name === "fetch_url").at(-1).args).toEqual({
+			url: "https://x/",
+			hosts: ["f-01"],
+		});
+	});
+
 	it("advertises the definitions local references point to", () => {
 		const server = fakeServer(
 			"defs",
